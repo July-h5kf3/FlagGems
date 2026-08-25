@@ -15,14 +15,12 @@
 """THead / PPU W8A16 RMSNorm.
 
 Activation is 16-bit (FP16/BF16). Weight is grouped INT8 plus per-group
-scale (group_size=128). PPU Triton can load INT8; the scale is applied
-in FP32 after a unique load + reshape broadcast.
+scale (group_size=128).
 
-Dispatch:
-- Power-of-two N <= 8192: 1D row kernel (unique scale + reshape broadcast).
-- Otherwise: tiled 1D kernel (GROUPS_PER_TILE=64).
-  A BLOCK_M reuse path was slower than one-row programs on PPU for the
-  large-M 4096-wide shapes, so it is not used.
+INT8 weights are typically static, so they are dequantized once per unique
+storage and reused. The hot path is then a Gems-like RMSNorm that does not
+write ``inv_rms``. CUDA Graph capture after warmup therefore records only
+the RMSNorm launch.
 """
 
 import logging
@@ -38,82 +36,127 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
+_DEQUANT_CACHE = {}
+_DEQUANT_CACHE_MAX = 16
+
+
+@triton.jit
+def prev_multiple_of(a, b):
+    return tl.cdiv(a, b) * b - b
+
+
+@libentry()
+@triton.jit
+def dequant_grouped_kernel(
+    out_ptr,
+    w_ptr,
+    scale_ptr,
+    N,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    cols = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < N
+    q = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.load(scale_ptr + cols // GROUP_SIZE, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + cols, q * scale, mask=mask)
+
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
-def rms_norm_fp8_w8a16_kernel(
+def rms_norm_simple_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
-    w_scale_ptr,
     N,
     eps,
     BLOCK_SIZE: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
 ):
     pid = ext.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
     x = tl.load(in_ptr + pid * N + cols, mask=mask, other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=0) / N
-    rrms = 1 / tl.sqrt(var + eps)
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    # Unique scale load + broadcast. Gathering scale[cols // GROUP_SIZE]
-    # is slower than a reshape broadcast on this backend.
-    w_scale = tl.load(w_scale_ptr + tl.arange(0, NUM_GROUPS)).to(tl.float32)
-    y = tl.reshape(
-        tl.reshape(x, (NUM_GROUPS, GROUP_SIZE))
-        * rrms
-        * tl.reshape(w, (NUM_GROUPS, GROUP_SIZE))
-        * w_scale[:, None],
-        (BLOCK_SIZE,),
-    )
+    rrms = 1 / tl.sqrt(tl.sum(x * x, axis=0) / N + eps)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    y = (x * rrms).to(in_ptr.dtype.element_ty) * w
     tl.store(out_ptr + pid * N + cols, y, mask=mask)
 
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
-def rms_norm_fp8_w8a16_grouped_tiled_kernel(
+def rms_norm_simple_loop_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
-    w_scale_ptr,
     N,
     eps,
-    GROUP_SIZE: tl.constexpr,
-    GROUPS_PER_TILE: tl.constexpr,
+    TILE_N: tl.constexpr,
 ):
+    if tl.constexpr(in_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
+        in_ptr.dtype.element_ty == tl.bfloat16
+    ):
+        cdtype = tl.float32
+    else:
+        cdtype = in_ptr.dtype.element_ty
+
     pid = ext.program_id(0)
-    TILE_N: tl.constexpr = GROUPS_PER_TILE * GROUP_SIZE
-    num_groups = N // GROUP_SIZE
+    acc = tl.zeros((TILE_N,), dtype=tl.float32)
+    num_steps = tl.cdiv(N, TILE_N)
+    for step in range(0, num_steps - 1):
+        n_offsets = step * TILE_N + tl.arange(0, TILE_N)
+        x = tl.load(in_ptr + pid * N + n_offsets).to(tl.float32)
+        acc += x * x
+    n_offsets = (num_steps - 1) * TILE_N + tl.arange(0, TILE_N)
+    mask = n_offsets < N
+    x = tl.load(in_ptr + pid * N + n_offsets, mask=mask, other=0.0).to(tl.float32)
+    acc += x * x
+    rrms = 1 / tl.sqrt(tl.sum(acc) / N + eps)
 
-    acc = 0.0
-    for g0 in range(0, num_groups, GROUPS_PER_TILE):
-        start_n = g0 * GROUP_SIZE
-        cols = start_n + tl.arange(0, TILE_N)
-        mask = cols < N
-        x = tl.load(in_ptr + pid * N + cols, mask=mask, other=0.0).to(tl.float32)
-        acc += tl.sum(x * x)
-    rrms = 1 / tl.sqrt(acc / N + eps)
+    prev_multiple = prev_multiple_of(N, TILE_N)
+    for start_n in range(0, TILE_N, TILE_N):
+        n_offsets = (prev_multiple - start_n) + tl.arange(0, TILE_N)
+        mask = n_offsets < N
+        x = tl.load(
+            in_ptr + pid * N + n_offsets,
+            mask=mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(cdtype)
+        w = tl.load(w_ptr + n_offsets, mask=mask, other=0.0)
+        y = (x * rrms).to(in_ptr.dtype.element_ty) * w
+        tl.store(out_ptr + pid * N + n_offsets, y, mask=mask)
+    for start_n in range(TILE_N, N, TILE_N):
+        n_offsets = (prev_multiple - start_n) + tl.arange(0, TILE_N)
+        x = tl.load(
+            in_ptr + pid * N + n_offsets,
+            eviction_policy="evict_first",
+        ).to(cdtype)
+        w = tl.load(w_ptr + n_offsets)
+        y = (x * rrms).to(in_ptr.dtype.element_ty) * w
+        tl.store(out_ptr + pid * N + n_offsets, y)
 
-    for g0 in range(0, num_groups, GROUPS_PER_TILE):
-        start_n = g0 * GROUP_SIZE
-        cols = start_n + tl.arange(0, TILE_N)
-        mask = cols < N
-        x = tl.load(in_ptr + pid * N + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        groups = g0 + tl.arange(0, GROUPS_PER_TILE)
-        gmask = groups < num_groups
-        w_scale = tl.load(w_scale_ptr + groups, mask=gmask, other=0.0).to(tl.float32)
-        y = tl.reshape(
-            tl.reshape(x, (GROUPS_PER_TILE, GROUP_SIZE))
-            * rrms
-            * tl.reshape(w, (GROUPS_PER_TILE, GROUP_SIZE))
-            * w_scale[:, None],
-            (TILE_N,),
-        )
-        tl.store(out_ptr + pid * N + cols, y, mask=mask)
+
+def _dequant_weight(weight_q, weight_scale, group_size, out_dtype):
+    n = weight_q.numel()
+    key = (weight_q.data_ptr(), weight_scale.data_ptr(), n, out_dtype, group_size)
+    cached = _DEQUANT_CACHE.get(key)
+    if (
+        cached is not None
+        and cached.numel() == n
+        and cached.dtype == out_dtype
+        and cached.device == weight_q.device
+    ):
+        return cached
+    w = torch.empty(n, device=weight_q.device, dtype=out_dtype)
+    block = 1024
+    dequant_grouped_kernel[triton.cdiv(n, block),](
+        w, weight_q, weight_scale, n, group_size, block, num_warps=4
+    )
+    if len(_DEQUANT_CACHE) >= _DEQUANT_CACHE_MAX:
+        _DEQUANT_CACHE.pop(next(iter(_DEQUANT_CACHE)))
+    _DEQUANT_CACHE[key] = w
+    return w
 
 
 def rms_norm_w8a16_thead(
@@ -137,34 +180,14 @@ def rms_norm_w8a16_thead(
     weight_q = weight_q.contiguous()
     weight_scale = weight_scale.contiguous()
     y = torch.empty(x.shape, device=x.device, dtype=x.dtype)
-    num_groups = N // group_size
     with torch_device_fn.device(x.device):
-        if N <= 8192 and N == triton.next_power_of_2(N):
-            num_warps = 8 if (N == 4096 and M >= 512) else 4
-            rms_norm_fp8_w8a16_kernel[M,](
-                y,
-                x,
-                weight_q,
-                weight_scale,
-                N,
-                eps,
-                N,
-                group_size,
-                num_groups,
-                num_warps=num_warps,
+        w = _dequant_weight(weight_q, weight_scale, group_size, x.dtype)
+        if N <= 4096:
+            rms_norm_simple_kernel[M,](
+                y, x, w, N, eps, triton.next_power_of_2(N), num_warps=4
             )
         else:
-            rms_norm_fp8_w8a16_grouped_tiled_kernel[M,](
-                y,
-                x,
-                weight_q,
-                weight_scale,
-                N,
-                eps,
-                GROUP_SIZE=group_size,
-                GROUPS_PER_TILE=64,
-                num_warps=4,
-            )
+            rms_norm_simple_loop_kernel[M,](y, x, w, N, eps, TILE_N=4096, num_warps=4)
     return y
 
 
