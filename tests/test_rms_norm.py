@@ -73,3 +73,56 @@ def test_rms_norm(shape, dtype):
     utils.gems_assert_close(res_out, ref_out, dtype)
     utils.gems_assert_close(res_grad, ref_grad, dtype)
     utils.gems_assert_close(res_weight_grad, ref_weight_grad, dtype, reduce_dim=N)
+
+
+GROUP_SIZE = 128
+W8A16_SHAPES = [
+    (1, 4096),
+    (128, 4096),
+    (512, 4096),
+    (64, 8192),
+    (1, 16384),
+    (1, 32768),
+]
+
+
+def _quantize_int8_grouped(weight, group_size=GROUP_SIZE):
+    n = weight.numel()
+    grouped = weight.reshape(n // group_size, group_size).to(torch.float32)
+    scale = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 127.0
+    quant = (grouped / scale).round().clamp(-128, 127).to(torch.int8)
+    return (
+        quant.reshape(n).contiguous(),
+        scale.squeeze(-1).to(weight.dtype).contiguous(),
+    )
+
+
+def _dequant_int8_grouped(weight_q, weight_scale, group_size=GROUP_SIZE):
+    return (
+        weight_q.to(torch.float32)
+        * weight_scale.to(torch.float32).repeat_interleave(group_size)
+    ).to(weight_scale.dtype)
+
+
+@pytest.mark.rms_norm
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "thead",
+    reason="W8A16 RMSNorm is implemented on THead / PPU only",
+)
+@pytest.mark.parametrize("shape", W8A16_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_rms_norm_w8a16_thead(shape, dtype):
+    torch.manual_seed(0)
+    tokens, hidden = shape
+    inp = torch.randn(tokens, hidden, dtype=dtype, device=flag_gems.device)
+    weight = torch.randn(hidden, dtype=dtype, device=flag_gems.device)
+    weight_q, weight_scale = _quantize_int8_grouped(weight)
+    weight_ref = _dequant_int8_grouped(weight_q, weight_scale)
+
+    ref_inp = utils.to_reference(inp)
+    ref_weight = utils.to_reference(weight_ref)
+    ref_out = torch.nn.functional.rms_norm(ref_inp, (hidden,), ref_weight, eps=1e-5)
+    res_out = flag_gems.rms_norm_fp8_w8a16(
+        inp, (hidden,), weight_q, weight_scale, eps=1e-5
+    )
+    utils.gems_assert_close(res_out, ref_out, dtype)
