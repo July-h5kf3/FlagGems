@@ -962,8 +962,6 @@ from flag_gems.ops.zeros_like import zeros_like
 
 __all__ = [
     "_nested_sum_backward",
-    "rms_norm_fp8_w8a16",
-    "rms_norm_w8a16_ascend",
     "SUPPORTED_FP8_DTYPE",
     "ScaleDotProductAttention",
     "__ilshift__",
@@ -1756,6 +1754,8 @@ __all__ = [
     "rms_norm_backward",
     "rms_norm_forward",
     "rms_norm_w8a16_fp8",
+    "rms_norm_fp8_w8a16",
+    "rms_norm_w8a16_ascend",
     "te_rmsnorm_bwd",
     "te_rmsnorm_fwd",
     "rnn_relu",
