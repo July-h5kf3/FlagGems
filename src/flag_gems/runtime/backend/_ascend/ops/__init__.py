@@ -100,6 +100,12 @@ from .replication_pad2d_backward import (
 )
 from .resolve_neg import resolve_neg
 from .rms_norm import rms_norm
+from flag_gems.ops.rmsnorm_w8a16_ascend import (
+    rms_norm_fp8_w8a16,
+    rms_norm_w8a16_ascend,
+)
+
+rms_norm_w8a16_fp8 = rms_norm_w8a16_ascend
 from .scatter import scatter, scatter_
 from .scatter_add_ import scatter_add_
 from .select_backward import select_backward
@@ -239,6 +245,9 @@ __all__ = [
     "replication_pad2d_backward_grad_input",
     "resolve_neg",
     "rms_norm",
+    "rms_norm_fp8_w8a16",
+    "rms_norm_w8a16_ascend",
+    "rms_norm_w8a16_fp8",
     "scatter",
     "scatter_",
     "scatter_add_",
