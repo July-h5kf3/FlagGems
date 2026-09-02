@@ -815,6 +815,7 @@ if HAS_TLE_GPU:
         K_PAD: tl.constexpr,
         BLOCK_N: tl.constexpr,
         PART_N: tl.constexpr,
+        RADIX_BITS: tl.constexpr,
         GROUP_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -823,8 +824,8 @@ if HAS_TLE_GPU:
         part_cols = tl.minimum(n_cols - col_start, PART_N)
         x_utype = tl.uint16
         x_ultype = tl.uint32
-        RADIX_SIZE: tl.constexpr = 256
-        RADIX_MASK: tl.constexpr = 255
+        RADIX_SIZE: tl.constexpr = 1 << RADIX_BITS
+        RADIX_MASK: tl.constexpr = RADIX_SIZE - 1
         bins = tl.arange(0, RADIX_SIZE)
         one = tl.full([BLOCK_N], 1, tl.int32)
         n_tiles = tl.cdiv(part_cols, BLOCK_N)
@@ -862,7 +863,7 @@ if HAS_TLE_GPU:
         desired = tl.full((), 0, dtype=x_utype)
         desired_mask = tl.full((), 0, dtype=x_utype)
         k_to_find = tl.full((), K, dtype=tl.int32)
-        for digit_pos in tl.static_range(8, -1, -8):
+        for digit_pos in tl.static_range(16 - RADIX_BITS, -1, -RADIX_BITS):
             tl.store(smem_count_ptrs, tl.zeros([RADIX_SIZE], dtype=tl.int32))
             for t in tl.range(0, n_tiles):
                 local = t * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -907,15 +908,23 @@ if HAS_TLE_GPU:
         tl.store(smem_selected_ptrs, tl.full([K_PAD], min_packed, dtype=x_ultype))
 
         smem_write_count = tle_gpu.gpu.alloc(
-            [1],
+            [2],
             dtype=tl.int32,
             layout=None,
             scope=tle_gpu.gpu.smem,
             nv_mma_shared_layout=False,
         )
         tl.store(tle_gpu.gpu.local_ptr(smem_write_count, (0,)), 0)
-        write_count_ptrs = tle_gpu.gpu.local_ptr(
-            smem_write_count, (tl.zeros([BLOCK_N], dtype=tl.int32),)
+        tl.store(
+            tle_gpu.gpu.local_ptr(smem_write_count, (1,)),
+            K - k_to_find,
+        )
+        counter_offsets = tl.zeros([BLOCK_N], dtype=tl.int32)
+        gt_count_ptrs = tle_gpu.gpu.local_ptr(
+            smem_write_count, (counter_offsets,)
+        )
+        eq_count_ptrs = tle_gpu.gpu.local_ptr(
+            smem_write_count, (counter_offsets + 1,)
         )
 
         for t in tl.range(0, n_tiles):
@@ -929,33 +938,18 @@ if HAS_TLE_GPU:
             )
             packed = (x_key.to(x_ultype) << 16) | (n_cols - offs_n).to(x_ultype)
             take_gt = mask_n & (x_key > thr_key)
-            pos = tl.atomic_add(
-                write_count_ptrs, one, mask=take_gt, sem="relaxed", scope="cta"
-            )
-            tl.store(
-                tle_gpu.gpu.local_ptr(smem_selected, (pos.to(tl.int32),)),
-                packed,
-                mask=take_gt & (pos < K_PAD),
-            )
-
-        for t in tl.range(0, n_tiles):
-            local = t * BLOCK_N + tl.arange(0, BLOCK_N)
-            mask_n = local < part_cols
-            offs_n = col_start + local
-            x_key = tl.load(
-                tle_gpu.gpu.local_ptr(smem_keys, (local,)),
-                mask=mask_n,
-                other=0,
-            )
-            packed = (x_key.to(x_ultype) << 16) | (n_cols - offs_n).to(x_ultype)
             take_eq = mask_n & (x_key == thr_key)
-            pos = tl.atomic_add(
-                write_count_ptrs, one, mask=take_eq, sem="relaxed", scope="cta"
+            pos_gt = tl.atomic_add(
+                gt_count_ptrs, one, mask=take_gt, sem="relaxed", scope="cta"
             )
+            pos_eq = tl.atomic_add(
+                eq_count_ptrs, one, mask=take_eq, sem="relaxed", scope="cta"
+            )
+            pos = tl.where(take_gt, pos_gt, pos_eq)
             tl.store(
                 tle_gpu.gpu.local_ptr(smem_selected, (pos.to(tl.int32),)),
                 packed,
-                mask=take_eq & (pos < K_PAD),
+                mask=(take_gt | take_eq) & (pos < K_PAD),
             )
 
         selected_packed = tl.load(smem_selected_ptrs)
@@ -1083,8 +1077,11 @@ def topk_w8a16_fp8(
                     topk_elem_cnt,
                     K=k,
                     K_PAD=k_pad,
-                    BLOCK_N=1024,
+                    BLOCK_N=512,
                     PART_N=part_n,
+                    # On PPU, four 16-bin histogram passes beat two
+                    # 256-bin passes by reducing shared-atomic overhead.
+                    RADIX_BITS=4,
                     GROUP_SIZE=group_size,
                     num_warps=8,
                     num_stages=1,
