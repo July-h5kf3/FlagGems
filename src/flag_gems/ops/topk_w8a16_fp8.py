@@ -235,6 +235,123 @@ def _fp8_bits_to_ordered_key(bits):
 
 @libentry()
 @triton.jit
+def topk_fp8_one_group_packed_kernel(
+    y_ptr,
+    index_ptr,
+    x_ptr,
+    scale_ptr,
+    k: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tle.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    bits = tl.load(x_ptr + pid * N + cols, mask=mask, other=0).to(tl.uint8)
+    values = _fp8_e5_to_f32(bits)
+    ordered_key = _fp8_bits_to_ordered_key(bits)
+    ordered_key = tl.where(values != values, 0xFF, ordered_key).to(tl.uint8)
+    index_key = (0xFFFF - cols).to(tl.uint32)
+    packed = (ordered_key.to(tl.uint32) << 16) | index_key
+    packed = tl.where(mask, packed, 0)
+    packed = tl.sort(packed, dim=0, descending=True)
+
+    out_mask = cols < k
+    selected_key = (packed >> 16).to(tl.uint8)
+    selected_flip = tl.where(
+        (selected_key & 0x80) != 0, 0x80, 0xFF
+    ).to(tl.uint8)
+    selected_bits = selected_key ^ selected_flip
+    selected_values = _fp8_e5_to_f32(selected_bits)
+    scale = tl.load(scale_ptr + pid).to(tl.float32)
+    selected_indices = (0xFFFF - (packed & 0xFFFF)).to(tl.int64)
+    tl.store(
+        y_ptr + pid * k + cols,
+        selected_values * scale,
+        mask=out_mask,
+    )
+    tl.store(index_ptr + pid * k + cols, selected_indices, mask=out_mask)
+
+
+@libentry()
+@triton.jit
+def topk_fp8_two_group_packed_kernel(
+    y_ptr,
+    index_ptr,
+    x_ptr,
+    scale_ptr,
+    k: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    pid = tle.program_id(0)
+    local = tl.arange(0, GROUP_SIZE)
+    row_start = pid * 2 * GROUP_SIZE
+
+    bits_0 = tl.load(x_ptr + row_start + local).to(tl.uint8)
+    bits_1 = tl.load(x_ptr + row_start + GROUP_SIZE + local).to(tl.uint8)
+    values_0 = _fp8_e5_to_f32(bits_0)
+    values_1 = _fp8_e5_to_f32(bits_1)
+    key_0 = _fp8_bits_to_ordered_key(bits_0)
+    key_1 = _fp8_bits_to_ordered_key(bits_1)
+    key_0 = tl.where(values_0 != values_0, 0xFF, key_0).to(tl.uint8)
+    key_1 = tl.where(values_1 != values_1, 0xFF, key_1).to(tl.uint8)
+    packed_0 = (key_0.to(tl.uint32) << 16) | (0xFFFF - local).to(tl.uint32)
+    packed_1 = (key_1.to(tl.uint32) << 16) | (
+        0xFFFF - GROUP_SIZE - local
+    ).to(tl.uint32)
+    packed_0 = tl.sort(packed_0, dim=0, descending=True)
+    packed_1 = tl.sort(packed_1, dim=0, descending=True)
+
+    candidate_offsets = tl.arange(0, 2 * k)
+    group_ranks = candidate_offsets % k
+    selected_0 = tl.gather(packed_0, group_ranks, axis=0)
+    selected_1 = tl.gather(packed_1, group_ranks, axis=0)
+    selected = tl.where(candidate_offsets < k, selected_0, selected_1)
+
+    raw_key = (selected >> 16).to(tl.uint8)
+    raw_flip = tl.where(
+        (raw_key & 0x80) != 0, 0x80, 0xFF
+    ).to(tl.uint8)
+    raw_bits = raw_key ^ raw_flip
+    raw_values = _fp8_e5_to_f32(raw_bits)
+    group_idx = (candidate_offsets >= k).to(tl.int32)
+    scale = tl.load(scale_ptr + pid * 2 + group_idx).to(tl.float32)
+    values = (raw_values * scale).to(tl.bfloat16)
+    indices = (0xFFFF - (selected & 0xFFFF)).to(tl.int32)
+
+    value_bits = values.to(tl.uint16, bitcast=True)
+    value_flip = tl.where(
+        (value_bits & 0x8000) != 0, 0xFFFF, 0x8000
+    ).to(tl.uint16)
+    value_key = value_bits ^ value_flip
+    value_key = tl.where(values != values, 0xFFFF, value_key).to(tl.uint16)
+    merged = (value_key.to(tl.uint32) << 16) | (
+        0xFFFF - indices
+    ).to(tl.uint32)
+    merged = tl.sort(merged, dim=0, descending=True)
+
+    out_mask = candidate_offsets < k
+    out_key = (merged >> 16).to(tl.uint16)
+    out_flip = tl.where(
+        (out_key & 0x8000) != 0, 0x8000, 0xFFFF
+    ).to(tl.uint16)
+    out_bits = out_key ^ out_flip
+    final_values = out_bits.to(tl.bfloat16, bitcast=True)
+    final_indices = (0xFFFF - (merged & 0xFFFF)).to(tl.int64)
+    tl.store(
+        y_ptr + pid * k + candidate_offsets,
+        final_values,
+        mask=out_mask,
+    )
+    tl.store(
+        index_ptr + pid * k + candidate_offsets,
+        final_indices,
+        mask=out_mask,
+    )
+
+
+@libentry()
+@triton.jit
 def topk_fp8_row_radix_threshold_kernel(
     x_ptr,
     threshold_key_ptr,
@@ -1040,6 +1157,47 @@ def topk_w8a16_fp8(
     y_idx = torch.empty(out_shape, device=x_fp8.device, dtype=torch.int64)
     y_vals_2d = y_vals.reshape(batch_size, k)
     y_idx_2d = y_idx.reshape(batch_size, k)
+
+    # A single non-negative quantization scale preserves the raw FP8 order.
+    # Sort packed 8-bit keys and only dequantize the selected values.
+    if descending and sorted and num_groups == 1 and topk_elem_cnt <= 128:
+        block_size = triton.next_power_of_2(topk_elem_cnt)
+        with torch_device_fn.device(x_fp8.device):
+            topk_fp8_one_group_packed_kernel[(batch_size,)](
+                y_vals_2d,
+                y_idx_2d,
+                x_2d,
+                scale_2d,
+                k,
+                topk_elem_cnt,
+                block_size,
+                num_warps=8,
+                num_stages=1,
+            )
+        return (y_vals, y_idx)
+
+    # For two 128-element groups, keep only each group's K best raw FP8
+    # candidates, dequantize 2K values, then merge those candidates in BF16.
+    if (
+        descending
+        and sorted
+        and out_dtype == torch.bfloat16
+        and group_size == 128
+        and topk_elem_cnt == 2 * group_size
+        and k == triton.next_power_of_2(k)
+    ):
+        with torch_device_fn.device(x_fp8.device):
+            topk_fp8_two_group_packed_kernel[(batch_size,)](
+                y_vals_2d,
+                y_idx_2d,
+                x_2d,
+                scale_2d,
+                k,
+                group_size,
+                num_warps=2,
+                num_stages=1,
+            )
+        return (y_vals, y_idx)
 
     if (
         HAS_TLE_GPU
