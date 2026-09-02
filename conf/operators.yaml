@@ -12418,6 +12418,19 @@ ops:
     stages:
       - stable: '2.1'
     cpp: '4.0'
+  - id: topk_w8a16_fp8
+    description: |
+      Returns the k largest (or smallest) elements of a group-wise FP8 E5M2
+      tensor along the last dimension, dequantizing with per-group scales.
+    for:
+      - None
+    labels:
+      - NoCPU
+      - Quantization
+    kind:
+      - Tensor
+    stages:
+      - alpha: '5.4'
   - id: topk_softmax
     description: |
       Selects the k most likely next-token candicates, sets all others to zero,
