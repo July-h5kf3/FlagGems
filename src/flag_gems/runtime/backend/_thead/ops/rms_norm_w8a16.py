@@ -59,8 +59,10 @@ def rms_norm_simple_kernel(
     N,
     eps,
     BLOCK_SIZE: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
 ):
     pid = ext.program_id(0)
+    tl.static_assert(NUM_WARPS > 0)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
     x = tl.load(in_ptr + pid * N + cols, mask=mask, other=0.0).to(tl.float32)
@@ -128,6 +130,87 @@ def rms_norm_simple_loop_kernel(
         tl.store(out_ptr + pid * N + n_offsets, y)
 
 
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def rms_norm_fwd_loop_kernel(
+    out_ptr,
+    in_ptr,
+    w_ptr,
+    N,
+    eps,
+    TILE_N: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    acc = tl.zeros((TILE_N,), dtype=tl.float32)
+    num_steps = tl.cdiv(N, TILE_N)
+    for step in range(0, num_steps - 1):
+        n_offsets = step * TILE_N + tl.arange(0, TILE_N)
+        x = tl.load(in_ptr + pid * N + n_offsets).to(tl.float32)
+        acc += x * x
+    n_offsets = (num_steps - 1) * TILE_N + tl.arange(0, TILE_N)
+    mask = n_offsets < N
+    x = tl.load(in_ptr + pid * N + n_offsets, mask=mask, other=0.0).to(tl.float32)
+    acc += x * x
+    rrms = 1 / tl.sqrt(tl.sum(acc) / N + eps)
+    for step in range(0, num_steps):
+        n_offsets = step * TILE_N + tl.arange(0, TILE_N)
+        mask = n_offsets < N
+        x = tl.load(in_ptr + pid * N + n_offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + n_offsets, mask=mask, other=0.0)
+        y = (x * rrms).to(in_ptr.dtype.element_ty) * w
+        tl.store(out_ptr + pid * N + n_offsets, y, mask=mask)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def rms_norm_multirow_kernel(
+    out_ptr,
+    in_ptr,
+    w_ptr,
+    M,
+    N,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    for r in range(0, ROW_BLOCK):
+        row = pid * ROW_BLOCK + r
+        row_valid = row < M
+        x = tl.load(in_ptr + row * N + cols, mask=mask & row_valid, other=0.0).to(
+            tl.float32
+        )
+        rrms = 1 / tl.sqrt(tl.sum(x * x, axis=0) / N + eps)
+        y = (x * rrms).to(in_ptr.dtype.element_ty) * w
+        tl.store(out_ptr + row * N + cols, y, mask=mask & row_valid)
+
+
+def _launch_rms_norm(y, x, w, M, N, eps):
+    if N <= 4096:
+        block = triton.next_power_of_2(N)
+        if M >= 512:
+            row_block = 2
+            rms_norm_multirow_kernel[triton.cdiv(M, row_block),](
+                y, x, w, M, N, eps, block, row_block, num_warps=4
+            )
+        else:
+            num_warps = 16 if M <= 64 else 4
+            # NUM_WARPS is a constexpr so libentry caches 4-warp and 16-warp
+            # cubins separately (launch kwargs are not part of the entry key).
+            rms_norm_simple_kernel[M,](
+                y, x, w, N, eps, block, num_warps, num_warps=num_warps
+            )
+        return
+    # Forward tiles win on PPU when many rows share a mid-size N.
+    if M >= 256 and N <= 8192:
+        rms_norm_fwd_loop_kernel[M,](y, x, w, N, eps, TILE_N=2048, num_warps=8)
+        return
+    rms_norm_simple_loop_kernel[M,](y, x, w, N, eps)
+
+
 def _dequant_weight(weight_q, weight_scale, group_size, out_dtype):
     global _LAST_DEQUANT_KEY, _LAST_DEQUANT_W
     n = weight_q.numel()
@@ -176,12 +259,7 @@ def rms_norm_w8a16_thead(
     y = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     with torch_device_fn.device(x.device):
         w = _dequant_weight(weight_q, weight_scale, group_size, x.dtype)
-        if N <= 4096:
-            rms_norm_simple_kernel[M,](
-                y, x, w, N, eps, triton.next_power_of_2(N), num_warps=4
-            )
-        else:
-            rms_norm_simple_loop_kernel[M,](y, x, w, N, eps)
+        _launch_rms_norm(y, x, w, M, N, eps)
     return y
 
 
