@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from flag_gems.ops.topk_w8a16_fp8 import topk_w8a16_fp8
+import flag_gems
 
 from . import base
 
@@ -56,7 +56,7 @@ def _torch_topk_w8a16(x_fp8, x_scale, k, dequant):
 
 
 def _gems_topk_w8a16(x_fp8, x_scale, k, dequant):
-    return topk_w8a16_fp8(x_fp8, x_scale, k, dim=-1, largest=True, sorted=True)
+    return flag_gems.topk_w8a16_fp8(x_fp8, x_scale, k, dim=-1, largest=True, sorted=True)
 
 
 class TopKFp8W8A16Benchmark(base.Benchmark):
@@ -82,6 +82,10 @@ class TopKFp8W8A16Benchmark(base.Benchmark):
 
 
 @pytest.mark.topk_w8a16_fp8
+@pytest.mark.skipif(
+    getattr(flag_gems, "vendor_name", None) != "thead",
+    reason="topk_w8a16_fp8 is a THead/PPU operator",
+)
 @pytest.mark.skipif(not _fp8_e5_available(), reason="float8_e5m2 is unavailable")
 def test_topk_w8a16_fp8():
     bench = TopKFp8W8A16Benchmark(

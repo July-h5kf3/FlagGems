@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""THead / PPU W8A16 TopK.
+
+Input is grouped FP8 E5M2 plus per-group scale (group_size=128). The kernel
+dequantizes on the fly and returns BF16 values and int64 indices along the
+last dimension.
+"""
+
 import logging
 import math
 

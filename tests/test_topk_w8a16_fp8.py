@@ -16,7 +16,6 @@ import pytest
 import torch
 
 import flag_gems
-from flag_gems.ops.topk_w8a16_fp8 import topk_w8a16_fp8
 
 from . import accuracy_utils as utils
 
@@ -53,6 +52,10 @@ def _dequant_fp8_e5(x_fp8, x_scale, group_size=FP8_GROUP_SIZE):
 
 
 @pytest.mark.topk_w8a16_fp8
+@pytest.mark.skipif(
+    getattr(flag_gems, "vendor_name", None) != "thead",
+    reason="topk_w8a16_fp8 is a THead/PPU operator",
+)
 @pytest.mark.skipif(not _fp8_e5_available(), reason="float8_e5m2 is unavailable")
 @pytest.mark.parametrize(
     "shape, k",
@@ -76,7 +79,7 @@ def test_topk_w8a16_fp8(shape, k, largest):
     ref_value, ref_index = torch.topk(
         utils.to_reference(dequant), k, dim=-1, largest=largest, sorted=True
     )
-    res_value, res_index = topk_w8a16_fp8(
+    res_value, res_index = flag_gems.topk_w8a16_fp8(
         x_fp8,
         x_scale,
         k,
