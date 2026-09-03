@@ -17,7 +17,6 @@ import pytest
 import torch
 
 import flag_gems
-from flag_gems.ops.rms_norm_w8a16_fp8 import rms_norm_w8a16_fp8
 
 from . import accuracy_utils as utils
 from . import conftest as cfg
@@ -26,6 +25,35 @@ if cfg.QUICK_MODE:
     FLOAT_DTYPES = [torch.float32]
 else:
     FLOAT_DTYPES = utils.FLOAT_DTYPES
+
+FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
+FP8_GROUP_SIZE = 128
+
+
+def _cuda_fp8_e4m3fn_available():
+    if FP8_DTYPE is None or not torch.cuda.is_available():
+        return False
+    # PPU can store / cast e4m3fn even though it reports sm_80.
+    if flag_gems.vendor_name == "thead":
+        return True
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 9
+
+
+def _quantize_fp8_weight(weight, group_size=FP8_GROUP_SIZE):
+    fp8_info = torch.finfo(FP8_DTYPE)
+    grouped_weight = weight.float().reshape(-1, group_size)
+    scale = (grouped_weight.abs().amax(dim=-1, keepdim=True) / fp8_info.max).clamp(
+        min=1e-8
+    )
+    weight_fp8 = (
+        (grouped_weight / scale)
+        .clamp(fp8_info.min, fp8_info.max)
+        .to(FP8_DTYPE)
+        .reshape_as(weight)
+        .contiguous()
+    )
+    return weight_fp8, scale.squeeze(-1).to(weight.dtype).contiguous()
 
 
 @pytest.mark.rms_norm
@@ -76,36 +104,6 @@ def test_rms_norm(shape, dtype):
     utils.gems_assert_close(res_weight_grad, ref_weight_grad, dtype, reduce_dim=N)
 
 
-FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
-FP8_GROUP_SIZE = 128
-
-
-def _cuda_fp8_e4m3fn_available():
-    if FP8_DTYPE is None or not torch.cuda.is_available():
-        return False
-    # PPU can store / cast e4m3fn even though it reports sm_80.
-    if flag_gems.vendor_name == "thead":
-        return True
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
-
-
-def _quantize_fp8_weight(weight, group_size=FP8_GROUP_SIZE):
-    fp8_info = torch.finfo(FP8_DTYPE)
-    grouped_weight = weight.float().reshape(-1, group_size)
-    scale = (grouped_weight.abs().amax(dim=-1, keepdim=True) / fp8_info.max).clamp(
-        min=1e-8
-    )
-    weight_fp8 = (
-        (grouped_weight / scale)
-        .clamp(fp8_info.min, fp8_info.max)
-        .to(FP8_DTYPE)
-        .reshape_as(weight)
-        .contiguous()
-    )
-    return weight_fp8, scale.squeeze(-1).to(weight.dtype).contiguous()
-
-
 @pytest.mark.rms_norm_w8a16_fp8
 @pytest.mark.parametrize(
     "shape",
@@ -145,7 +143,7 @@ def test_rms_norm_w8a16_fp8(shape):
     ref_inp = utils.to_reference(inp)
     ref_weight = utils.to_reference(dequant_weight)
     ref_out = torch.nn.functional.rms_norm(ref_inp, (n,), ref_weight, eps=eps)
-    res_out = rms_norm_w8a16_fp8(
+    res_out = flag_gems.rms_norm_w8a16_fp8(
         inp,
         (n,),
         weight_fp8,

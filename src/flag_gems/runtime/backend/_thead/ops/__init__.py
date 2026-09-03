@@ -35,11 +35,7 @@ from .nonzero_numpy import nonzero_numpy
 from .reflection_pad3d_backward import reflection_pad3d_backward
 from .renorm import renorm, renorm_
 from .repeat import repeat
-from .rms_norm_w8a16 import (
-    rms_norm_fp8_w8a16,
-    rms_norm_w8a16_fp8,
-    rms_norm_w8a16_thead,
-)
+from .rms_norm_w8a16 import rms_norm_w8a16_fp8
 from .scatter_reduce_ import scatter_reduce, scatter_reduce_, scatter_reduce_out
 from .softplus_backward import softplus_backward
 from .special_chebyshev_polynomial_u import special_chebyshev_polynomial_u
@@ -91,9 +87,7 @@ __all__ = [
     "renorm",
     "renorm_",
     "repeat",
-    "rms_norm_fp8_w8a16",
     "rms_norm_w8a16_fp8",
-    "rms_norm_w8a16_thead",
     "scatter_reduce",
     "scatter_reduce_",
     "scatter_reduce_out",

@@ -16,7 +16,6 @@ import pytest
 import torch
 
 import flag_gems
-from flag_gems.ops.rms_norm_w8a16_fp8 import rms_norm_w8a16_fp8
 
 from . import base
 
@@ -72,7 +71,7 @@ def _torch_rms_norm_w8a16(x, normalized_shape, weight_fp8, weight_scale, weight_
 
 
 def _gems_rms_norm_w8a16(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
-    return rms_norm_w8a16_fp8(x, normalized_shape, weight_fp8, weight_scale)
+    return flag_gems.rms_norm_w8a16_fp8(x, normalized_shape, weight_fp8, weight_scale)
 
 
 class RmsNormFp8Benchmark(base.Benchmark):

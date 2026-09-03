@@ -177,6 +177,5 @@ def rms_norm_w8a16_thead(
     return y
 
 
-# Public name matches PR #4437 (`rms_norm_w8a16_fp8`).
+# Public name matches the generic operator (`rms_norm_w8a16_fp8`).
 rms_norm_w8a16_fp8 = rms_norm_w8a16_thead
-rms_norm_fp8_w8a16 = rms_norm_w8a16_thead
