@@ -1145,6 +1145,7 @@ _FULL_CONFIG = (
     ("threshold_backward", threshold_backward),
     ("tile", tile),
     ("topk", topk),
+    ("topk_w8a16_fp8", topk_w8a16_fp8),
     ("trace", trace),
     ("transpose.int", transpose),
     ("tril", tril),
