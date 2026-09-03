@@ -31,14 +31,18 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
+_FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 _DEQUANT_CACHE = {}
 _DEQUANT_CACHE_MAX = 16
+_LAST_DEQUANT_KEY = None
+_LAST_DEQUANT_W = None
 
 
 @triton.jit
@@ -67,6 +71,10 @@ def rms_norm_simple_kernel(
 
 
 @libentry()
+@triton.autotune(
+    configs=runtime.get_tuned_config("rms_norm_loop"),
+    key=["N"],
+)
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_simple_loop_kernel(
     out_ptr,
@@ -121,15 +129,15 @@ def rms_norm_simple_loop_kernel(
 
 
 def _dequant_weight(weight_q, weight_scale, group_size, out_dtype):
+    global _LAST_DEQUANT_KEY, _LAST_DEQUANT_W
     n = weight_q.numel()
     key = (weight_q.data_ptr(), weight_scale.data_ptr(), n, out_dtype, group_size)
+    if key == _LAST_DEQUANT_KEY and _LAST_DEQUANT_W is not None:
+        return _LAST_DEQUANT_W
     cached = _DEQUANT_CACHE.get(key)
-    if (
-        cached is not None
-        and cached.numel() == n
-        and cached.dtype == out_dtype
-        and cached.device == weight_q.device
-    ):
+    if cached is not None:
+        _LAST_DEQUANT_KEY = key
+        _LAST_DEQUANT_W = cached
         return cached
     # Cast in PyTorch so PPU does not need Triton fp8e4nv loads.
     w = (
@@ -139,6 +147,8 @@ def _dequant_weight(weight_q, weight_scale, group_size, out_dtype):
     if len(_DEQUANT_CACHE) >= _DEQUANT_CACHE_MAX:
         _DEQUANT_CACHE.pop(next(iter(_DEQUANT_CACHE)))
     _DEQUANT_CACHE[key] = w
+    _LAST_DEQUANT_KEY = key
+    _LAST_DEQUANT_W = w
     return w
 
 
@@ -153,8 +163,7 @@ def rms_norm_w8a16_thead(
         raise ValueError(
             f"normalized_shape product {N} must be divisible by group_size={group_size}"
         )
-    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
-    if fp8_dtype is None or weight_q.dtype != fp8_dtype:
+    if _FP8_DTYPE is None or weight_q.dtype != _FP8_DTYPE:
         raise TypeError(
             f"PPU W8A16 RMSNorm expects float8_e4m3fn weight, got {weight_q.dtype}"
         )
@@ -162,9 +171,8 @@ def rms_norm_w8a16_thead(
         raise ValueError(
             f"weight_scale numel {weight_scale.numel()} != {N // group_size} groups"
         )
-    x = x.contiguous()
-    weight_q = weight_q.contiguous()
-    weight_scale = weight_scale.contiguous()
+    if not x.is_contiguous():
+        x = x.contiguous()
     y = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     with torch_device_fn.device(x.device):
         w = _dequant_weight(weight_q, weight_scale, group_size, x.dtype)
@@ -173,7 +181,7 @@ def rms_norm_w8a16_thead(
                 y, x, w, N, eps, triton.next_power_of_2(N), num_warps=4
             )
         else:
-            rms_norm_simple_loop_kernel[M,](y, x, w, N, eps, TILE_N=4096, num_warps=4)
+            rms_norm_simple_loop_kernel[M,](y, x, w, N, eps)
     return y
 
 
