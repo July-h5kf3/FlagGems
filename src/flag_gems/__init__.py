@@ -835,6 +835,8 @@ _FULL_CONFIG = (
     ("mkldnn_rnn_layer", mkldnn_rnn_layer),
     ("mm", mm),
     ("mm.out", mm_out),
+    ("mm_w8a8_fp8", mm_w8a8_fp8),
+    ("mm_w8a8_fp8_out", mm_w8a8_fp8_out),
     ("mode", mode),
     ("mse_loss", mse_loss),
     ("mse_loss_backward", mse_loss_backward),
