@@ -16,8 +16,9 @@ import pytest
 import torch
 
 import flag_gems
+from flag_gems.ops.rms_norm_w8a16_fp8 import rms_norm_w8a16_fp8
 
-from . import base, consts
+from . import base
 
 
 @pytest.mark.rms_norm
@@ -37,83 +38,80 @@ def test_rms_norm():
 
 
 GROUP_SIZE = 128
-W8A16_SHAPES = [
-    (1, 4096),
-    (16, 4096),
-    (64, 4096),
-    (256, 4096),
-    (1024, 4096),
-    (1, 8192),
-    (64, 8192),
-    (256, 8192),
-    (1, 16384),
-    (64, 16384),
-]
+FP8_DTYPE = torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else None
 
 
-def _quantize_int8_grouped(weight, group_size=GROUP_SIZE):
-    n = weight.numel()
-    grouped = weight.reshape(n // group_size, group_size).to(torch.float32)
-    scale = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 127.0
-    quant = (grouped / scale).round().clamp(-128, 127).to(torch.int8)
-    return (
-        quant.reshape(n).contiguous(),
-        scale.squeeze(-1).to(weight.dtype).contiguous(),
-    )
+def _cuda_fp8_e4m3fn_available():
+    if FP8_DTYPE is None or not torch.cuda.is_available():
+        return False
+    if flag_gems.vendor_name == "thead":
+        return True
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 9
 
 
-def _dequant_int8_grouped(weight_q, weight_scale, group_size=GROUP_SIZE):
-    return (
-        weight_q.to(torch.float32)
-        * weight_scale.to(torch.float32).repeat_interleave(group_size)
-    ).to(weight_scale.dtype)
+def _quantize_fp8_grouped(w, group_size=GROUP_SIZE):
+    fp8_info = torch.finfo(FP8_DTYPE)
+    if w.ndim == 1:
+        n = w.shape[0]
+        assert n % group_size == 0
+        wg = w.reshape(n // group_size, group_size).float()
+        scale = (wg.abs().amax(dim=-1, keepdim=True) / fp8_info.max).clamp(min=1e-8)
+        q = (wg / scale).clamp(fp8_info.min, fp8_info.max).to(FP8_DTYPE)
+        return q.reshape(n).contiguous(), scale.squeeze(-1).to(w.dtype).contiguous()
+    m, n = w.shape
+    assert n % group_size == 0
+    wg = w.reshape(m, n // group_size, group_size).float()
+    scale = (wg.abs().amax(dim=-1, keepdim=True) / fp8_info.max).clamp(min=1e-8)
+    q = (wg / scale).clamp(fp8_info.min, fp8_info.max).to(FP8_DTYPE)
+    return q.reshape(m, n).contiguous(), scale.squeeze(-1).to(w.dtype).contiguous()
 
 
-def _ref_rms_norm(x, normalized_shape, weight_q, weight_scale, weight_ref):
-    return torch.nn.functional.rms_norm(x, normalized_shape, weight_ref, eps=1e-5)
+def _torch_rms_norm_w8a16(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
+    return torch.nn.functional.rms_norm(x, normalized_shape, weight_ref)
 
 
-def _gems_rms_norm_w8a16(x, normalized_shape, weight_q, weight_scale, weight_ref):
-    return flag_gems.rms_norm_fp8_w8a16(
-        x, normalized_shape, weight_q, weight_scale, eps=1e-5
-    )
+def _gems_rms_norm_w8a16(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
+    return rms_norm_w8a16_fp8(x, normalized_shape, weight_fp8, weight_scale)
 
 
-class RmsNormW8A16TheadBenchmark(base.Benchmark):
-    DEFAULT_DTYPES = [torch.bfloat16]
-    DEFAULT_SHAPE_DESC = "tokens, hidden"
-    DEFAULT_METRICS = consts.DEFAULT_METRICS[:] + ["gbps"]
+class RmsNormFp8Benchmark(base.Benchmark):
+    DEFAULT_SHAPE_DESC = "M, N"
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = list(W8A16_SHAPES)
-
-    def get_gbps(self, args, latency=None):
-        x, _, weight_q, weight_scale, _ = args
-        nbytes = (
-            2 * x.numel() * x.element_size()
-            + weight_q.numel() * weight_q.element_size()
-            + weight_scale.numel() * weight_scale.element_size()
-        )
-        return nbytes * 1e-9 / (latency * 1e-3)
-
-    def get_input_iter(self, cur_dtype):
-        for tokens, hidden in self.shapes:
-            x = torch.randn(tokens, hidden, dtype=cur_dtype, device=self.device)
-            weight = torch.randn(hidden, dtype=cur_dtype, device=self.device)
-            weight_q, weight_scale = _quantize_int8_grouped(weight)
-            weight_ref = _dequant_int8_grouped(weight_q, weight_scale)
-            yield x, (hidden,), weight_q, weight_scale, weight_ref
+        self.shapes = [
+            (1, 4096),
+            (16, 4096),
+            (64, 4096),
+            (256, 4096),
+            (1024, 4096),
+            (1, 8192),
+            (64, 8192),
+            (256, 8192),
+            (1, 16384),
+            (64, 16384),
+        ]
 
 
-@pytest.mark.rms_norm
+class RmsNormFp8W8A16Benchmark(RmsNormFp8Benchmark):
+    def get_input_iter(self, dtype):
+        for shape in self.shapes:
+            _, n = shape
+            x = torch.randn(shape, dtype=dtype, device=self.device)
+            weight = torch.randn(n, dtype=dtype, device=self.device)
+            weight_fp8, weight_scale = _quantize_fp8_grouped(weight)
+            yield x, (n,), weight_fp8, weight_scale, weight
+
+
+@pytest.mark.rms_norm_w8a16_fp8
 @pytest.mark.skipif(
-    flag_gems.vendor_name != "thead",
-    reason="W8A16 RMSNorm is implemented on THead / PPU only",
+    not _cuda_fp8_e4m3fn_available(),
+    reason="RMSNorm FP8-W8A16 benchmark requires CUDA float8_e4m3fn support",
 )
-def test_rms_norm_w8a16_thead():
-    bench = RmsNormW8A16TheadBenchmark(
-        op_name="rms_norm_fp8_w8a16",
-        torch_op=_ref_rms_norm,
+def test_rms_norm_w8a16_fp8():
+    bench = RmsNormFp8W8A16Benchmark(
+        op_name="rms_norm_w8a16_fp8",
+        torch_op=_torch_rms_norm_w8a16,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_rms_norm_w8a16)

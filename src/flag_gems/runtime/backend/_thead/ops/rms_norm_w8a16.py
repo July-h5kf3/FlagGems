@@ -14,10 +14,11 @@
 
 """THead / PPU W8A16 RMSNorm.
 
-Activation is 16-bit (FP16/BF16). Weight is grouped INT8 plus per-group
-scale (group_size=128).
+Activation is 16-bit (FP16/BF16). Weight is grouped FP8 E4M3
+(``torch.float8_e4m3fn``) plus per-group scale (group_size=128), matching
+PR #4437.
 
-INT8 weights are typically static, so they are dequantized once per unique
+Weights are typically static, so they are dequantized once per unique
 storage and reused. The hot path is then a Gems-like RMSNorm that does not
 write ``inv_rms``. CUDA Graph capture after warmup therefore records only
 the RMSNorm launch.
@@ -43,24 +44,6 @@ _DEQUANT_CACHE_MAX = 16
 @triton.jit
 def prev_multiple_of(a, b):
     return tl.cdiv(a, b) * b - b
-
-
-@libentry()
-@triton.jit
-def dequant_grouped_kernel(
-    out_ptr,
-    w_ptr,
-    scale_ptr,
-    N,
-    GROUP_SIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    cols = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = cols < N
-    q = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.load(scale_ptr + cols // GROUP_SIZE, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + cols, q * scale, mask=mask)
 
 
 @libentry()
@@ -148,11 +131,11 @@ def _dequant_weight(weight_q, weight_scale, group_size, out_dtype):
         and cached.device == weight_q.device
     ):
         return cached
-    w = torch.empty(n, device=weight_q.device, dtype=out_dtype)
-    block = 1024
-    dequant_grouped_kernel[triton.cdiv(n, block),](
-        w, weight_q, weight_scale, n, group_size, block, num_warps=4
-    )
+    # Cast in PyTorch so PPU does not need Triton fp8e4nv loads.
+    w = (
+        weight_q.to(torch.float32)
+        * weight_scale.to(torch.float32).repeat_interleave(group_size)
+    ).to(out_dtype)
     if len(_DEQUANT_CACHE) >= _DEQUANT_CACHE_MAX:
         _DEQUANT_CACHE.pop(next(iter(_DEQUANT_CACHE)))
     _DEQUANT_CACHE[key] = w
@@ -170,8 +153,11 @@ def rms_norm_w8a16_thead(
         raise ValueError(
             f"normalized_shape product {N} must be divisible by group_size={group_size}"
         )
-    if weight_q.dtype != torch.int8:
-        raise TypeError(f"PPU W8A16 RMSNorm expects INT8 weight, got {weight_q.dtype}")
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None or weight_q.dtype != fp8_dtype:
+        raise TypeError(
+            f"PPU W8A16 RMSNorm expects float8_e4m3fn weight, got {weight_q.dtype}"
+        )
     if weight_scale.numel() != N // group_size:
         raise ValueError(
             f"weight_scale numel {weight_scale.numel()} != {N // group_size} groups"
@@ -191,5 +177,6 @@ def rms_norm_w8a16_thead(
     return y
 
 
-# Public name matches the W8A16 RMSNorm API used by other vendors.
+# Public name matches PR #4437 (`rms_norm_w8a16_fp8`).
+rms_norm_w8a16_fp8 = rms_norm_w8a16_thead
 rms_norm_fp8_w8a16 = rms_norm_w8a16_thead
