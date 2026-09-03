@@ -19,7 +19,12 @@
 
 Hopper #3821 uses FP8 E4M3 tensor cores. PPU Triton has no ``fp8e4nv``, so this
 backend quantizes BF16/FP16/FP32 inputs to INT8 (per-row A, per-column B) and
-runs an INT8 GEMM. Quantized A/B are cached by storage identity.
+runs an INT8 GEMM. A/B tiles are moved with AIU via
+``tle.load(block_ptr, is_async=True)``. Quantized A/B are cached by storage
+identity.
+
+Requires a FlagTree build that lowers INT8 AIU to ``ppu.cp.async.aiu...2d.b8``
+(FlagTree #1026 / QCLDC INT8 AIU). Older compilers emit ``.b16`` and fault.
 """
 
 from __future__ import annotations
@@ -34,7 +39,11 @@ import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
-from flag_gems.utils import triton_lang_extension as tle
+
+try:
+    from triton.experimental.tle import language as tle_async
+except ImportError:  # pragma: no cover
+    tle_async = None
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +84,7 @@ def _mm_w8a8_int8_kernel(
     GROUP_M: tl.constexpr,
     NUM_WARPS: tl.constexpr,
 ):
-    pid = tle.program_id(0)
+    pid = tl.program_id(0)
     pid_m, pid_n = _grouped_pids(pid, M, N, BLOCK_M, BLOCK_N, GROUP_M)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -112,22 +121,93 @@ def _mm_w8a8_int8_kernel(
     )
 
 
-def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
-    """Return BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, warps, stages."""
-    # tl.dot(int8) on PPU requires K tile >= 32.
-    block_k = 128 if k >= 128 else max(32, triton.next_power_of_2(k))
-    block_n = 128 if n >= 128 else max(16, triton.next_power_of_2(n))
-    if m <= 8:
-        block_m = 8
-    elif m <= 16:
+if tle_async is not None:
+
+    @libentry()
+    @triton.jit(do_not_specialize_on_alignment=["A_Q", "B_Q", "OUT"])
+    def _mm_w8a8_aiu_kernel(
+        A_Q,
+        B_Q,
+        A_SCALE,
+        B_SCALE,
+        OUT,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        NUM_WARPS: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        a_block_ptr = tl.make_block_ptr(
+            A_Q,
+            shape=(M, K),
+            strides=(K, 1),
+            offsets=(pid_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_K),
+            order=(1, 0),
+        )
+        # B is physically contiguous [N, K], logically column-major [K, N].
+        b_block_ptr = tl.make_block_ptr(
+            B_Q,
+            shape=(K, N),
+            strides=(1, K),
+            offsets=(0, pid_n * BLOCK_N),
+            block_shape=(BLOCK_K, BLOCK_N),
+            order=(0, 1),
+        )
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        for _ in range(0, tl.cdiv(K, BLOCK_K)):
+            a = tle_async.load(
+                a_block_ptr,
+                boundary_check=(0, 1),
+                padding_option="zero",
+                is_async=True,
+            )
+            b = tle_async.load(
+                b_block_ptr,
+                boundary_check=(0, 1),
+                padding_option="zero",
+                is_async=True,
+            )
+            acc += tl.dot(a, b)
+            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        a_scale = tl.load(A_SCALE + offs_m, mask=offs_m < M, other=0.0).to(tl.float32)
+        b_scale = tl.load(B_SCALE + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+        out = (acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]).to(
+            OUT.dtype.element_ty
+        )
+        tl.store(
+            OUT + offs_m[:, None] * N + offs_n[None, :],
+            out,
+            mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+        )
+
+
+def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
+    """Return BLOCK_M, BLOCK_N, BLOCK_K, warps, stages.
+
+    Tiles follow FlagTree INT8 AIU GEMM tests: K tile >= 32, small epilogue
+    uses 1 warp, 64-wide tiles use 4 warps.
+    """
+    block_k = 64 if k >= 64 else 32
+    if m <= 16:
         block_m = 16
-    elif m <= 64:
-        block_m = 32
-        block_n = min(block_n, 64)
-    else:
-        block_m = 64
-        block_n = min(block_n, 64)
-    return block_m, block_n, block_k, 4, 4, 3
+        if n <= 16:
+            return block_m, 16, block_k, 1, 2
+        if n <= 32:
+            return block_m, 32, block_k, 1, 2
+        return block_m, 64, block_k, 4, 2
+    if m <= 32:
+        block_n = 32 if n <= 32 else 64
+        return 32, block_n, block_k, 4, 2
+    return 64, 64, block_k, 4, 2
 
 
 def _cache_key(source: torch.Tensor) -> tuple:
@@ -235,35 +315,56 @@ def _launch(
     n: int,
     k: int,
 ) -> torch.Tensor:
-    block_m, block_n, block_k, group_m, num_warps, num_stages = _pick_tiles(m, n, k)
-    grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
+    block_m, block_n, block_k, num_warps, num_stages = _pick_tiles(m, n, k)
     logger.debug(
-        "GEMS_THEAD MM_W8A8 m=%s n=%s k=%s tiles=(%s,%s,%s)",
+        "GEMS_THEAD MM_W8A8_AIU m=%s n=%s k=%s tiles=(%s,%s,%s) warps=%s aiu=%s",
         m,
         n,
         k,
         block_m,
         block_n,
         block_k,
+        num_warps,
+        tle_async is not None,
     )
     with torch_device_fn.device(a_q.device):
-        _mm_w8a8_int8_kernel[grid](
-            a_q,
-            b_q,
-            a_scale,
-            b_scale,
-            out,
-            m,
-            n,
-            k,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-            GROUP_M=group_m,
-            NUM_WARPS=num_warps,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
+        if tle_async is not None:
+            grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+            _mm_w8a8_aiu_kernel[grid](
+                a_q,
+                b_q,
+                a_scale,
+                b_scale,
+                out,
+                m,
+                n,
+                k,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                NUM_WARPS=num_warps,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+        else:
+            grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
+            _mm_w8a8_int8_kernel[grid](
+                a_q,
+                b_q,
+                a_scale,
+                b_scale,
+                out,
+                m,
+                n,
+                k,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                GROUP_M=4,
+                NUM_WARPS=num_warps,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
     return out
 
 
