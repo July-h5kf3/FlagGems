@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import statistics
+
 import pytest
 import torch
 
 import flag_gems
 
-from . import base
+from . import base, consts
+from .conftest import Config
 
 
 @pytest.mark.rms_norm
@@ -85,8 +88,12 @@ def _quantize_fp8_grouped(w, group_size=GROUP_SIZE):
     return q.reshape(m, n).contiguous(), scale.squeeze(-1).to(w.dtype).contiguous()
 
 
-def _torch_rms_norm_w8a16(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
+def _torch_bf16_rms_norm(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
     return torch.nn.functional.rms_norm(x, normalized_shape, weight_ref)
+
+
+def _gems_bf16_rms_norm(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
+    return flag_gems.rms_norm(x, normalized_shape, weight_ref)
 
 
 def _quantize_w8a16_weight(w, group_size=GROUP_SIZE):
@@ -97,6 +104,47 @@ def _quantize_w8a16_weight(w, group_size=GROUP_SIZE):
 
 def _gems_rms_norm_w8a16(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
     return flag_gems.rms_norm_w8a16_fp8(x, normalized_shape, weight_fp8, weight_scale)
+
+
+def _do_bench_graph(fn, rep=100):
+    # Capture once and replay, so host launch overhead is amortized out.
+    if flag_gems.vendor_name == "ascend":
+        device = torch.npu
+        Graph = torch.npu.NPUGraph
+        graph_ctx = lambda g: torch.npu.graph(g, capture_error_mode="relaxed")
+    else:
+        device = torch.cuda
+        Graph = torch.cuda.CUDAGraph
+        graph_ctx = torch.cuda.graph
+
+    with device.stream(device.Stream()):
+        fn()
+        start_event = device.Event(enable_timing=True)
+        end_event = device.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(5):
+            fn()
+        end_event.record()
+        device.synchronize()
+        estimate_ms = start_event.elapsed_time(end_event) / 5
+        n_repeat = 1000 if estimate_ms == 0 else max(1, int(rep / estimate_ms))
+
+        graph = Graph()
+        with graph_ctx(graph):
+            for _ in range(n_repeat):
+                fn()
+        device.synchronize()
+
+        times = []
+        for _ in range(10):
+            start_event = device.Event(enable_timing=True)
+            end_event = device.Event(enable_timing=True)
+            start_event.record()
+            graph.replay()
+            end_event.record()
+            device.synchronize()
+            times.append(start_event.elapsed_time(end_event) / n_repeat)
+        return statistics.median(times)
 
 
 class RmsNormFp8Benchmark(base.Benchmark):
@@ -126,6 +174,12 @@ class RmsNormFp8W8A16Benchmark(RmsNormFp8Benchmark):
             weight_fp8, weight_scale = _quantize_w8a16_weight(weight)
             yield x, (n,), weight_fp8, weight_scale, weight
 
+    def get_latency(self, op, *args, **kwargs):
+        return _do_bench_graph(
+            lambda: op(*args, **kwargs),
+            rep=Config.repetition,
+        )
+
 
 @pytest.mark.rms_norm_w8a16_fp8
 @pytest.mark.skipif(
@@ -133,10 +187,15 @@ class RmsNormFp8W8A16Benchmark(RmsNormFp8Benchmark):
     reason="RMSNorm W8A16 requires Ascend or CUDA sm90+ float8_e4m3fn",
 )
 def test_rms_norm_w8a16_fp8():
-    bench = RmsNormFp8W8A16Benchmark(
-        op_name="rms_norm_w8a16_fp8",
-        torch_op=_torch_rms_norm_w8a16,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_gems_rms_norm_w8a16)
-    bench.run()
+    Config.mode = consts.BenchMode.CUDAGRAPH
+    for op_name, baseline in (
+        ("rms_norm_w8a16_fp8_vs_torch", _torch_bf16_rms_norm),
+        ("rms_norm_w8a16_fp8_vs_gems", _gems_bf16_rms_norm),
+    ):
+        bench = RmsNormFp8W8A16Benchmark(
+            op_name=op_name,
+            torch_op=baseline,
+            dtypes=[torch.bfloat16],
+        )
+        bench.set_gems(_gems_rms_norm_w8a16)
+        bench.run()
