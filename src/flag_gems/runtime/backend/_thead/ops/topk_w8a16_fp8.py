@@ -25,7 +25,6 @@ from flag_gems.ops.topk import (
     _MIN_INT32_VAL,
     _MIN_INT64_VAL,
     argsort,
-    topk_stage2_kernel,
 )
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
@@ -110,7 +109,14 @@ def topk_fp8_single_stage_kernel(
 
 
 @triton.jit
-def _merge_sorted_topk(best_val, best_idx, tile_val, tile_idx, BLOCK: tl.constexpr, DESCENDING: tl.constexpr):
+def _merge_sorted_topk(
+    best_val,
+    best_idx,
+    tile_val,
+    tile_idx,
+    BLOCK: tl.constexpr,
+    DESCENDING: tl.constexpr,
+):
     sval, sidx = argsort(tile_val, tile_idx, 0, DESCENDING)
     row0 = tl.arange(0, 2)[:, None] == 0
     mval = tl.where(row0, best_val.reshape(1, BLOCK), sval.reshape(1, BLOCK)).reshape(
@@ -258,9 +264,7 @@ def topk_fp8_one_group_packed_kernel(
 
     out_mask = cols < k
     selected_key = (packed >> 16).to(tl.uint8)
-    selected_flip = tl.where(
-        (selected_key & 0x80) != 0, 0x80, 0xFF
-    ).to(tl.uint8)
+    selected_flip = tl.where((selected_key & 0x80) != 0, 0x80, 0xFF).to(tl.uint8)
     selected_bits = selected_key ^ selected_flip
     selected_values = _fp8_e5_to_f32(selected_bits)
     scale = tl.load(scale_ptr + pid).to(tl.float32)
@@ -296,9 +300,7 @@ def topk_fp8_two_group_packed_kernel(
     key_0 = tl.where(values_0 != values_0, 0xFF, key_0).to(tl.uint8)
     key_1 = tl.where(values_1 != values_1, 0xFF, key_1).to(tl.uint8)
     packed_0 = (key_0.to(tl.uint32) << 16) | (0xFFFF - local).to(tl.uint32)
-    packed_1 = (key_1.to(tl.uint32) << 16) | (
-        0xFFFF - GROUP_SIZE - local
-    ).to(tl.uint32)
+    packed_1 = (key_1.to(tl.uint32) << 16) | (0xFFFF - GROUP_SIZE - local).to(tl.uint32)
     packed_0 = tl.sort(packed_0, dim=0, descending=True)
     packed_1 = tl.sort(packed_1, dim=0, descending=True)
 
@@ -309,9 +311,7 @@ def topk_fp8_two_group_packed_kernel(
     selected = tl.where(candidate_offsets < k, selected_0, selected_1)
 
     raw_key = (selected >> 16).to(tl.uint8)
-    raw_flip = tl.where(
-        (raw_key & 0x80) != 0, 0x80, 0xFF
-    ).to(tl.uint8)
+    raw_flip = tl.where((raw_key & 0x80) != 0, 0x80, 0xFF).to(tl.uint8)
     raw_bits = raw_key ^ raw_flip
     raw_values = _fp8_e5_to_f32(raw_bits)
     group_idx = (candidate_offsets >= k).to(tl.int32)
@@ -320,21 +320,15 @@ def topk_fp8_two_group_packed_kernel(
     indices = (0xFFFF - (selected & 0xFFFF)).to(tl.int32)
 
     value_bits = values.to(tl.uint16, bitcast=True)
-    value_flip = tl.where(
-        (value_bits & 0x8000) != 0, 0xFFFF, 0x8000
-    ).to(tl.uint16)
+    value_flip = tl.where((value_bits & 0x8000) != 0, 0xFFFF, 0x8000).to(tl.uint16)
     value_key = value_bits ^ value_flip
     value_key = tl.where(values != values, 0xFFFF, value_key).to(tl.uint16)
-    merged = (value_key.to(tl.uint32) << 16) | (
-        0xFFFF - indices
-    ).to(tl.uint32)
+    merged = (value_key.to(tl.uint32) << 16) | (0xFFFF - indices).to(tl.uint32)
     merged = tl.sort(merged, dim=0, descending=True)
 
     out_mask = candidate_offsets < k
     out_key = (merged >> 16).to(tl.uint16)
-    out_flip = tl.where(
-        (out_key & 0x8000) != 0, 0x8000, 0xFFFF
-    ).to(tl.uint16)
+    out_flip = tl.where((out_key & 0x8000) != 0, 0x8000, 0xFFFF).to(tl.uint16)
     out_bits = out_key ^ out_flip
     final_values = out_bits.to(tl.bfloat16, bitcast=True)
     final_indices = (0xFFFF - (merged & 0xFFFF)).to(tl.int64)
@@ -1037,12 +1031,8 @@ if HAS_TLE_GPU:
             K - k_to_find,
         )
         counter_offsets = tl.zeros([BLOCK_N], dtype=tl.int32)
-        gt_count_ptrs = tle_gpu.gpu.local_ptr(
-            smem_write_count, (counter_offsets,)
-        )
-        eq_count_ptrs = tle_gpu.gpu.local_ptr(
-            smem_write_count, (counter_offsets + 1,)
-        )
+        gt_count_ptrs = tle_gpu.gpu.local_ptr(smem_write_count, (counter_offsets,))
+        eq_count_ptrs = tle_gpu.gpu.local_ptr(smem_write_count, (counter_offsets + 1,))
 
         for t in tl.range(0, n_tiles):
             local = t * BLOCK_N + tl.arange(0, BLOCK_N)
