@@ -19,11 +19,13 @@ because Ascend UB / compiler cannot load FP8. Layout matches the NVIDIA
 FP8-W8A16 RMSNorm path: group_size=128.
 
 Dispatch:
-- Power-of-two N <= 8192: 1D row kernel. Scale is loaded uniquely and
+- Power-of-two N <= 4096: 1D kernel with BLOCK_M rows so INT8 weight +
+  scale are loaded once per program and reused. Mid-size M uses
+  BLOCK_M=8; small and very large M use BLOCK_M=2 (higher occupancy).
+- Power-of-two N <= 8192: 1D row kernel. Full-row BLOCK_M overflows
+  Ascend UB by a few hundred bytes. Scale is loaded uniquely and
   broadcast via reshape (no ``cols // group_size`` gather, no ``(G, 128)``
   FP32 2D tile — that layout has a 512B row stride and conflicts on UB).
-- Power-of-two N <= 4096 and M >= 256: 1D kernel with BLOCK_M rows so
-  INT8 weight + scale are loaded once per program and reused.
 - Otherwise: tiled 1D kernel (GROUPS_PER_TILE=64) to stay in UB
 """
 
@@ -283,8 +285,14 @@ def rms_norm_w8a16_fp8(
         # Power-of-two N <= 8192: contiguous 1D load + unique scale broadcast.
         # Do not gather on ``cols // group_size`` (~97% scalar) and do not use
         # a ``(G, 128)`` FP32 2D tile (512B row stride, UB bank conflict).
-        if N <= 4096 and N == triton.next_power_of_2(N) and M >= 256:
-            block_m = 8
+        if N <= 4096 and N == triton.next_power_of_2(N):
+            # BLOCK_M=8 is best for a few hundred rows; BLOCK_M=2 wins on
+            # tiny M (occupancy) and large M (more programs, same reuse).
+            if 256 <= M < 1024:
+                block_m, num_warps = 8, 2
+            else:
+                block_m = 2
+                num_warps = 2 if 16 <= M < 256 else 4
             grid = triton.cdiv(M, block_m)
             rms_norm_fp8_w8a16_blockm_kernel[grid,](
                 y,
@@ -298,10 +306,9 @@ def rms_norm_w8a16_fp8(
                 group_size,
                 num_groups,
                 block_m,
-                num_warps=4,
+                num_warps=num_warps,
             )
         elif N <= 8192 and N == triton.next_power_of_2(N):
-            num_warps = 8 if (N == 4096 and M >= 512) else 4
             rms_norm_fp8_w8a16_kernel[M,](
                 y,
                 x,
@@ -312,7 +319,7 @@ def rms_norm_w8a16_fp8(
                 N,
                 group_size,
                 num_groups,
-                num_warps=num_warps,
+                num_warps=4,
             )
         else:
             # 128*128 grouped tile overflows Ascend UB; 64*128 1D tiles are safe.
