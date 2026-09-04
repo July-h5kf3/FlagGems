@@ -330,11 +330,6 @@ def _get_cached_b(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return _store_cache(_B_CACHE, key, _quantize_b_per_col(b))
 
 
-def clear_mm_w8a8_fp8_caches() -> None:
-    _A_CACHE.clear()
-    _B_CACHE.clear()
-
-
 def _validate_mm_inputs(a, b) -> tuple[int, int, int]:
     if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
         raise TypeError("mm_w8a8_fp8 expects torch.Tensor inputs")
