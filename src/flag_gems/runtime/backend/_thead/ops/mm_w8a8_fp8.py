@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import OrderedDict
+from typing import Optional
 
 import torch
 import triton
@@ -53,6 +54,8 @@ _A_CACHE: OrderedDict = OrderedDict()
 _B_CACHE: OrderedDict = OrderedDict()
 _SUPPORTED_FLOAT = {torch.bfloat16, torch.float16, torch.float32}
 _INT8_QMAX = 127
+# Skinny N is padded to this so AIU/MMA can skip boundary_check on B.
+_B_N_ALIGN = 16
 
 
 @triton.jit
@@ -134,13 +137,17 @@ if tle_async is not None:
         M: tl.constexpr,
         N: tl.constexpr,
         K: tl.constexpr,
+        OUT_N: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
+        BOUNDARY: tl.constexpr,
+        STORE_MASK: tl.constexpr,
         NUM_WARPS: tl.constexpr,
     ):
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
+        pid = tl.program_id(0)
+        pid_m, pid_n = _grouped_pids(pid, M, N, BLOCK_M, BLOCK_N, GROUP_M)
         a_block_ptr = tl.make_block_ptr(
             A_Q,
             shape=(M, K),
@@ -150,6 +157,7 @@ if tle_async is not None:
             order=(1, 0),
         )
         # B is physically contiguous [N, K], logically column-major [K, N].
+        # N may be padded to BLOCK_N so skinny GEMM can skip load boundary checks.
         b_block_ptr = tl.make_block_ptr(
             B_Q,
             shape=(K, N),
@@ -159,55 +167,96 @@ if tle_async is not None:
             order=(0, 1),
         )
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-        for _ in range(0, tl.cdiv(K, BLOCK_K)):
-            a = tle_async.load(
-                a_block_ptr,
-                boundary_check=(0, 1),
-                padding_option="zero",
-                is_async=True,
-            )
-            b = tle_async.load(
-                b_block_ptr,
-                boundary_check=(0, 1),
-                padding_option="zero",
-                is_async=True,
-            )
-            acc += tl.dot(a, b)
-            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+        if BOUNDARY:
+            for _ in range(0, tl.cdiv(K, BLOCK_K)):
+                a = tle_async.load(
+                    a_block_ptr,
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                    is_async=True,
+                )
+                b = tle_async.load(
+                    b_block_ptr,
+                    boundary_check=(0, 1),
+                    padding_option="zero",
+                    is_async=True,
+                )
+                acc = tl.dot(a, b, acc=acc, out_dtype=tl.int32)
+                a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+                b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+        else:
+            for _ in range(0, tl.cdiv(K, BLOCK_K)):
+                a = tle_async.load(a_block_ptr, is_async=True)
+                b = tle_async.load(b_block_ptr, is_async=True)
+                acc = tl.dot(a, b, acc=acc, out_dtype=tl.int32)
+                a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+                b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        a_scale = tl.load(A_SCALE + offs_m, mask=offs_m < M, other=0.0).to(tl.float32)
-        b_scale = tl.load(B_SCALE + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
-        out = (acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]).to(
-            OUT.dtype.element_ty
-        )
-        tl.store(
-            OUT + offs_m[:, None] * N + offs_n[None, :],
-            out,
-            mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-        )
+        if STORE_MASK:
+            a_scale = tl.load(A_SCALE + offs_m, mask=offs_m < M, other=0.0).to(
+                tl.float32
+            )
+            b_scale = tl.load(B_SCALE + offs_n, mask=offs_n < N, other=0.0).to(
+                tl.float32
+            )
+            out = (acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]).to(
+                OUT.dtype.element_ty
+            )
+            tl.store(
+                OUT + offs_m[:, None] * OUT_N + offs_n[None, :],
+                out,
+                mask=(offs_m[:, None] < M) & (offs_n[None, :] < OUT_N),
+            )
+        else:
+            a_scale = tl.load(A_SCALE + offs_m).to(tl.float32)
+            b_scale = tl.load(B_SCALE + offs_n).to(tl.float32)
+            out = (acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]).to(
+                OUT.dtype.element_ty
+            )
+            tl.store(OUT + offs_m[:, None] * OUT_N + offs_n[None, :], out)
 
 
-def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
-    """Return BLOCK_M, BLOCK_N, BLOCK_K, warps, stages.
+def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
+    """Return BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, GROUP_M.
 
-    Tiles follow FlagTree INT8 AIU GEMM tests: K tile >= 32, small epilogue
-    uses 1 warp, 64-wide tiles use 4 warps.
+    INT8 AIU v1 wants channel bytes of 32/64/128. Prefer BLOCK_K=128 on
+    long K so each CTA does fewer AIU/MMA rounds and can prefetch deeper.
+    Never pad BLOCK_N far past N: a 64-wide MMA on N=1 is ~64x wasted work.
     """
-    block_k = 64 if k >= 64 else 32
+    if k >= 256:
+        block_k = 128
+    elif k >= 64:
+        block_k = 64
+    else:
+        block_k = 32
+    if k >= 2048:
+        stages = 4
+    elif k >= 512:
+        stages = 3
+    else:
+        stages = 2
+    group_m = 8
+    # Keep BLOCK_N close to N so skinny GEMM does not compute unused columns.
+    if n <= 16:
+        block_n = 16
+    elif n <= 32:
+        block_n = 32
+    elif n < 512:
+        block_n = 64
+    else:
+        block_n = 128
     if m <= 16:
-        block_m = 16
-        if n <= 16:
-            return block_m, 16, block_k, 1, 2
-        if n <= 32:
-            return block_m, 32, block_k, 1, 2
-        return block_m, 64, block_k, 4, 2
+        # Tiny wide GEMM is launch-bound; one warp + BLOCK_K=128 beats gems BF16.
+        if n <= 256 and k <= 256 and k >= 128:
+            return 16, min(block_n, 64), 128, 1, 2, group_m
+        warps = 1 if block_n <= 32 else 4
+        return 16, block_n, block_k, warps, stages, group_m
     if m <= 32:
-        block_n = 32 if n <= 32 else 64
-        return 32, block_n, block_k, 4, 2
-    return 64, 64, block_k, 4, 2
+        warps = 2 if block_n <= 16 else 4
+        return 32, block_n, block_k, warps, stages, group_m
+    return 64, block_n, block_k, 4, stages, group_m
 
 
 def _cache_key(source: torch.Tensor) -> tuple:
@@ -243,6 +292,13 @@ def _quantize_b_per_col(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         .t()
         .contiguous()
     )
+    n = quantized.shape[0]
+    if 0 < n < _B_N_ALIGN:
+        padded = quantized.new_zeros((_B_N_ALIGN, quantized.shape[1]))
+        padded[:n].copy_(quantized)
+        scale_pad = scale.new_zeros((_B_N_ALIGN,))
+        scale_pad[:n].copy_(scale)
+        return padded, scale_pad.contiguous()
     return quantized, scale.contiguous()
 
 
@@ -315,21 +371,30 @@ def _launch(
     n: int,
     k: int,
 ) -> torch.Tensor:
-    block_m, block_n, block_k, num_warps, num_stages = _pick_tiles(m, n, k)
+    block_m, block_n, block_k, num_warps, num_stages, group_m = _pick_tiles(
+        m, n, k
+    )
+    n_b = int(b_q.shape[0])
+    boundary = (m % block_m) != 0 or (n_b % block_n) != 0 or (k % block_k) != 0
+    store_mask = boundary or (n != n_b)
     logger.debug(
-        "GEMS_THEAD MM_W8A8_AIU m=%s n=%s k=%s tiles=(%s,%s,%s) warps=%s aiu=%s",
+        "GEMS_THEAD MM_W8A8_AIU m=%s n=%s k=%s n_b=%s tiles=(%s,%s,%s) warps=%s stages=%s aiu=%s boundary=%s store_mask=%s",
         m,
         n,
         k,
+        n_b,
         block_m,
         block_n,
         block_k,
         num_warps,
+        num_stages,
         tle_async is not None,
+        boundary,
+        store_mask,
     )
     with torch_device_fn.device(a_q.device):
         if tle_async is not None:
-            grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+            grid = (triton.cdiv(m, block_m) * triton.cdiv(n_b, block_n),)
             _mm_w8a8_aiu_kernel[grid](
                 a_q,
                 b_q,
@@ -337,11 +402,15 @@ def _launch(
                 b_scale,
                 out,
                 m,
-                n,
+                n_b,
                 k,
+                n,
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
                 BLOCK_K=block_k,
+                GROUP_M=group_m,
+                BOUNDARY=boundary,
+                STORE_MASK=store_mask,
                 NUM_WARPS=num_warps,
                 num_warps=num_warps,
                 num_stages=num_stages,
@@ -360,7 +429,7 @@ def _launch(
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
                 BLOCK_K=block_k,
-                GROUP_M=4,
+                GROUP_M=group_m,
                 NUM_WARPS=num_warps,
                 num_warps=num_warps,
                 num_stages=num_stages,
@@ -368,7 +437,7 @@ def _launch(
     return out
 
 
-def mm_w8a8_fp8(a, b, *, out_dtype=None):
+def mm_w8a8_fp8(a, b, *, out_dtype: Optional[torch.dtype] = None):
     m, n, k = _validate_mm_inputs(a, b)
     a_q, a_scale, b_q, b_scale = _prepare_inputs(a, b)
     dtype = out_dtype or a.dtype
