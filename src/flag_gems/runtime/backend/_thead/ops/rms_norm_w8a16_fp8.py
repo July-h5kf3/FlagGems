@@ -211,7 +211,7 @@ def _dequant_weight(weight_q, weight_scale, group_size, out_dtype):
     return w
 
 
-def rms_norm_w8a16_thead(
+def rms_norm_w8a16_fp8(
     x, normalized_shape, weight_q, weight_scale, eps=1e-5, group_size=128
 ):
     logger.debug("GEMS_THEAD RMS_NORM W8A16 FORWARD")
@@ -237,7 +237,3 @@ def rms_norm_w8a16_thead(
         w = _dequant_weight(weight_q, weight_scale, group_size, x.dtype)
         _launch_rms_norm(y, x, w, M, N, eps)
     return y
-
-
-# Public name matches the generic operator (`rms_norm_w8a16_fp8`).
-rms_norm_w8a16_fp8 = rms_norm_w8a16_thead
