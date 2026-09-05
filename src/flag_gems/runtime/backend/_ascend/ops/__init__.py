@@ -76,6 +76,7 @@ from .max import max, max_dim
 from .mean import mean, mean_dim
 from .min import min, min_dim
 from .mm import mm, mm_out
+from .mm_w8a8_fp8 import mm_w8a8_fp8, mm_w8a8_fp8_out
 from .multinomial import multinomial
 from .nansum import nansum, nansum_out
 from .nonzero_static import nonzero_static, nonzero_static_out
@@ -216,6 +217,8 @@ __all__ = [
     "min_dim",
     "mm",
     "mm_out",
+    "mm_w8a8_fp8",
+    "mm_w8a8_fp8_out",
     "multinomial",
     "nansum",
     "nansum_out",
