@@ -56,7 +56,9 @@ def _torch_topk_w8a16(x_fp8, x_scale, k, dequant):
 
 
 def _gems_topk_w8a16(x_fp8, x_scale, k, dequant):
-    return flag_gems.topk_w8a16_fp8(x_fp8, x_scale, k, dim=-1, largest=True, sorted=True)
+    return flag_gems.topk_w8a16_fp8(
+        x_fp8, x_scale, k, dim=-1, largest=True, sorted=True
+    )
 
 
 class TopKFp8W8A16Benchmark(base.Benchmark):

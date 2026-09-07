@@ -27,12 +27,7 @@ import triton
 import triton.language as tl
 
 import flag_gems
-from flag_gems.ops.topk import (
-    _MAX_INT32_VAL,
-    _MIN_INT32_VAL,
-    _MIN_INT64_VAL,
-    argsort,
-)
+from flag_gems.ops.topk import _MAX_INT32_VAL, _MIN_INT32_VAL, _MIN_INT64_VAL, argsort
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as tle
