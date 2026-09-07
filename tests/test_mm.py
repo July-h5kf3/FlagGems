@@ -24,6 +24,13 @@ import flag_gems
 from . import accuracy_utils as utils
 from .conftest import QUICK_MODE
 
+
+@pytest.fixture(autouse=True)
+def _disable_flagtune_for_mm_unit_tests(monkeypatch):
+    """Keep operator correctness tests independent of remote tuning models."""
+    monkeypatch.setenv("USE_FLAGTUNE", "0")
+
+
 if QUICK_MODE:
     MNK_SHAPES = [
         (1, 1, 32),
@@ -60,30 +67,6 @@ def _mm_atol_base():
     if flag_gems.vendor_name == "metax":
         return 3e-4
     return 1e-4
-
-
-# Issue #2833: fails at (1, 1, 2)
-@pytest.mark.mm
-@pytest.mark.parametrize("M, N, K", MNK_SHAPES)
-@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-@pytest.mark.parametrize("b_column_major", [True, False])
-def test_mm(M, N, K, dtype, b_column_major):
-    if flag_gems.vendor_name == "tsingmicro" and dtype == torch.float32:
-        pytest.skip("Issue #2834: Skipping fp32 mm test on tsingmicro platform")
-
-    mat1 = torch.randn((M, K), dtype=dtype, device=flag_gems.device)
-    if b_column_major:
-        mat2 = torch.randn((N, K), dtype=dtype, device=flag_gems.device).t()
-    else:
-        mat2 = torch.randn((K, N), dtype=dtype, device=flag_gems.device)
-    ref_mat1 = utils.to_reference(mat1, True)
-    ref_mat2 = utils.to_reference(mat2, True)
-
-    ref_out = torch.mm(ref_mat1, ref_mat2)
-    with flag_gems.use_gems():
-        res_out = torch.mm(mat1, mat2)
-
-    utils.gems_assert_close(res_out, ref_out, dtype, reduce_dim=K, atol=_mm_atol_base())
 
 
 def _cuda_hopper_w8a8_fp8_available():
@@ -139,6 +122,30 @@ def _mm_w8a8_int8_reference(a, b):
     b_q = torch.round(b_fp32 / b_scale[None, :]).clamp(-127, 127)
 
     return (a_q @ b_q) * a_scale[:, None] * b_scale[None, :]
+
+
+# Issue #2833: fails at (1, 1, 2)
+@pytest.mark.mm
+@pytest.mark.parametrize("M, N, K", MNK_SHAPES)
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+@pytest.mark.parametrize("b_column_major", [True, False])
+def test_mm(M, N, K, dtype, b_column_major):
+    if flag_gems.vendor_name == "tsingmicro" and dtype == torch.float32:
+        pytest.skip("Issue #2834: Skipping fp32 mm test on tsingmicro platform")
+
+    mat1 = torch.randn((M, K), dtype=dtype, device=flag_gems.device)
+    if b_column_major:
+        mat2 = torch.randn((N, K), dtype=dtype, device=flag_gems.device).t()
+    else:
+        mat2 = torch.randn((K, N), dtype=dtype, device=flag_gems.device)
+    ref_mat1 = utils.to_reference(mat1, True)
+    ref_mat2 = utils.to_reference(mat2, True)
+
+    ref_out = torch.mm(ref_mat1, ref_mat2)
+    with flag_gems.use_gems():
+        res_out = torch.mm(mat1, mat2)
+
+    utils.gems_assert_close(res_out, ref_out, dtype, reduce_dim=K, atol=_mm_atol_base())
 
 
 @pytest.mark.mm_w8a8_fp8
