@@ -18,9 +18,9 @@ Activation is 16-bit (FP16/BF16). Weight is grouped FP8 E4M3
 (``torch.float8_e4m3fn``) plus per-group scale (group_size=128), matching
 PR #4437.
 
-Weights are dequantized on every call before RMSNorm. CUDA Graph capture
-records the dequantization as well, so replay reads the current weights
-and scales from the captured input buffers.
+FP8 bytes are decoded and scaled inside RMSNorm. Every invocation and
+CUDA Graph replay reads the current weight and scale buffers, without
+caching tensor values or launching separate dequantization kernels.
 """
 
 import logging
@@ -45,14 +45,31 @@ def prev_multiple_of(a, b):
     return tl.cdiv(a, b) * b - b
 
 
+@triton.jit
+def _decode_e4m3fn(bits):
+    # PPU cannot load fp8e4nv directly. Build the exact FP32 representation
+    # from uint8 storage: E4M3's exponent bias is 7, versus 127 for FP32.
+    bits = bits.to(tl.uint32)
+    magnitude = bits & 0x7F
+    normal = ((magnitude << 20) + (120 << 23)).to(tl.float32, bitcast=True)
+    value = tl.where(magnitude < 8, magnitude.to(tl.float32) * 0.001953125, normal)
+    value = tl.where(magnitude == 0x7F, float("nan"), value)
+    # Set the sign bit directly: lowering a negation to 0 - value can lose -0.
+    return (value.to(tl.uint32, bitcast=True) | ((bits & 0x80) << 24)).to(
+        tl.float32, bitcast=True
+    )
+
+
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_simple_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
+    scale_ptr,
     N,
     eps,
+    GROUP_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_WARPS: tl.constexpr,
 ):
@@ -62,7 +79,9 @@ def rms_norm_simple_kernel(
     mask = cols < N
     x = tl.load(in_ptr + pid * N + cols, mask=mask, other=0.0).to(tl.float32)
     rrms = 1 / tl.sqrt(tl.sum(x * x, axis=0) / N + eps)
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    bits = tl.load(w_ptr + cols, mask=mask, other=0)
+    scale = tl.load(scale_ptr + cols // GROUP_SIZE, mask=mask, other=0).to(tl.float32)
+    w = (_decode_e4m3fn(bits) * scale).to(in_ptr.dtype.element_ty)
     y = (x * rrms).to(in_ptr.dtype.element_ty) * w
     tl.store(out_ptr + pid * N + cols, y, mask=mask)
 
@@ -77,8 +96,10 @@ def rms_norm_simple_loop_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
+    scale_ptr,
     N,
     eps,
+    GROUP_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
 ):
     if tl.constexpr(in_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
@@ -111,7 +132,11 @@ def rms_norm_simple_loop_kernel(
             other=0.0,
             eviction_policy="evict_first",
         ).to(cdtype)
-        w = tl.load(w_ptr + n_offsets, mask=mask, other=0.0)
+        bits = tl.load(w_ptr + n_offsets, mask=mask, other=0)
+        scale = tl.load(scale_ptr + n_offsets // GROUP_SIZE, mask=mask, other=0).to(
+            tl.float32
+        )
+        w = (_decode_e4m3fn(bits) * scale).to(in_ptr.dtype.element_ty)
         y = (x * rrms).to(in_ptr.dtype.element_ty) * w
         tl.store(out_ptr + pid * N + n_offsets, y, mask=mask)
     for start_n in range(TILE_N, N, TILE_N):
@@ -120,7 +145,9 @@ def rms_norm_simple_loop_kernel(
             in_ptr + pid * N + n_offsets,
             eviction_policy="evict_first",
         ).to(cdtype)
-        w = tl.load(w_ptr + n_offsets)
+        bits = tl.load(w_ptr + n_offsets)
+        scale = tl.load(scale_ptr + n_offsets // GROUP_SIZE).to(tl.float32)
+        w = (_decode_e4m3fn(bits) * scale).to(in_ptr.dtype.element_ty)
         y = (x * rrms).to(in_ptr.dtype.element_ty) * w
         tl.store(out_ptr + pid * N + n_offsets, y)
 
@@ -131,6 +158,7 @@ def rms_norm_grouped_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
+    scale_ptr,
     N,
     eps,
     GROUP_SIZE: tl.constexpr,
@@ -144,9 +172,42 @@ def rms_norm_grouped_kernel(
     offsets = groups[:, None] * GROUP_SIZE + cols[None, :]
     x = tl.load(in_ptr + pid * N + offsets).to(tl.float32)
     rrms = 1 / tl.sqrt(tl.sum(x * x) / N + eps)
-    w = tl.load(w_ptr + offsets)
+    bits = tl.load(w_ptr + offsets)
+    scale = tl.load(scale_ptr + groups).to(tl.float32)
+    w = (_decode_e4m3fn(bits) * scale[:, None]).to(in_ptr.dtype.element_ty)
     y = (x * rrms).to(in_ptr.dtype.element_ty) * w
     tl.store(out_ptr + pid * N + offsets, y)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def rms_norm_batched_kernel(
+    out_ptr,
+    in_ptr,
+    w_ptr,
+    scale_ptr,
+    M,
+    N,
+    eps,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+):
+    tl.static_assert(NUM_WARPS > 0)
+    rows = ext.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
+    offsets = rows[:, None] * N + cols[None, :]
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    x = tl.load(in_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    rrms = 1 / tl.sqrt(tl.sum(x * x, axis=1) / N + eps)
+    bits = tl.load(w_ptr + cols, mask=cols < N, other=0)
+    scale = tl.load(scale_ptr + cols // GROUP_SIZE, mask=cols < N, other=0).to(
+        tl.float32
+    )
+    w = (_decode_e4m3fn(bits) * scale).to(in_ptr.dtype.element_ty)
+    y = (x * rrms[:, None]).to(in_ptr.dtype.element_ty) * w[None, :]
+    tl.store(out_ptr + offsets, y, mask=mask)
 
 
 def _num_warps_for(M, N):
@@ -157,14 +218,33 @@ def _num_warps_for(M, N):
     return 4
 
 
-def _launch_rms_norm(y, x, w, M, N, eps):
+def _launch_rms_norm(y, x, w, scale, M, N, eps, group_size):
+    # Reuse decoded weights across rows when there are enough rows to keep
+    # the device occupied. Larger row tiles otherwise increase register use.
+    if M >= 256 and 4096 <= N <= 8192 and N & (N - 1) == 0:
+        block_m, num_warps = (4, 4) if M >= 512 and N <= 4096 else (2, 8)
+        rms_norm_batched_kernel[triton.cdiv(M, block_m),](
+            y,
+            x,
+            w,
+            scale,
+            M,
+            N,
+            eps,
+            group_size,
+            block_m,
+            N,
+            num_warps,
+            num_warps=num_warps,
+        )
+        return
     num_warps = _num_warps_for(M, N)
     # NUM_WARPS is a constexpr so libentry caches each warp count separately
     # (launch kwargs are not part of the entry key).
     # PPU can hold a full row up to 32k; Gems switches to a 2-pass loop at 4k.
-    if N <= 16384 and N % 128 == 0:
+    if N <= 16384 and N % 128 == 0 and N & (N - 1) == 0 and group_size == 128:
         rms_norm_grouped_kernel[M,](
-            y, x, w, N, eps, 128, N // 128, num_warps, num_warps=num_warps
+            y, x, w, scale, N, eps, 128, N // 128, num_warps, num_warps=num_warps
         )
         return
     if N <= 32768:
@@ -172,24 +252,16 @@ def _launch_rms_norm(y, x, w, M, N, eps):
             y,
             x,
             w,
+            scale,
             N,
             eps,
+            group_size,
             triton.next_power_of_2(N),
             num_warps,
             num_warps=num_warps,
         )
         return
-    rms_norm_simple_loop_kernel[M,](y, x, w, N, eps)
-
-
-def _dequant_weight(weight_q, weight_scale, group_size, out_dtype):
-    # Cast in PyTorch so PPU does not need Triton fp8e4nv loads.
-    # A data pointer can be reused by another tensor, and both inputs can
-    # change in place. Recompute instead of caching values by storage address.
-    return (
-        weight_q.to(torch.float32)
-        * weight_scale.to(torch.float32).repeat_interleave(group_size)
-    ).to(out_dtype)
+    rms_norm_simple_loop_kernel[M,](y, x, w, scale, N, eps, group_size)
 
 
 def rms_norm_w8a16_fp8(
@@ -207,6 +279,8 @@ def rms_norm_w8a16_fp8(
         raise TypeError(
             f"PPU W8A16 RMSNorm expects float8_e4m3fn weight, got {weight_q.dtype}"
         )
+    if weight_q.numel() != N:
+        raise ValueError(f"weight_q numel {weight_q.numel()} != {N} elements")
     if weight_scale.numel() != N // group_size:
         raise ValueError(
             f"weight_scale numel {weight_scale.numel()} != {N // group_size} groups"
@@ -215,6 +289,8 @@ def rms_norm_w8a16_fp8(
         x = x.contiguous()
     y = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     with torch_device_fn.device(x.device):
-        w = _dequant_weight(weight_q, weight_scale, group_size, x.dtype)
-        _launch_rms_norm(y, x, w, M, N, eps)
+        # A dtype view only changes metadata; it does not launch a conversion.
+        w = weight_q.contiguous().view(torch.uint8)
+        scale = weight_scale.contiguous()
+        _launch_rms_norm(y, x, w, scale, M, N, eps, group_size)
     return y

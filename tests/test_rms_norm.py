@@ -158,6 +158,48 @@ def test_rms_norm_w8a16_fp8_weight_updates(dtype, capture):
 
 
 @pytest.mark.rms_norm_w8a16_fp8
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "m,n,group_size",
+    [(2, 256, 128), (2, 384, 128), (2, 32768, 64), (2, 33024, 128), (513, 4096, 128)],
+)
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "thead" or not _cuda_fp8_e4m3fn_available(),
+    reason="THead E4M3FN byte decoding across all kernel paths",
+)
+def test_rms_norm_w8a16_fp8_encodings(dtype, m, n, group_size):
+    # Cover all 256 encodings, including signed zero, subnormals, and NaNs.
+    bits = (torch.arange(n, device=flag_gems.device) % 256).to(torch.uint8)
+    if n == 384:
+        bits = bits.repeat_interleave(2)[::2]
+    weight_q = bits.view(FP8_DTYPE)
+    scales = torch.linspace(
+        0.001, 0.01, n // group_size, device=flag_gems.device, dtype=dtype
+    )
+    if n == 384:
+        # Strided input weights/scales were accepted by the unfused path.
+        scales = scales.repeat_interleave(2)[::2]
+    inp = torch.ones((m, n), device=flag_gems.device, dtype=dtype)
+    result = flag_gems.rms_norm_w8a16_fp8(
+        inp, (n,), weight_q, scales, eps=0.0, group_size=group_size
+    )
+    expected = (
+        (weight_q.float().reshape(-1, group_size) * scales.float()[:, None])
+        .flatten()
+        .to(dtype)
+    )
+    # All-one inputs with eps=0 normalize to exactly one, so the public
+    # operator exposes the decoded/scaled weights without normalization error.
+    torch.testing.assert_close(
+        result, expected.expand_as(inp), rtol=0, atol=0, equal_nan=True
+    )
+    zero = expected == 0
+    assert torch.equal(
+        torch.signbit(result[:, zero]), torch.signbit(expected[zero]).expand(m, -1)
+    )
+
+
+@pytest.mark.rms_norm_w8a16_fp8
 @pytest.mark.parametrize(
     "shape",
     [
