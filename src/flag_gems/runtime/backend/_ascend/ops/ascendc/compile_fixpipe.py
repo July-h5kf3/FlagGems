@@ -45,7 +45,9 @@ def _find_ccec() -> str:
     found = shutil.which("ccec") or shutil.which("bisheng")
     if found:
         return found
-    toolkit = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_TOOLKIT_HOME")
+    toolkit = os.environ.get("ASCEND_HOME_PATH") or os.environ.get(
+        "ASCEND_TOOLKIT_HOME"
+    )
     if toolkit:
         cand = Path(toolkit) / "compiler" / "ccec_compiler" / "bin" / "ccec"
         if cand.is_file():
@@ -60,7 +62,9 @@ def _find_ld_lld() -> str:
     found = shutil.which("ld.lld")
     if found:
         return found
-    toolkit = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_TOOLKIT_HOME")
+    toolkit = os.environ.get("ASCEND_HOME_PATH") or os.environ.get(
+        "ASCEND_TOOLKIT_HOME"
+    )
     if toolkit:
         cand = Path(toolkit) / "compiler" / "ccec_compiler" / "bin" / "ld.lld"
         if cand.is_file():
@@ -69,7 +73,9 @@ def _find_ld_lld() -> str:
 
 
 def _tikcpp_include() -> Path:
-    toolkit = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_TOOLKIT_HOME")
+    toolkit = os.environ.get("ASCEND_HOME_PATH") or os.environ.get(
+        "ASCEND_TOOLKIT_HOME"
+    )
     if toolkit:
         tik = Path(toolkit) / "aarch64-linux" / "tikcpp" / "tikcfw"
         if (tik / "kernel_operator.h").is_file():
@@ -175,7 +181,9 @@ def fatbin_path() -> Path:
     return _FATBIN
 
 
-def _ccec_core_cmd(arch: str, src: Path, out: Path, defines: list[str] | None = None) -> list[str]:
+def _ccec_core_cmd(
+    arch: str, src: Path, out: Path, defines: list[str] | None = None
+) -> list[str]:
     tik = _tikcpp_include()
     extras = [f"-D{item}" for item in (defines or [])]
     return [
@@ -341,7 +349,9 @@ def lower_custom_op_to_call(mlir: str) -> str:
     descriptors into ``func.call`` fails later: HIVM wraps the AIC body and
     ``llvm.call`` cannot use values defined outside that region. Extract GM
     addresses next to the call (new SSA, new type) so the call stays legal.
-    Dummy ``outs`` stay out of the C ABI.
+    Legacy dummy ``outs`` stay out of the C ABI. Operations declaring
+    ``extra_attr="flaggems_pass_outputs=true"`` receive output buffer addresses
+    after their inputs. This preserves existing Fixpipe call signatures.
     """
     decls: list[str] = []
     pieces: list[str] = []
@@ -395,6 +405,11 @@ def lower_custom_op_to_call(mlir: str) -> str:
         ins_vals, ins_tys = _split_ins_outs(ins_body)
         operands = _split_mlir_list(ins_vals)
         types = _split_mlir_list(ins_tys)
+        fragment = mlir[hit:cursor]
+        if "flaggems_pass_outputs=true" in fragment:
+            out_vals, out_tys = _split_ins_outs(_outs_body)
+            operands.extend(_split_mlir_list(out_vals))
+            types.extend(_split_mlir_list(out_tys))
         if len(operands) != len(types):
             raise ValueError("hivm.hir.custom operand/type count mismatch")
         call_vals: list[str] = []
@@ -421,7 +436,9 @@ def lower_custom_op_to_call(mlir: str) -> str:
                     f"{indent}{p_name} = memref.extract_aligned_pointer_as_index "
                     f"{name} : {ty} -> index\n"
                 )
-                prefix.append(f"{indent}{i_name} = arith.index_cast {p_name} : index to i64\n")
+                prefix.append(
+                    f"{indent}{i_name} = arith.index_cast {p_name} : index to i64\n"
+                )
                 call_vals.append(i_name)
                 call_tys.append("i64")
             else:
@@ -433,11 +450,14 @@ def lower_custom_op_to_call(mlir: str) -> str:
             f": ({', '.join(call_tys)}) -> (){loc}\n"
         )
         # hivmc on CANN 9.0 rejects hivm.vf_mode / hivm.pipe on func.func.
-        # i64 callees need an AIC core type or hivmc reports "Unknown core type".
+        # i64 callees need an explicit matching core type for hivmc.
+        vector_call = "#hivm.tcore_type<VECTOR>" in fragment
+        func_core = "AIV" if vector_call else "AIC"
+        tensor_core = "VECTOR" if vector_call else "CUBE"
         attrs = [
-            "hivm.func_core_type = #hivm.func_core_type<AIC>",
+            f"hivm.func_core_type = #hivm.func_core_type<{func_core}>",
             "hivm.part_of_mix",
-            "hivm.tcore_type = #hivm.tcore_type<CUBE>",
+            f"hivm.tcore_type = #hivm.tcore_type<{tensor_core}>",
         ]
         decl = (
             f"  func.func private @{iface}({', '.join(call_tys)}) "
@@ -460,7 +480,11 @@ def rewrite_custom_op_segments(mlir: str) -> str:
     """Flatten 3-element CustomOp segment sizes to CANN 9.0's 2-element form."""
 
     def _repl(match: re.Match[str]) -> str:
-        ins, outs, tmps = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        ins, outs, tmps = (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        )
         if tmps != 0:
             raise ValueError(
                 f"hivm.hir.custom has non-empty tmps={tmps}; cannot lower to CANN 9.0"
@@ -585,9 +609,7 @@ def sink_call_operands(mlir: str) -> str:
     return "".join(out)
 
 
-_CALL_RE = re.compile(
-    r"(\s*)func\.call\s+(@\S+)\(([^)]*)\)\s*:\s*\((.*)\)\s*->\s*\(\)"
-)
+_CALL_RE = re.compile(r"(\s*)func\.call\s+(@\S+)\(([^)]*)\)\s*:\s*\((.*)\)\s*->\s*\(\)")
 _FOR_RE = re.compile(
     r"scf\.for\s+(%[\w.]+)\s+=\s+(%[\w.]+)\s+to\s+(%[\w.]+)\s+step\s+(%[\w.]+)\s*:\s*(\S+)"
 )
@@ -621,7 +643,9 @@ def add_for_iter_args_for_calls(mlir: str) -> str:
         local = _region_defs(body) | {iv}
         mapping: dict[str, tuple[str, str]] = {}
         for cm in _CALL_RE.finditer(body):
-            for name, ty in zip(_split_mlir_list(cm.group(3)), _split_mlir_list(cm.group(4))):
+            for name, ty in zip(
+                _split_mlir_list(cm.group(3)), _split_mlir_list(cm.group(4))
+            ):
                 if name not in local and name not in mapping:
                     mapping[name] = (f"%fp_ia_{ia_n[0]}", ty)
                     ia_n[0] += 1
@@ -631,13 +655,17 @@ def add_for_iter_args_for_calls(mlir: str) -> str:
             continue
 
         def _repl_call(cm: re.Match[str]) -> str:
-            indent, callee, vals, tys = cm.group(1), cm.group(2), cm.group(3), cm.group(4)
-            ops = [mapping.get(name, (name, ""))[0] if name in mapping else name
-                   for name in _split_mlir_list(vals)]
-            return (
-                f"{indent}func.call {callee}({', '.join(ops)}) "
-                f": ({tys}) -> ()"
+            indent, callee, vals, tys = (
+                cm.group(1),
+                cm.group(2),
+                cm.group(3),
+                cm.group(4),
             )
+            ops = [
+                mapping.get(name, (name, ""))[0] if name in mapping else name
+                for name in _split_mlir_list(vals)
+            ]
+            return f"{indent}func.call {callee}({', '.join(ops)}) " f": ({tys}) -> ()"
 
         new_body = _CALL_RE.sub(_repl_call, body)
         ia_names = [new for new, _ty in mapping.values()]
@@ -649,7 +677,9 @@ def add_for_iter_args_for_calls(mlir: str) -> str:
             new_body = re.sub(
                 r"scf\.yield\b([^\n]*)",
                 lambda ym: "scf.yield "
-                + ", ".join([ym.group(1).split(":", 1)[0].strip(), *ia_names]).strip(" ,")
+                + ", ".join([ym.group(1).split(":", 1)[0].strip(), *ia_names]).strip(
+                    " ,"
+                )
                 + " : "
                 + ", ".join(
                     [
@@ -671,7 +701,7 @@ def add_for_iter_args_for_calls(mlir: str) -> str:
             f"scf.for {m.group(1)} = {m.group(2)} to {m.group(3)} step {m.group(4)} "
             f"iter_args({inits}) -> ({', '.join(ia_tys)}) : {m.group(5)} "
         )
-        out.append(mlir[pos:m.start()])
+        out.append(mlir[pos : m.start()])
         out.append(header)
         out.append("{\n")
         if new_body.startswith("\n"):
@@ -712,8 +742,8 @@ def flatten_for_with_calls(mlir: str) -> str:
         iv_n[0] += 1
         body = re.sub(rf"{re.escape(iv)}(?![\w.])", new_iv, body)
         line_start = mlir.rfind("\n", pos, m.start()) + 1
-        indent = re.match(r"[ \t]*", mlir[line_start:m.start()]).group(0)
-        out.append(mlir[pos:m.start()])
+        indent = re.match(r"[ \t]*", mlir[line_start : m.start()]).group(0)
+        out.append(mlir[pos : m.start()])
         out.append(f"{indent}{new_iv} = arith.constant 0 : {iv_ty}\n")
         if not body.startswith("\n"):
             out.append("\n")
@@ -766,7 +796,7 @@ def rewrite_cann90_bufferization(mlir: str) -> str:
             to_i = mlir.find("to ", ty_end)
             ty_end = _skip_mlir_type(mlir, to_i + 2)
             out.append(mlir[pos:colon])
-            out.append(mlir[colon: mlir.find("to ", colon)])
+            out.append(mlir[colon : mlir.find("to ", colon)])
             pos = ty_end
         else:
             out.append(mlir[pos:ty_end])
@@ -775,7 +805,9 @@ def rewrite_cann90_bufferization(mlir: str) -> str:
 
 
 _CAST_DEF_RE = re.compile(r"^\s*(%[\w.]+)\s*=\s*memref\.cast\s+(%[\w.]+)\s*:")
-_PTR_DEF_RE = re.compile(r"^\s*(%[\w.]+)\s*=\s*hivm\.hir\.pointer_cast[^:]*:\s*(memref.*)")
+_PTR_DEF_RE = re.compile(
+    r"^\s*(%[\w.]+)\s*=\s*hivm\.hir\.pointer_cast[^:]*:\s*(memref.*)"
+)
 _NZ2ND_RE = re.compile(r"func\.call\s+@fixpipe_nz2nd_\S+\(")
 
 
@@ -843,11 +875,7 @@ def rewire_custom_acc_from_default_fixpipe(mlir: str) -> str:
         if _NZ2ND_RE.search(ln):
             saw_nz = True
             continue
-        if (
-            saw_nz
-            and delayed_fix_m is None
-            and "set_flag[<PIPE_FIX>, <PIPE_M>" in ln
-        ):
+        if saw_nz and delayed_fix_m is None and "set_flag[<PIPE_FIX>, <PIPE_M>" in ln:
             delayed_fix_m = ln
             continue
         if "hivm.hir.custom" not in ln or "ins(" not in ln:
@@ -880,9 +908,47 @@ def rewire_custom_acc_from_default_fixpipe(mlir: str) -> str:
     return "".join(out)
 
 
+def strip_declared_cube_only_stub(mlir: str) -> str:
+    # Only explicit opt-in kernels whose actual work is entirely in AIC.
+    while True:
+        m = re.search(r"  func\.func @(\w+)_mix_aiv\(", mlir)
+        if m is None:
+            break
+        line_end = mlir.index("\n", m.start())
+        start = mlir.rfind("{", m.start(), line_end)
+        body, end = _extract_balanced(mlir, start)
+        if "hivm.hir.custom" in body or re.search(
+            r"(?:func\.)?call @(?!broadcast_scalar_)", body
+        ):
+            raise ValueError("cube-only marker would discard a nonempty AIV body")
+        if any(
+            op in body
+            for op in (
+                "hivm.hir.load",
+                "hivm.hir.store",
+                "memref.store",
+                "memref.copy",
+                "llvm.store",
+            )
+        ):
+            raise ValueError("cube-only marker would discard AIV memory operations")
+        mlir = mlir[: m.start()] + mlir[end:]
+    mlir = re.sub(r"@(\w+)_mix_aic(?=\()", r"@\1", mlir)
+    mlir = re.sub(r",\s*hivm\.part_of_mix\b", "", mlir)
+    mlir = re.sub(r"\bhivm\.part_of_mix\s*,\s*", "", mlir)
+    mlir = re.sub(r"\bhivm\.part_of_mix\b", "", mlir)
+    mlir = re.sub(
+        r"hivm\.module_core_type = #hivm\.module_core_type<[^>]+>",
+        "hivm.module_core_type = #hivm.module_core_type<AIC>",
+        mlir,
+    )
+    mlir = re.sub(r"^.*hivm\.hir\.sync_block_(?:set|wait).*\n", "", mlir, flags=re.M)
+    return mlir
+
 
 def prepare_hivmc_mlir(mlir: str) -> str:
     """Lower ``hivm.hir.custom`` for CANN 9.0 hivmc (op is unknown there)."""
+    cube_only = "flaggems_cube_only=true" in mlir
     rewritten = rewrite_cann90_bufferization(mlir)
     rewritten = rewrite_custom_op_segments(rewritten)
     if 'mix_mode = "aic"' in rewritten:
@@ -900,11 +966,19 @@ def prepare_hivmc_mlir(mlir: str) -> str:
         # Do not flatten: a cube may scan many tiles. Binding the
         # induction var to 0 would rewrite every tile as tile 0.
         rewritten = sink_call_operands(rewritten)
+    if cube_only:
+        rewritten = strip_declared_cube_only_stub(rewritten)
     return rewritten
 
 
 def _prepare_custom_linalg(linalg: str) -> str:
     """Keep ``hivm.hir.custom`` so InferCoreType can assign CUBE."""
+    if "flaggems_cube_only=true" in linalg:
+        if "#hivm.tcore_type<VECTOR>" in linalg:
+            raise ValueError(
+                "cube-only marker conflicts with a Vector custom operation"
+            )
+        linalg = re.sub(r'mix_mode\s*=\s*"[^"]+"', 'mix_mode = "aic"', linalg)
     rewritten = rewrite_cann90_bufferization(linalg)
     _DUMP.write_text(rewritten)
     rewritten = rewrite_custom_op_segments(rewritten)
@@ -919,7 +993,11 @@ def _find_real_hivmc() -> str:
         cand = Path(cached)
         if cand.is_file() and cand.resolve() != wrap:
             return str(cand)
-    toolkit = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_TOOLKIT_HOME") or ""
+    toolkit = (
+        os.environ.get("ASCEND_HOME_PATH")
+        or os.environ.get("ASCEND_TOOLKIT_HOME")
+        or ""
+    )
     candidates = [
         "/usr/local/Ascend/cann-9.0.0/bin/hivmc",
         "/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin/hivmc",
@@ -1012,13 +1090,19 @@ def _ensure_hivmc_wrapper() -> Path:
 
 def install_cann90_custom_op_compat() -> None:
     """Keep CustomOp for InferCoreType; rewrite it only when hivmc starts."""
-    global _PATCHED, _LAST_CUSTOM_LINALG
+    global _PATCHED
     if _PATCHED:
         return
     from triton.backends.ascend import compiler as ascend_compiler
     from triton.backends.ascend import utils as ascend_utils
 
-    if getattr(ascend_compiler._compile_linalg_to_npu_bin, "_flaggems_fixpipe", False):
+    compile_entry = (
+        "_compile_linalg_to_npu_bin"
+        if hasattr(ascend_compiler, "_compile_linalg_to_npu_bin")
+        else "linalg_to_bin_enable_npu_compile_A2_A3"
+    )
+    original_compile = getattr(ascend_compiler, compile_entry)
+    if getattr(original_compile, "_flaggems_fixpipe", False):
         _PATCHED = True
         return
 
@@ -1026,7 +1110,7 @@ def install_cann90_custom_op_compat() -> None:
     real_hivmc = _find_real_hivmc()
     orig_to_bc = ascend_compiler.linalg_to_bc_by_triton_mlir_opt
     orig_to_lin = ascend_compiler.bc_to_linalg_by_bishengir_opt
-    orig_to_bin = ascend_compiler._compile_linalg_to_npu_bin
+    orig_to_bin = original_compile
     orig_get_compiler = ascend_compiler._get_npucompiler_path
 
     def _to_bc(linalg, metadata, opt):
@@ -1059,7 +1143,9 @@ def install_cann90_custom_op_compat() -> None:
             # makes the runtime launch two AIV blocks per AIC block even
             # though the AIV body has no useful work.  Mark the wrapper AIC so
             # the launcher submits only the 20 Cube blocks.
-            linalg = re.sub(r'mix_mode\s*=\s*"mix"', 'mix_mode = "aic"', linalg, count=1)
+            linalg = re.sub(
+                r'mix_mode\s*=\s*"mix"', 'mix_mode = "aic"', linalg, count=1
+            )
             linalg = _prepare_custom_linalg(linalg)
             # Keep func.call at function scope so hivmc can lower it.
             orig_blockify = ascend_compiler._is_auto_map_parallel_blocks_enabled
@@ -1073,7 +1159,7 @@ def install_cann90_custom_op_compat() -> None:
     _to_bin._flaggems_fixpipe = True
     ascend_compiler.linalg_to_bc_by_triton_mlir_opt = _to_bc
     ascend_compiler.bc_to_linalg_by_bishengir_opt = _to_lin
-    ascend_compiler._compile_linalg_to_npu_bin = _to_bin
+    setattr(ascend_compiler, compile_entry, _to_bin)
     ascend_compiler._get_npucompiler_path = _wrapped_get_compiler
     ascend_utils._get_npucompiler_path = _wrapped_get_compiler
     _PATCHED = True

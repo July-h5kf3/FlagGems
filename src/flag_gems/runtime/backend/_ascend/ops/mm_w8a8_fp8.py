@@ -18,10 +18,11 @@ Public API matches NVIDIA PR #3821: BF16/FP16 inputs are quantized, then
 ``C = (A_q @ B_q) * a_scale[:, None] * b_scale[None, :]``.
 
 Ascend 910 UB / DataCopy cannot load FP8, so weights and activations stay
-INT8 plus per-row / per-column scale. TLE does the INT8 ``tl.dot``. A CommonIR
-AIC-only epilogue applies the column scale with ``VDEQF16``, applies the row
-scale with a 16x16 diagonal Cube matmul, and writes the requested dtype with a
-second FixPipe. No INT32 GM workspace or AIV output pass is used.
+INT8 plus per-row / per-column scale. Tiny matrices use one Vector kernel;
+large matrices fuse INT8 Cube matmul and FP32 scaling in a mixed kernel.
+Other shapes use an INT32 workspace and a tiled Vector output pass. All paths
+apply both scales and cast to the requested output dtype. The older CommonIR
+AIC-only implementation is retained for comparison.
 """
 
 from __future__ import annotations
@@ -40,14 +41,13 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
-
 from .ascendc.compile_fixpipe import (
     ensure_bitcode,
     install_cann90_custom_op_compat,
     makefile_compile,
     source_path,
-    symbol as _fixpipe_symbol,
 )
+from .ascendc.compile_fixpipe import symbol as _fixpipe_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,7 @@ def _init_fixpipe() -> None:
                 self.arg_type["load_diag"] = tl.int32
                 self.arg_type["out_bf16"] = tl.int32
                 del acc, deq, row_diag, c
+
     except AssertionError as exc:
         if "already used" not in str(exc):
             raise
@@ -187,7 +188,9 @@ def mm_w8a8_fp8_fixpipe_kernel(
                 order=(1, 0),
             )
             if DISALLOW_ACC:
-                for k0 in tl.range(0, K, BLOCK_K, num_stages=2, disallow_acc_multi_buffer=True):
+                for k0 in tl.range(
+                    0, K, BLOCK_K, num_stages=2, disallow_acc_multi_buffer=True
+                ):
                     a = tl.load(a_block_ptr)
                     b = tl.load(b_block_ptr)
                     acc = tl.dot(a, b, acc, out_dtype=tl.int32)
@@ -195,7 +198,9 @@ def mm_w8a8_fp8_fixpipe_kernel(
                     b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
             else:
                 # Two L0C banks: FixPipe drains one while the next tile MMA fills the other.
-                for k0 in tl.range(0, K, BLOCK_K, num_stages=2, disallow_acc_multi_buffer=False):
+                for k0 in tl.range(
+                    0, K, BLOCK_K, num_stages=2, disallow_acc_multi_buffer=False
+                ):
                     a = tl.load(a_block_ptr)
                     b = tl.load(b_block_ptr)
                     acc = tl.dot(a, b, acc, out_dtype=tl.int32)
@@ -218,6 +223,141 @@ def mm_w8a8_fp8_fixpipe_kernel(
                 tl.cast(OUT_BF16, tl.int32),
                 out=dummy,
             )
+            if M_MAJOR:
+                pid_n = pid_n + 1
+                wrap = pid_n == grid_n
+                pid_m = pid_m + wrap
+                pid_n = tl.where(wrap, 0, pid_n)
+            else:
+                pid_m = pid_m + 1
+                wrap = pid_m == grid_m
+                pid_n = pid_n + wrap
+                pid_m = tl.where(wrap, 0, pid_m)
+
+
+@libentry()
+@triton.jit
+def _mm_w8a8_tiny_kernel(
+    A,
+    BT,
+    SA,
+    SB,
+    OUT,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    OM: tl.constexpr,
+    ON: tl.constexpr,
+):
+    # For K <= 64, every integer product and partial sum is exact in FP32.
+    tiles: tl.constexpr = tl.cdiv(N, BN)
+    tile = ext.program_id(0)
+    row = tile // tiles
+    col = tile % tiles * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    a = tl.load(A + row * K + kk, kk < K, other=0).to(tl.float32)
+    b = tl.load(
+        BT + col[:, None] * K + kk[None, :],
+        (col[:, None] < N) & (kk[None, :] < K),
+        other=0,
+    ).to(tl.float32)
+    acc = tl.sum(b * a[None, :], 1)
+    sa = tl.load(SA + row)
+    sb = tl.load(SB + col, col < N, other=0)
+    tl.store(OUT + row * OM + col * ON, acc * sa * sb, col < N)
+
+
+@libentry()
+@triton.jit
+def _mm_w8a8_mixed_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    SA,
+    SB,
+    OUT_M: tl.constexpr,
+    OUT_N: tl.constexpr,
+    SCM: tl.constexpr,
+    SCN: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    N_CORES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    M_MAJOR: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """INT8 Cube matmul with FP32 row/column scaling in the same mixed kernel."""
+    pid = ext.program_id(0)
+    grid_m: tl.constexpr = tl.cdiv(M, BLOCK_M)
+    grid_n: tl.constexpr = tl.cdiv(N, BLOCK_N)
+    n_tiles: tl.constexpr = grid_m * grid_n
+    q = n_tiles // N_CORES
+    r = n_tiles % N_CORES
+    start = tl.where(pid < r, pid * (q + 1), r * (q + 1) + (pid - r) * q)
+    count = q + tl.where(pid < r, 1, 0)
+    if GROUP_M == 0:
+        if M_MAJOR:
+            # Keep one A tile adjacent across N tiles. This is faster once M
+            # is large and the packed B working set fits in L2.
+            pid_m = start // grid_n
+            pid_n = start % grid_n
+        else:
+            # Keep one packed B tile adjacent across M tiles.
+            pid_n = start // grid_m
+            pid_m = start % grid_m
+    for i in tl.range(0, count):
+        if GROUP_M > 0:
+            # Bound the live A/B working set for wide matrices so both sides
+            # are reused before the traversal advances to the next M group.
+            tile_id = start + i
+            group_width: tl.constexpr = GROUP_M * grid_n
+            group_id = tile_id // group_width
+            first_m = group_id * GROUP_M
+            group_size_m = tl.minimum(grid_m - first_m, GROUP_M)
+            tile_in_group = tile_id % group_width
+            pid_m = first_m + tile_in_group % group_size_m
+            pid_n = tile_in_group // group_size_m
+        off_m = (pid_m * BLOCK_M).to(tl.int32)
+        off_n = (pid_n * BLOCK_N).to(tl.int32)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        a_block_ptr = tl.make_block_ptr(
+            base=a_ptr,
+            shape=(M, K),
+            strides=(K, 1),
+            offsets=(off_m, 0),
+            block_shape=(BLOCK_M, BLOCK_K),
+            order=(1, 0),
+        )
+        b_block_ptr = tl.make_block_ptr(
+            base=b_ptr + pid_n * K * BLOCK_N,
+            shape=(K, BLOCK_N),
+            strides=(BLOCK_N, 1),
+            offsets=(0, 0),
+            block_shape=(BLOCK_K, BLOCK_N),
+            order=(1, 0),
+        )
+        for _k0 in tl.range(0, K, BLOCK_K, num_stages=2):
+            a = tl.load(a_block_ptr)
+            b = tl.load(b_block_ptr)
+            acc = tl.dot(a, b, acc, out_dtype=tl.int32)
+            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+        rows = off_m + tl.arange(0, BLOCK_M)
+        cols = off_n + tl.arange(0, BLOCK_N)
+        sa = tl.load(SA + rows, rows < OUT_M, other=0)
+        sb = tl.load(SB + cols, cols < OUT_N, other=0)
+        val = acc.to(tl.float32) * sa[:, None] * sb[None, :]
+        tl.store(
+            c_ptr + rows[:, None] * SCM + cols[None, :] * SCN,
+            val,
+            (rows[:, None] < OUT_M) & (cols[None, :] < OUT_N),
+        )
+        if GROUP_M == 0:
             if M_MAJOR:
                 pid_n = pid_n + 1
                 wrap = pid_n == grid_n
@@ -349,20 +489,179 @@ def _row_scale_cast_kernel(
         for n0 in range(0, N, BLOCK_N):
             n_idx = n0 + offs
             mask = n_idx < N
-            c = tl.load(c_ptr + r * stride_cm + n_idx, mask=mask, other=0).to(tl.float32)
+            c = tl.load(c_ptr + r * stride_cm + n_idx, mask=mask, other=0).to(
+                tl.float32
+            )
             b_scale = tl.load(b_scale_ptr + n_idx, mask=mask, other=0).to(tl.float32)
             tl.store(o_ptr + r * stride_om + n_idx, c * a_scale * b_scale, mask=mask)
+
+
+@libentry()
+@triton.jit
+def _scale_int32_static_kernel(
+    C, SA, SB, OUT, N: tl.constexpr, NP: tl.constexpr, R: tl.constexpr, X: tl.constexpr
+):
+    tile = ext.program_id(0)
+    cols: tl.constexpr = N // X
+    rr = tile // cols * R + tl.arange(0, R)
+    cc = tile % cols * X + tl.arange(0, X)
+    v = tl.load(C + rr[:, None] * NP + cc[None, :]).to(tl.float32)
+    a = tl.load(SA + rr)
+    b = tl.load(SB + cc)
+    tl.store(OUT + rr[:, None] * N + cc[None, :], v * a[:, None] * b[None, :])
+
+
+@libentry()
+@triton.jit
+def _scale_int32_dense_kernel(
+    C,
+    SA,
+    SB,
+    OUT,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    NP: tl.constexpr,
+    R: tl.constexpr,
+    X: tl.constexpr,
+):
+    # Full, contiguous output tiles avoid generic masked gather/scatter code.
+    pid = ext.program_id(0)
+    columns: tl.constexpr = N // X
+    tiles: tl.constexpr = (M // R) * columns
+    for tile in range(pid, tiles, ext.num_programs(0)):
+        rr = tile // columns * R + tl.arange(0, R)
+        cc = tile % columns * X + tl.arange(0, X)
+        value = tl.load(C + rr[:, None] * NP + cc[None, :]).to(tl.float32)
+        row_scale = tl.load(SA + rr)
+        col_scale = tl.load(SB + cc)
+        tl.store(
+            OUT + rr[:, None] * N + cc[None, :],
+            value * row_scale[:, None] * col_scale[None, :],
+        )
+
+
+@libentry()
+@triton.jit
+def _scale_int32_tiles_kernel(
+    C,
+    A,
+    B,
+    OUT,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    NP: tl.constexpr,
+    R: tl.constexpr,
+    X: tl.constexpr,
+    OM: tl.constexpr,
+    ON: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    cols: tl.constexpr = tl.cdiv(N, X)
+    tiles: tl.constexpr = tl.cdiv(M, R) * cols
+    for tile in range(pid, tiles, ext.num_programs(0)):
+        r = tile // cols * R + tl.arange(0, R)
+        col = tile % cols * X + tl.arange(0, X)
+        c = tl.load(
+            C + r[:, None] * NP + col[None, :],
+            (r[:, None] < M) & (col[None, :] < N),
+            other=0,
+        ).to(tl.float32)
+        a = tl.load(A + r, r < M, other=0)
+        b = tl.load(B + col, col < N, other=0)
+        tl.store(
+            OUT + r[:, None] * OM + col[None, :] * ON,
+            c * a[:, None] * b[None, :],
+            (r[:, None] < M) & (col[None, :] < N),
+        )
 
 
 def _vector_grid(n: int) -> int:
     return max(1, min(n, 40 * 8))
 
 
+@libentry()
+@triton.jit
+def _quantize_rows_kernel(
+    X,
+    Q,
+    S,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    R: tl.constexpr,
+    BK: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    for r0 in range(pid * R, M, ext.num_programs(0) * R):
+        r = r0 + tl.arange(0, R)
+        s = tl.load(S + r, r < M, other=1.0)
+        for c0 in range(0, K, BK):
+            kk = c0 + tl.arange(0, BK)
+            x = tl.load(
+                X + r[:, None] * S0 + kk[None, :] * S1,
+                (r[:, None] < M) & (kk[None, :] < K),
+                other=0,
+            ).to(tl.float32)
+            z = x / s[:, None]
+            f = tl.floor(z)
+            fi = f.to(tl.int32)
+            d = z - f
+            yi = fi + ((d > 0.5) | ((d == 0.5) & ((fi & 1) != 0))).to(tl.int32)
+            q = tl.minimum(127, tl.maximum(-128, yi)).to(tl.int8)
+            tl.store(
+                Q + r[:, None] * K + kk[None, :],
+                q,
+                (r[:, None] < M) & (kk[None, :] < K),
+            )
+
+
+@libentry()
+@triton.jit
+def _row_amax_kernel(
+    X,
+    S,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    R: tl.constexpr,
+    BK: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    for r0 in range(pid * R, M, ext.num_programs(0) * R):
+        r = r0 + tl.arange(0, R)
+        kk = tl.arange(0, BK)
+        x = tl.load(
+            X + r[:, None] * S0 + kk[None, :] * S1,
+            (r[:, None] < M) & (kk[None, :] < K),
+            other=0,
+        ).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.abs(x), 1), 1.0e-10)
+        tl.store(S + r, amax, r < M)
+
+
 def _quantize_int8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    xf = x.float()
-    scale = xf.abs().amax(dim=1).clamp_min(1e-10) / _INT8_MAX
-    q = (xf / scale[:, None]).round().clamp(-128, 127).to(torch.int8)
-    return q.contiguous(), scale.contiguous()
+    m, k = x.shape
+    if k == 0 or k > 4096 or m == 0:
+        xf = x.float()
+        scale = xf.abs().amax(dim=1).clamp_min(1e-10) / _INT8_MAX
+        q = (xf / scale[:, None]).round().clamp(-128, 127).to(torch.int8)
+        return q.contiguous(), scale.contiguous()
+    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
+    amax = torch.empty((m,), dtype=torch.float32, device=x.device)
+    rr = 4 if k <= 2048 else 1
+    _row_amax_kernel[(min(40, triton.cdiv(m, rr)),)](
+        x, amax, m, k, *x.stride(), rr, triton.next_power_of_2(k)
+    )
+    # Native division preserves scale rounding at quantization half-integers.
+    # Fusing this division changed some INT8 values by one on this runtime.
+    s = amax / _INT8_MAX
+    r = 4
+    _quantize_rows_kernel[(min(40, triton.cdiv(m, r)),)](
+        x, q, s, m, k, *x.stride(), r, min(256, triton.next_power_of_2(k))
+    )
+    return q, s
 
 
 def _quantize_int8_cols(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -409,27 +708,39 @@ def _prepare_aic_epilogue(
     row_diag_nd = torch.diag_embed(row_ratio.reshape(groups, block_m))
     # A1 fractal layout consumed by L1->L0A: [group, K1, M1, M0, K0].
     row_diag = (
-        row_diag_nd.reshape(groups, m1, 16, m1, 16)
-        .permute(0, 3, 1, 2, 4)
-        .contiguous()
+        row_diag_nd.reshape(groups, m1, 16, m1, 16).permute(0, 3, 1, 2, 4).contiguous()
     )
     return deq, row_diag
 
 
 def _b_cache_key(b: torch.Tensor) -> tuple:
-    return (b.data_ptr(), tuple(b.shape), tuple(b.stride()), b.dtype)
+    return (
+        b.device,
+        b.data_ptr(),
+        tuple(b.shape),
+        tuple(b.stride()),
+        b.dtype,
+        b._version,
+    )
 
 
 def _get_cached_b(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    key = _b_cache_key(b)
+    # Inference tensors have no version counter. Recompute rather than return
+    # stale weights when they are mutated in an inference_mode region.
+    try:
+        key = _b_cache_key(b)
+    except RuntimeError:
+        q, scale = _quantize_int8_cols(b)
+        return q, scale, _pack_col_deq(scale)
     cached = _B_CACHE.get(key)
     if cached is not None:
         _B_CACHE.move_to_end(key)
-        return cached
+        return cached[1:]
     q, scale = _quantize_int8_cols(b)
     packed = _pack_col_deq(scale)
     item = (q, scale, packed)
-    _B_CACHE[key] = item
+    # Keep the original storage alive so allocator address reuse cannot alias.
+    _B_CACHE[key] = (b, *item)
     if len(_B_CACHE) > _B_CACHE_MAX:
         _B_CACHE.popitem(last=False)
     return item
@@ -537,7 +848,9 @@ def _pick_fixpipe_tiles(M: int, N: int, K: int) -> tuple[int, int, int]:
     return 128, 256, 256
 
 
-def _resolve_out_dtype(a: torch.Tensor, out_dtype: Optional[torch.dtype]) -> torch.dtype:
+def _resolve_out_dtype(
+    a: torch.Tensor, out_dtype: Optional[torch.dtype]
+) -> torch.dtype:
     if out_dtype is not None:
         return out_dtype
     if _MM_W8A8_OUTPUT_DTYPE == "fp16":
@@ -643,8 +956,384 @@ def _launch_fixpipe(a_q, b_q, a_s, b_s, out, M, N, K, deq=None):
     return out
 
 
+def _pick_int32_tiles(M: int, N: int, K: int) -> tuple[int, int, int]:
+    if os.environ.get("FLAGGEMS_FIXPIPE_TILES"):
+        return _pick_fixpipe_tiles(M, N, K)
+    if N == 1024 and K == 2048 and 256 < M <= 448:
+        return _align_up(triton.cdiv(M, 2), 16), 128, 512
+    # Keep the whole short M dimension without padding it to 256 rows.
+    if N == 2048 and K == 4096 and 128 < M <= 256:
+        return _align_up(M, 16), 128, 512
+    # Short K fits one 512-wide panel. Compact M tiles reduce padding for
+    # small matrices; two M tiles balance the longest worker for larger M.
+    if N == 2048 and K == 512 and 128 < M <= 224:
+        return _align_up(M, 16), 128, 512
+    if N == 2048 and K == 512 and 256 < M <= 512:
+        return _align_up(triton.cdiv(M, 2), 16), 128, 512
+    # Match short-wide tiles to the 20 Cube workers without excessive M padding.
+    if N == 12288 and K == 2048 and 0 < M <= 32:
+        return _align_up(M, 16), 128, 512
+    if N == 9216 and K == 2048 and 32 < M <= 64:
+        return _align_up(M, 16), 512, 256
+    # Ascend block pointers and INT8 dot support M multiples of 16, not
+    # only powers of two. Keep the L0C tile within 128 KiB.
+    if 8192 <= N < 65536 and K == 2048 and 0 < M <= 512:
+        m_tiles = triton.cdiv(M, 256)
+        block_m = _align_up(triton.cdiv(M, m_tiles), 16)
+        if block_m & (block_m - 1):
+            return block_m, (256 if block_m <= 128 else 128), 512
+    if N == 1024 and K == 2048 and 128 < M <= 256:
+        return _align_up(triton.cdiv(M, 2), 16), 128, 512
+    # Avoid padding short matrices to 128 rows, and reduce K-loop overhead.
+    if N == 2048 and K == 512 and M <= 64:
+        return max(16, triton.next_power_of_2(M)), 128, 512
+    if N == 1024 and K == 2048 and M <= 32:
+        return max(16, triton.next_power_of_2(M)), 64, 512
+    if 8192 <= N < 65536 and K == 2048 and M <= 64:
+        return max(16, triton.next_power_of_2(M)), 256, 512
+    # Avoid a second tile iteration on the busiest cores for this narrow N.
+    if N == 256 and K == 2048 and 320 < M <= 512:
+        return 128, 64, 512
+    # Narrow outputs need enough independent Cube tiles. BN=64 also avoids
+    # the expensive INT8 packing path seen with 32-column panels on 910B.
+    if 64 <= N <= 256 and K >= 1024 and (M <= 512 or N == 64):
+        block_m = (
+            16
+            if M <= 64 or (N == 64 and M <= 128)
+            else (32 if M <= 256 else (64 if M <= 512 else 128))
+        )
+        return block_m, 64, 512
+    if N == 1024 and K == 2048 and 256 < M < 512:
+        return 128, 256, 512
+    if N >= 8192 and K == 2048 and 128 < M <= 512:
+        # Do not add a 256-row padding penalty for M in (256, 384].
+        if _align_up(M, 256) == _align_up(M, 128):
+            return 256, 128, 512
+    if 32 <= M <= 64 and N <= 256 and K <= 128:
+        return 64, 64, max(32, triton.next_power_of_2(K))
+    if 64 <= M <= 192 and N <= 512 and K <= 512:
+        return 64, 128, min(256, max(32, triton.next_power_of_2(K)))
+    if 192 < M <= 256 and N <= 1024 and K <= 1024:
+        return 128, 128, 256
+    if 256 < M <= 512 and N <= 1024 and K <= 1024:
+        return 128, 256, min(512, max(32, triton.next_power_of_2(K)))
+    block_m, block_n, block_k = _pick_fixpipe_tiles(M, N, K)
+    if M <= 128 and K <= 256:
+        block_m = min(block_m, max(16, triton.next_power_of_2(M)))
+        block_n = min(block_n, max(32, triton.next_power_of_2(N)))
+        block_k = min(block_k, max(32, triton.next_power_of_2(K)))
+    return block_m, block_n, block_k
+
+
+def _pick_aic_tiles(M: int, N: int, K: int):
+    if M <= 0 or N <= 0:
+        return None
+    if N == 2048 and K == 512 and 1024 <= M <= 16384 and M % 16 == 0:
+        return 128, 256, 128
+    if K == 2048 and N == 64:
+        if 32 < M <= 128:
+            return 16, 64, 1024
+        if 128 < M <= 512:
+            return 32, 64, 1024
+        if M == 2048:
+            return 64, 64, 1024
+    if K == 2048 and N == 256:
+        if M <= 64:
+            return 16, 64, 1024
+        if 128 < M <= 320:
+            return 32, 128, 512
+        if 320 < M <= 512:
+            return 64, 128, 512
+    if K == 512 and N == 2048 and M <= 512:
+        if M <= 32:
+            return 16, 128, 512
+        if M <= 256:
+            return _align_up(triton.cdiv(M, 2), 16), 256, 256
+        # Five M groups with eight N groups balance two tiles per Cube.
+        return _align_up(triton.cdiv(M, 5), 16), 256, 256
+    if K == 2048 and N == 1024:
+        if M <= 16:
+            return 16, 64, 1024
+        if M <= 64:
+            return 32, 128, 512
+    return None
+
+
+def _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K):
+    """Prepare a callable that executes only matmul and output scaling.
+
+    Quantization, padding, weight layout conversion and explicit allocations
+    finish before the returned callable is invoked. The public API and kernel
+    benchmark share this dispatch. Captured tensors remain alive in the closure.
+    """
+    if M <= 8 and N in (16, 32, 64) and K in (16, 32, 64):
+        key = ("tiny_transpose", b_q.data_ptr(), tuple(b_q.shape), b_q.dtype)
+        cached = _B_PACKED_CACHE.get(key)
+        if cached is None:
+            b_t = b_q.t().contiguous()
+            _B_PACKED_CACHE[key] = (b_q, b_t)
+            if len(_B_PACKED_CACHE) > _B_CACHE_MAX:
+                _B_PACKED_CACHE.popitem(last=False)
+        else:
+            _B_PACKED_CACHE.move_to_end(key)
+            b_t = cached[1]
+        bn, bk = triton.next_power_of_2(N), triton.next_power_of_2(K)
+        grid = M * triton.cdiv(N, bn)
+
+        def call():
+            _mm_w8a8_tiny_kernel[(grid,)](
+                a_q,
+                b_t,
+                a_s,
+                b_s,
+                out,
+                M,
+                N,
+                K,
+                bn,
+                bk,
+                *out.stride(),
+                multibuffer=False,
+            )
+
+        return call, {
+            "path": "tiny_vector",
+            "tiles": [1, bn, bk],
+            "kernel_count": 1,
+            "workspace_bytes": 0,
+        }
+
+    nz_tiles = None
+    if K == 2048 and M % 8 == 0:
+        if N in (9216, 12288) and 8 <= M <= 512:
+            nz_tiles = (_align_up(triton.cdiv(M, triton.cdiv(M, 128)), 16), 128, 256)
+        elif N == 1024 and 64 < M <= 512:
+            # Eight N tiles: use two M groups for one wave, five for two.
+            groups = 2 if M <= 256 else 5
+            nz_tiles = (_align_up(triton.cdiv(M, groups), 16), 128, 256)
+        elif N == 256 and 1024 <= M < 8192:
+            # Two N tiles per M group; balance each wave over 20 Cube cores.
+            groups = triton.cdiv(triton.cdiv(M, 128), 10) * 10
+            nz_tiles = (_align_up(triton.cdiv(M, groups), 16), 128, 256)
+    if (
+        nz_tiles is not None
+        and out.dtype in (torch.bfloat16, torch.float16)
+        and out.is_contiguous()
+        and not os.environ.get("FLAGGEMS_FIXPIPE_TILES")
+        and not os.environ.get("FLAGGEMS_MM_W8A8_EPILOGUE")
+    ):
+        from .ascendc.mm_nz import prepare as prepare_nz
+
+        return prepare_nz(a_q, b_q, a_s, b_s, out, M, N, K, nz_tiles)
+
+    aic_tiles = _pick_aic_tiles(M, N, K)
+    if (
+        aic_tiles is not None
+        and out.dtype == torch.bfloat16
+        and out.is_contiguous()
+        and not os.environ.get("FLAGGEMS_FIXPIPE_TILES")
+        and not os.environ.get("FLAGGEMS_MM_W8A8_EPILOGUE")
+    ):
+        from .ascendc.mm_aic import prepare as prepare_aic
+
+        input_nz = N == 2048 and K == 512 and M > 128
+        if input_nz:
+            aic_tiles = (aic_tiles[0], aic_tiles[1], 128)
+        batch_rows = input_nz and M >= 1024
+        return prepare_aic(
+            a_q,
+            b_q,
+            a_s,
+            b_s,
+            out,
+            M,
+            N,
+            K,
+            aic_tiles,
+            input_nz=input_nz,
+            batch_rows=batch_rows,
+            prefetch=batch_rows,
+        )
+
+    mixed = (
+        M >= 1024
+        and N >= 1024
+        and K >= 1024
+        and M * N * K >= 2048**3
+        and out.is_contiguous()
+    )
+    # Large short-K and narrow-N outputs are dominated by the full INT32
+    # workspace round trip; mixed execution keeps only per-core tile scratch.
+    mixed_extra = out.is_contiguous() and (
+        (M >= 1024 and N >= 1024 and K == 512)
+        or (M >= 8192 and N in (64, 256) and K >= 1024)
+    )
+    mixed = mixed or mixed_extra
+    if mixed and not os.environ.get("FLAGGEMS_FIXPIPE_TILES"):
+        if N == 64:
+            block_m, block_n, block_k = 128, 64, 512
+        elif K == 512:
+            block_m, block_n, block_k = 128, 256, 512
+        else:
+            block_m, block_n, block_k = 256, 128, (256 if N >= 8192 else 512)
+    else:
+        block_m, block_n, block_k = _pick_int32_tiles(M, N, K)
+    a_q, b_q, a_s, b_s, mp, np, kp = _pad_fixpipe_inputs(
+        a_q, b_q, a_s, b_s, M, N, K, block_m, block_n, block_k
+    )
+    grid = min(triton.cdiv(mp, block_m) * triton.cdiv(np, block_n), _cube_core_count())
+    opts = dict(
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        M_MAJOR=_FIXPIPE_M_MAJOR,
+        GROUP_M=0,
+        num_warps=1,
+        num_stages=2,
+        optimize_dynamic_offset=True,
+        unit_flag=False,
+        limit_auto_multi_buffer_of_local_buffer="no-l0c",
+    )
+    if mixed:
+
+        def call():
+            _mm_w8a8_mixed_kernel[(grid,)](
+                a_q,
+                b_q,
+                out,
+                a_s,
+                b_s,
+                M,
+                N,
+                *out.stride(),
+                mp,
+                np,
+                kp,
+                grid,
+                **opts,
+            )
+
+        # The compiler uses one INT32 tile per block, not a full MxN buffer.
+        return call, {
+            "path": "mixed",
+            "tiles": [block_m, block_n, block_k],
+            "kernel_count": 1,
+            "workspace_bytes": block_m * block_n * 4 * grid,
+        }
+
+    # Per-call ownership is required for concurrent streams and graph captures.
+    acc = torch.empty((mp, np), dtype=torch.int32, device=out.device)
+    if M >= 64 and N <= 1024:
+        rows = 8 if M <= 64 else 16
+        cols = min(256, triton.next_power_of_2(N))
+    else:
+        rows, cols = 4, min(1024, triton.next_power_of_2(N))
+    if not out.is_contiguous():
+        # Strided stores need additional index/scatter buffers in UB.
+        rows, cols = 4, min(256, triton.next_power_of_2(N))
+    static_output = (
+        out.is_contiguous()
+        and 16 <= M <= 128
+        and M % 16 == 0
+        and N in (32, 64, 128, 256)
+    )
+    if static_output:
+        rows, cols = 16, N
+    dense_output = (
+        not static_output
+        and out.is_contiguous()
+        and (M >= 64 or (N >= 8192 and M >= 8))
+        and M % 8 == 0
+        and N % 64 == 0
+    )
+    if dense_output:
+        cols = min(1024, N & -N)
+        rows = 8
+        if N in (9216, 12288) and M <= 512:
+            if N == 12288:
+                rows, cols = 8, 2048
+            elif M % 16 == 0:
+                rows, cols = 16, 1024
+        if N == 1024 and M >= 1024 and M % 16 == 0:
+            rows, cols = 16, 256
+        if N <= 256 and M > 128:
+            rows = 32 if M >= 1024 and M % 32 == 0 else (16 if M % 16 == 0 else 8)
+    grid_v = min(40, triton.cdiv(M, rows) * triton.cdiv(N, cols))
+    custom_epilogue = None
+    if (
+        os.environ.get("FLAGGEMS_MM_W8A8_EPILOGUE") == "ascendc"
+        and out.is_contiguous()
+        and M > 0
+        and N > 0
+        and M % 8 == 0
+        and N % 64 == 0
+    ):
+        from .ascendc.vector_epilogue import prepare as prepare_vector_epilogue
+
+        custom_rows = 16 if M % 16 == 0 else 8
+        custom_cols = min(512, N & -N)
+        custom_epilogue, _, _ = prepare_vector_epilogue(
+            acc, a_s, b_s, out, M, N, custom_rows, custom_cols
+        )
+
+    def call():
+        mm_w8a8_fp8_int32_kernel[(grid,)](
+            a_q,
+            b_q,
+            acc,
+            mp,
+            np,
+            kp,
+            grid,
+            **opts,
+        )
+        if custom_epilogue is not None:
+            custom_epilogue()
+        elif static_output:
+            _scale_int32_static_kernel[(M // rows,)](
+                acc,
+                a_s,
+                b_s,
+                out,
+                N,
+                np,
+                rows,
+                cols,
+            )
+        elif dense_output:
+            _scale_int32_dense_kernel[(grid_v,)](
+                acc, a_s, b_s, out, M, N, np, rows, cols
+            )
+        else:
+            _scale_int32_tiles_kernel[(grid_v,)](
+                acc,
+                a_s,
+                b_s,
+                out,
+                M,
+                N,
+                np,
+                rows,
+                cols,
+                *out.stride(),
+            )
+
+    return call, {
+        "path": "int32_vector",
+        "tiles": [block_m, block_n, block_k],
+        "scale_tile": [rows, cols],
+        "static_output": static_output,
+        "dense_output": dense_output,
+        "epilogue": "ascendc_brcb" if custom_epilogue is not None else "triton",
+        "kernel_count": 2,
+        "workspace_bytes": mp * np * 4,
+    }
+
+
 def _launch(a_q, b_q, a_s, b_s, out, M, N, K, deq=None):
-    return _launch_fixpipe(a_q, b_q, a_s, b_s, out, M, N, K, deq=deq)
+    call, _ = _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K)
+    call()
+    return out
 
 
 def mm_w8a8_fp8(a, b, *, out_dtype: Optional[torch.dtype] = None):
