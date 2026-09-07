@@ -114,7 +114,7 @@ exec -a "$0" @COMPILER@ "$@"
 def _install(cache, toolkit):
     from triton.backends.ascend import compiler, utils
 
-    if getattr(compiler._compile_linalg_to_npu_bin, "_topk_custom", False):
+    if getattr(compiler.linalg_to_bin_enable_npu_compile_A2_A3, "_topk_custom", False):
         return
     # CANN also probes the wrapper without the environment returned by Triton.
     # Bake in the activated toolkit paths for those subprocesses.
@@ -128,7 +128,7 @@ def _install(cache, toolkit):
         path.chmod(0o755)
     original_bc = compiler.linalg_to_bc_by_triton_mlir_opt
     original_linalg = compiler.bc_to_linalg_by_bishengir_opt
-    original_bin = compiler._compile_linalg_to_npu_bin
+    original_bin = compiler.linalg_to_bin_enable_npu_compile_A2_A3
     original_path = compiler._get_npucompiler_path
     tag = b"flaggems-topk-linalg:"
 
@@ -161,7 +161,7 @@ def _install(cache, toolkit):
     to_bin._topk_custom = True
     compiler.linalg_to_bc_by_triton_mlir_opt = to_bc
     compiler.bc_to_linalg_by_bishengir_opt = to_linalg
-    compiler._compile_linalg_to_npu_bin = to_bin
+    compiler.linalg_to_bin_enable_npu_compile_A2_A3 = to_bin
     compiler._get_npucompiler_path = get_compiler
     utils._get_npucompiler_path = get_compiler
 
