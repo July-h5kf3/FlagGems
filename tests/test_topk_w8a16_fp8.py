@@ -27,9 +27,15 @@ def _require_ascend_common_ir():
     try:
         import triton.language.extra.cann.extension as al
     except ImportError:
-        pytest.skip("FlagTree Common IR al.custom support required")
+        pytest.fail(
+            "Ascend test environment lacks required FlagTree Common IR al.custom support",
+            pytrace=False,
+        )
     if not all(hasattr(al, name) for name in ("custom", "register_custom_op", "scope")):
-        pytest.skip("FlagTree Common IR al.custom support required")
+        pytest.fail(
+            "Ascend test environment lacks required FlagTree Common IR al.custom support",
+            pytrace=False,
+        )
 
 
 CASES = [

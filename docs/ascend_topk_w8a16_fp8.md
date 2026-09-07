@@ -10,6 +10,21 @@ Precision is compared with TopK of `float32(decode(x))*float32(scale)`, rounded
 to BF16 at the output. This does not promise identical results to the original
 unquantized BF16 input. Quantization/transfers are outside operator timing.
 
+## Registration and CI integration
+
+This is a custom Python API, not an ATen schema. It is exported through
+`flag_gems.ops` and overridden by Ascend's `SpecOpRegistrar`; it must not be
+added to `_FULL_CONFIG` / the `aten` implementation registry.
+
+`benchmark/test_topk_w8a16_fp8.py` is the standard pytest entry, marked
+`topk_w8a16_fp8`. Its `base.Benchmark` subclass explicitly uses `set_gems` to
+call the FP8 API. The dedicated Graph-only test selects `BenchMode.NPUGRAPH`
+within the test scope, so the normal `/test` route also records `mode=npugraph`.
+Other operators retain their existing default measurement mode.
+
+On Ascend, missing Common IR is a test failure rather than a skipped acceptance
+run. Other hardware is still skipped because this is an Ascend-only backend.
+
 ## Implementation
 
 - Triton handles data access, scheduling, decoding/scaling and output. Inline
@@ -57,7 +72,9 @@ streams, and unavailable Common IR. Each benchmark input is checked for exact
 BF16 value agreement and index consistency before timing.
 
 Final acceptance uses actual NPU Graph capture/replay, with 100 calls per graph
-and the median of 30 replay event samples normalized per operator. Targets are
+and at least 30 replay event samples normalized per operator. The standard mode
+honors the approximate `--warmup` / `--iter` time budgets. There is no fallback
+to eager timing. Targets are
 (4,128,8), (8,256,16), (64,1024,32), (64,4096,64), (64,8192,128), and
 (128,32768,256), expressed as (M,N,K). All exceed 1.3x in the reported Graph run.
 
@@ -74,12 +91,19 @@ Activate the matching environment, source CANN, and run from the repository:
 export FLAGTREE_BACKEND=ascend
 export PYTHONPATH="$PWD/src"
 pytest -q tests/test_topk_w8a16_fp8.py
-python benchmark/bench_topk_w8a16_fp8_ascend.py --output topk-graph.json
+pytest -q benchmark/test_topk_w8a16_fp8.py -m topk_w8a16_fp8 --mode npugraph --level core --record json --output topk-graph.json
+# Same entry used by on-demand CI (select an available GPU):
+python tools/run_tests.py --ops topk_w8a16_fp8 --gpus 0 --dump-output --output-dir topk-ci
 ```
 
-Optional diagnostics:
+The local CI-equivalent run completed with accuracy and performance exit codes
+both zero: 64 accuracy cases passed, and six actual Graph results were emitted
+with `mode=npugraph` (all >1.3x).
+
+Optional standalone diagnostics (import-safe, using the same Graph helper):
 
 ```bash
+python benchmark/bench_topk_w8a16_fp8_ascend.py --output topk-standalone.json
 python benchmark/profile_topk_w8a16_fp8_ascend.py --root profile-topk
 ```
 

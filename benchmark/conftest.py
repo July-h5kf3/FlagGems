@@ -110,7 +110,7 @@ def pytest_addoption(parser):
         help=(
             "Specify how to measure latency, 'kernel' for device kernel, "
             "'operator' for end2end operator, 'wrapper' for runtime wrapper, "
-            "or 'cudagraph' for CUDA Graph captured execution."
+            "'cudagraph' for CUDA Graph, or 'npugraph' for NPU Graph captured execution."
         ),
     )
 
