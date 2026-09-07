@@ -15,8 +15,8 @@
 """Ascend W8A16 RMSNorm.
 
 Activation is 16-bit (FP16/BF16). Weight is grouped INT8 plus per-group scale
-because Ascend UB / compiler cannot load FP8. Layout matches the NVIDIA
-FP8-W8A16 RMSNorm path: group_size=128.
+because the current CANN/Triton-Ascend data-movement path cannot load FP8
+weights from GM into UB. The default group size is 128.
 
 Dispatch:
 - Power-of-two N <= 4096: 1D kernel with BLOCK_M rows so INT8 weight +
@@ -50,7 +50,7 @@ def prev_multiple_of(a, b):
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
-def rms_norm_fp8_w8a16_kernel(
+def rms_norm_int8_w8a16_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
@@ -83,7 +83,7 @@ def rms_norm_fp8_w8a16_kernel(
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
-def rms_norm_fp8_w8a16_blockm_kernel(
+def rms_norm_int8_w8a16_blockm_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
@@ -120,7 +120,7 @@ def rms_norm_fp8_w8a16_blockm_kernel(
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
-def rms_norm_fp8_w8a16_grouped_kernel(
+def rms_norm_int8_w8a16_grouped_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
@@ -153,7 +153,7 @@ def rms_norm_fp8_w8a16_grouped_kernel(
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
-def rms_norm_fp8_w8a16_loop_kernel_fixed(
+def rms_norm_int8_w8a16_loop_kernel_fixed(
     out_ptr,
     in_ptr,
     w_ptr,
@@ -215,7 +215,7 @@ def rms_norm_fp8_w8a16_loop_kernel_fixed(
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
-def rms_norm_fp8_w8a16_grouped_tiled_kernel(
+def rms_norm_int8_w8a16_grouped_tiled_kernel(
     out_ptr,
     in_ptr,
     w_ptr,
@@ -257,10 +257,10 @@ def rms_norm_fp8_w8a16_grouped_tiled_kernel(
         tl.store(out_ptr + pid * N + cols, y, mask=mask)
 
 
-def rms_norm_w8a16_fp8(
-    x, normalized_shape, weight_fp8, weight_scale, eps=1e-5, group_size=128
+def rms_norm_w8a16_int8(
+    x, normalized_shape, weight_int8, weight_scale, eps=1e-5, group_size=128
 ):
-    logger.debug("GEMS_ASCEND RMS_NORM W8A16 FORWARD")
+    logger.debug("GEMS_ASCEND RMS_NORM W8A16 INT8 FORWARD")
     dim = x.ndim - len(normalized_shape)
     M = math.prod(x.shape[:dim])
     N = math.prod(normalized_shape)
@@ -268,16 +268,16 @@ def rms_norm_w8a16_fp8(
         raise ValueError(
             f"normalized_shape product {N} must be divisible by group_size={group_size}"
         )
-    if weight_fp8.dtype != torch.int8:
+    if weight_int8.dtype != torch.int8:
         raise TypeError(
-            f"Ascend W8A16 RMSNorm expects INT8 weight, got {weight_fp8.dtype}"
+            f"Ascend W8A16 RMSNorm expects INT8 weight, got {weight_int8.dtype}"
         )
     if weight_scale.numel() != N // group_size:
         raise ValueError(
             f"weight_scale numel {weight_scale.numel()} != {N // group_size} groups"
         )
     x = x.contiguous()
-    weight_q = weight_fp8.contiguous()
+    weight_q = weight_int8.contiguous()
     weight_scale = weight_scale.contiguous()
     y = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     num_groups = N // group_size
@@ -294,7 +294,7 @@ def rms_norm_w8a16_fp8(
                 block_m = 2
                 num_warps = 2 if 16 <= M < 256 else 4
             grid = triton.cdiv(M, block_m)
-            rms_norm_fp8_w8a16_blockm_kernel[grid,](
+            rms_norm_int8_w8a16_blockm_kernel[grid,](
                 y,
                 x,
                 weight_q,
@@ -309,7 +309,7 @@ def rms_norm_w8a16_fp8(
                 num_warps=num_warps,
             )
         elif N <= 8192 and N == triton.next_power_of_2(N):
-            rms_norm_fp8_w8a16_kernel[M,](
+            rms_norm_int8_w8a16_kernel[M,](
                 y,
                 x,
                 weight_q,
@@ -323,7 +323,7 @@ def rms_norm_w8a16_fp8(
             )
         else:
             # 128*128 grouped tile overflows Ascend UB; 64*128 1D tiles are safe.
-            rms_norm_fp8_w8a16_grouped_tiled_kernel[M,](
+            rms_norm_int8_w8a16_grouped_tiled_kernel[M,](
                 y,
                 x,
                 weight_q,

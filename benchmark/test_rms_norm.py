@@ -47,11 +47,6 @@ def _cuda_fp8_e4m3fn_available():
     return major >= 9
 
 
-def _w8a16_available():
-    # Ascend uses grouped INT8 weight (UB cannot load FP8). NVIDIA uses FP8 e4m3.
-    return flag_gems.vendor_name == "ascend" or _cuda_fp8_e4m3fn_available()
-
-
 def _quantize_int8_grouped(w, group_size=GROUP_SIZE):
     if w.ndim == 1:
         n = w.shape[0]
@@ -85,22 +80,23 @@ def _quantize_fp8_grouped(w, group_size=GROUP_SIZE):
     return q.reshape(m, n).contiguous(), scale.squeeze(-1).to(w.dtype).contiguous()
 
 
-def _torch_rms_norm_w8a16(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
+def _torch_rms_norm_w8a16(x, normalized_shape, weight_q, weight_scale, weight_ref):
     return torch.nn.functional.rms_norm(x, normalized_shape, weight_ref)
 
 
-def _quantize_w8a16_weight(w, group_size=GROUP_SIZE):
-    if flag_gems.vendor_name == "ascend":
-        return _quantize_int8_grouped(w, group_size)
-    return _quantize_fp8_grouped(w, group_size)
-
-
-def _gems_rms_norm_w8a16(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
+def _gems_rms_norm_w8a16_fp8(x, normalized_shape, weight_fp8, weight_scale, weight_ref):
     return flag_gems.rms_norm_w8a16_fp8(x, normalized_shape, weight_fp8, weight_scale)
 
 
-class RmsNormFp8Benchmark(base.Benchmark):
+def _gems_rms_norm_w8a16_int8(
+    x, normalized_shape, weight_int8, weight_scale, weight_ref
+):
+    return flag_gems.rms_norm_w8a16_int8(x, normalized_shape, weight_int8, weight_scale)
+
+
+class RmsNormW8A16Benchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "M, N"
+    quantize_weight = None
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
@@ -116,21 +112,27 @@ class RmsNormFp8Benchmark(base.Benchmark):
             (64, 16384),
         ]
 
-
-class RmsNormFp8W8A16Benchmark(RmsNormFp8Benchmark):
     def get_input_iter(self, dtype):
         for shape in self.shapes:
             _, n = shape
             x = torch.randn(shape, dtype=dtype, device=self.device)
             weight = torch.randn(n, dtype=dtype, device=self.device)
-            weight_fp8, weight_scale = _quantize_w8a16_weight(weight)
-            yield x, (n,), weight_fp8, weight_scale, weight
+            weight_q, weight_scale = self.quantize_weight(weight)
+            yield x, (n,), weight_q, weight_scale, weight
+
+
+class RmsNormFp8W8A16Benchmark(RmsNormW8A16Benchmark):
+    quantize_weight = staticmethod(_quantize_fp8_grouped)
+
+
+class RmsNormInt8W8A16Benchmark(RmsNormW8A16Benchmark):
+    quantize_weight = staticmethod(_quantize_int8_grouped)
 
 
 @pytest.mark.rms_norm_w8a16_fp8
 @pytest.mark.skipif(
-    not _w8a16_available(),
-    reason="RMSNorm W8A16 requires Ascend or CUDA sm90+ float8_e4m3fn",
+    not _cuda_fp8_e4m3fn_available(),
+    reason="RMSNorm W8A16 FP8 requires CUDA sm90+ float8_e4m3fn",
 )
 def test_rms_norm_w8a16_fp8():
     bench = RmsNormFp8W8A16Benchmark(
@@ -138,5 +140,20 @@ def test_rms_norm_w8a16_fp8():
         torch_op=_torch_rms_norm_w8a16,
         dtypes=[torch.bfloat16],
     )
-    bench.set_gems(_gems_rms_norm_w8a16)
+    bench.set_gems(_gems_rms_norm_w8a16_fp8)
+    bench.run()
+
+
+@pytest.mark.rms_norm_w8a16_int8
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="RMSNorm W8A16 INT8 is only available on Ascend",
+)
+def test_rms_norm_w8a16_int8():
+    bench = RmsNormInt8W8A16Benchmark(
+        op_name="rms_norm_w8a16_int8",
+        torch_op=_torch_rms_norm_w8a16,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_rms_norm_w8a16_int8)
     bench.run()
