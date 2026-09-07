@@ -12,123 +12,67 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
-import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 import torch
 import triton
 import triton.language as tl
 
-try:
-    import triton.language.extra.cann.extension as al
-except ImportError:
-    al = None
-
-from flag_gems.runtime.backend._ascend.ops.ascendc import compile_topk as helper
-from flag_gems.runtime.backend._ascend.utils import CORE_NUM
+from flag_gems.runtime import torch_device_fn
+from flag_gems.runtime.backend._ascend.utils import CORE_NUM, compile_topk
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
-_READY = False
-_REV = ""
-_INDEX_TABLES = {}
-_LAUNCHERS = {}
+al = None
 
 
-def _launch(kernel, grid, args, tensor_count):
-    """Cache compiled launch functions; tensor data and streams stay dynamic."""
-    device = args[0].device.index
-    key = (
-        kernel,
-        grid,
-        device,
-        args[tensor_count:],
-        tuple((arg.dtype, arg.data_ptr() % 32) for arg in args[:tensor_count]),
-    )
-    runner = _LAUNCHERS.get(key)
-    if runner is None:
-        compiled, _ = kernel[grid](*args, multibuffer=False)
-        _LAUNCHERS[key] = compiled[(grid + (1, 1))[:3]]
-        return
-    stream = triton.runtime.driver.active.get_current_stream(device)
-    # Keep CompiledKernel's profiler/debug hooks; do not cache a stream or input.
-    runner(*args, stream=stream)
+@lru_cache(None)
+def _prepare():
+    global al
+    from triton.language.extra.cann import extension as al
 
+    cpp = Path(__file__).with_suffix(".cpp")
+    bc, command, revision = compile_topk.build(cpp)
 
-def _ensure():
-    global _READY, _REV
-    if _READY:
-        return
-    if al is None or not all(
-        hasattr(al, name) for name in ("custom", "register_custom_op", "scope")
-    ):
-        raise RuntimeError(
-            "Ascend FP8 TopK requires FlagTree Common IR with al.custom support"
-        )
-    helper.install_cann90_custom_op_compat()
-    src = Path(__file__).with_name("ascendc") / "topk_sort.cpp"
-    _REV = hashlib.sha256(
-        src.read_bytes() + Path(helper.__file__).read_bytes()
-    ).hexdigest()[:16]
-    bc = Path("/tmp") / ("flaggems_topk_" + _REV + ".bc")
-    if not bc.exists():
-        subprocess.check_call(
-            [
-                s.replace("dav-c220-cube", "dav-c220-vec")
-                for s in helper.compile_cmd(src, bc)
-            ]
-            + ["-O3"]
-        )
-
-    @al.register_custom_op
-    class topk_sort_pairs:
-        name = "topk_sort_pairs"
+    class VectorOp:
         core = al.CORE.VECTOR
         pipe = al.PIPE.PIPE_V
         mode = al.MODE.SIMD
-        symbol = "topk_sort_pairs"
         bitcode = str(bc)
-        source = str(src)
+        source = str(cpp)
+        compile = command
         extra_attr = "flaggems_pass_outputs=true"
-        compile = helper.makefile_compile().replace("dav-c220-cube", "dav-c220-vec")
+
+    @al.register_custom_op
+    class topk_sort_pairs(VectorOp):
+        name = symbol = "topk_sort_pairs"
 
         def __init__(self, values, indices, scratch, n, out=None):
             self.arg_type["n"] = tl.int32
 
     @al.register_custom_op
-    class topk_select_codes:
-        name = "topk_select_codes"
-        core = al.CORE.VECTOR
-        pipe = al.PIPE.PIPE_V
-        mode = al.MODE.SIMD
-        symbol = "topk_select_codes"
-        bitcode = str(bc)
-        source = str(src)
-        extra_attr = "flaggems_pass_outputs=true"
-        compile = helper.makefile_compile().replace("dav-c220-cube", "dav-c220-vec")
-
-        def __init__(self, q, index, v, i, row, n, k, flip, scratch, out=None):
-            for arg in ("row", "n", "k", "flip"):
-                self.arg_type[arg] = tl.int32
-
-    @al.register_custom_op
-    class topk_sort_prefix:
-        name = "topk_sort_prefix"
-        core = al.CORE.VECTOR
-        pipe = al.PIPE.PIPE_V
-        mode = al.MODE.SIMD
-        symbol = "topk_sort_prefix"
-        bitcode = str(bc)
-        source = str(src)
-        extra_attr = "flaggems_pass_outputs=true"
-        compile = helper.makefile_compile().replace("dav-c220-cube", "dav-c220-vec")
+    class topk_sort_prefix(VectorOp):
+        name = symbol = "topk_sort_prefix"
 
         def __init__(self, values, indices, scratch, n, keep, out=None):
             self.arg_type["n"] = tl.int32
             self.arg_type["keep"] = tl.int32
 
-    _READY = True
+    @al.register_custom_op
+    class topk_select_codes(VectorOp):
+        name = symbol = "topk_select_codes"
+
+        def __init__(self, q, index, v, i, row, n, k, flip, scratch, out=None):
+            for arg in ("row", "n", "k", "flip"):
+                self.arg_type[arg] = tl.int32
+
+    return revision
+
+
+@lru_cache(None)
+def _indices(n, device):
+    return torch.arange(n, dtype=torch.int16).to(device)
 
 
 @triton.jit
@@ -250,139 +194,6 @@ def _merge(
             tl.store(J + row * K + kk, ids, kk < K)
 
 
-def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=128):
-    """Select finite FP8 values, apply scales, and return BF16 values/int64 indices.
-
-    Selection uses exact FP32 dequantized values; equal values may reorder.
-    Only contiguous NPU inputs, last-dimension TopK, and finite scales/FP8
-    values are supported. Quantization is performed by the caller.
-    A constant index table is cached per device/row length for the row path.
-    """
-    assert x.ndim >= 1 and group_size > 0
-    assert x.device.type == "npu" and x_scale.device == x.device
-    assert x_scale.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    assert dim in (-1, x.ndim - 1)
-    assert x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    assert x.is_contiguous() and x_scale.is_contiguous()
-    n = x.shape[-1]
-    assert n > 0, "The last dimension must be nonempty"
-    m = x.numel() // n
-    ng = (n + group_size - 1) // group_size
-    assert x_scale.numel() == m * ng and 0 <= k <= n
-    if x.device.index != torch.npu.current_device():
-        with torch.npu.device(x.device):
-            return topk_w8a16_fp8(x, x_scale, k, dim, largest, sorted, group_size)
-    shape = x.shape[:-1] + (k,)
-    out = torch.empty(shape, dtype=torch.bfloat16, device=x.device)
-    idx = torch.empty(shape, dtype=torch.int64, device=x.device)
-    if k == 0 or m == 0:
-        return out, idx
-    _ensure()
-    if (
-        group_size >= n
-        and x.data_ptr() % 32 == 0
-        and n in (4096, 8192, 16384, 32768)
-        and 8 <= k <= 512
-        and k & (k - 1) == 0
-    ):
-        v = torch.empty((m * k,), dtype=torch.float32, device=x.device)
-        i = torch.empty((m * k,), dtype=torch.int32, device=x.device)
-        c = min(CORE_NUM, m)
-        key = (x.device, n)
-        if key not in _INDEX_TABLES:
-            _INDEX_TABLES[key] = torch.arange(n, dtype=torch.int16).to(x.device)
-        _launch(
-            _row_select,
-            (c,),
-            (
-                x.view(torch.uint8),
-                _INDEX_TABLES[key],
-                x_scale,
-                v,
-                i,
-                n,
-                k,
-                m,
-                c,
-                largest,
-                (5 * n + n // 4 + 8192) // 4,
-                _REV,
-            ),
-            5,
-        )
-        _launch(
-            _row_finish,
-            (c,),
-            (
-                v,
-                i,
-                x_scale,
-                out,
-                idx,
-                k,
-                max(32, 1 << (k - 1).bit_length()),
-                m,
-                c,
-                largest,
-                x.dtype == torch.float8_e5m2,
-                _REV,
-            ),
-            5,
-        )
-        return out, idx
-    b = min(2048, max(32, (1 << (n - 1).bit_length())))
-    p = (n + b - 1) // b
-    assert k <= b and (1 << (p * k - 1).bit_length()) <= 4096
-    if p == 1:
-        v = out
-        i = idx
-    else:
-        v = torch.empty((m * p * k,), dtype=torch.float32, device=x.device)
-        i = torch.empty((m * p * k,), dtype=torch.int32, device=x.device)
-    _launch(
-        _stage1,
-        (min(CORE_NUM, m * p),),
-        (
-            x.view(torch.uint8),
-            x_scale,
-            v,
-            i,
-            n,
-            k,
-            group_size,
-            ng,
-            b,
-            p,
-            largest,
-            x.dtype == torch.float8_e5m2,
-            m * p,
-            min(CORE_NUM, m * p),
-            _REV,
-        ),
-        4,
-    )
-    if p > 1:
-        _launch(
-            _merge,
-            (min(CORE_NUM, m),),
-            (
-                v,
-                i,
-                out,
-                idx,
-                k,
-                p,
-                max(32, 1 << (p * k - 1).bit_length()),
-                largest,
-                m,
-                min(CORE_NUM, m),
-                _REV,
-            ),
-            4,
-        )
-    return out, idx
-
-
 @libentry()
 @triton.jit
 def _row_finish(
@@ -452,3 +263,120 @@ def _row_select(
                 scratch,
                 out=dummy,
             )
+
+
+def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=128):
+    """Last-dimension TopK of finite FP8 values and row/group scales.
+
+    Values are selected in FP32 and returned as BF16 with int64 indices.
+    """
+    assert dim in (-1, x.ndim - 1)
+    assert x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    assert x.is_contiguous() and x_scale.is_contiguous()
+    assert x_scale.device == x.device and x_scale.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    )
+    n = x.shape[-1]
+    m = x.numel() // n
+    ng = triton.cdiv(n, group_size)
+    assert 0 <= k <= n and x_scale.numel() == m * ng
+    out = torch.empty(x.shape[:-1] + (k,), dtype=torch.bfloat16, device=x.device)
+    indices = torch.empty_like(out, dtype=torch.int64)
+    if k == 0 or m == 0:
+        return out, indices
+    with torch_device_fn.device(x.device):
+        revision = _prepare()
+        e5 = x.dtype == torch.float8_e5m2
+        q = x.view(torch.uint8)
+        cores = min(CORE_NUM, m)
+        if (
+            group_size >= n
+            and n in (4096, 8192, 16384, 32768)
+            and x.data_ptr() % 32 == 0
+            and 8 <= k <= 512
+            and k & (k - 1) == 0
+        ):
+            values = torch.empty((m * k,), dtype=torch.float32, device=x.device)
+            ids = torch.empty((m * k,), dtype=torch.int32, device=x.device)
+            _row_select[(cores,)](
+                q,
+                _indices(n, x.device),
+                x_scale,
+                values,
+                ids,
+                n,
+                k,
+                m,
+                cores,
+                largest,
+                (5 * n + n // 4 + 8192) // 4,
+                revision,
+                multibuffer=False,
+            )
+            _row_finish[(cores,)](
+                values,
+                ids,
+                x_scale,
+                out,
+                indices,
+                k,
+                max(32, triton.next_power_of_2(k)),
+                m,
+                cores,
+                largest,
+                e5,
+                revision,
+                multibuffer=False,
+            )
+        else:
+            block = min(2048, max(32, triton.next_power_of_2(n)))
+            parts = triton.cdiv(n, block)
+            merged = triton.next_power_of_2(parts * k)
+            assert k <= block and merged <= 4096
+            values = (
+                out
+                if parts == 1
+                else torch.empty((m * parts * k,), dtype=torch.float32, device=x.device)
+            )
+            ids = (
+                indices
+                if parts == 1
+                else torch.empty((m * parts * k,), dtype=torch.int32, device=x.device)
+            )
+            grid = min(CORE_NUM, m * parts)
+            _stage1[(grid,)](
+                q,
+                x_scale,
+                values,
+                ids,
+                n,
+                k,
+                group_size,
+                ng,
+                block,
+                parts,
+                largest,
+                e5,
+                m * parts,
+                grid,
+                revision,
+                multibuffer=False,
+            )
+            if parts > 1:
+                _merge[(cores,)](
+                    values,
+                    ids,
+                    out,
+                    indices,
+                    k,
+                    parts,
+                    max(32, merged),
+                    largest,
+                    m,
+                    cores,
+                    revision,
+                    multibuffer=False,
+                )
+    return out, indices

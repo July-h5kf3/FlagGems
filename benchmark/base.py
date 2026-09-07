@@ -333,14 +333,6 @@ class Benchmark:
                 fn()
             end = time.time()
             latency = (end - start) / n_rep * 1000
-        elif Config.mode == consts.BenchMode.NPUGRAPH:
-            if self.device != "npu":
-                raise ValueError("npugraph mode requires an Ascend NPU benchmark")
-            from .npu_graph import do_bench_npugraph
-
-            latency = do_bench_npugraph(
-                fn, warmup=Config.warm_up, rep=Config.repetition
-            )
         elif Config.mode == consts.BenchMode.CUDAGRAPH:
             do_bench_cudagraph = triton.testing.do_bench_cudagraph
             latency = do_bench_cudagraph(
