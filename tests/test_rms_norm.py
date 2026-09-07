@@ -105,6 +105,59 @@ def test_rms_norm(shape, dtype):
 
 
 @pytest.mark.rms_norm_w8a16_fp8
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("capture", [False, True], ids=["eager", "cudagraph"])
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "thead" or not _cuda_fp8_e4m3fn_available(),
+    reason="Regression test for THead W8A16 weight dequantization",
+)
+@torch.inference_mode()
+def test_rms_norm_w8a16_fp8_weight_updates(dtype, capture):
+    n = 4096
+    inp = torch.randn((512, n), device=flag_gems.device, dtype=dtype)
+    weight_q = torch.ones(n, device=inp.device, dtype=dtype).to(FP8_DTYPE)
+    weight_scale = torch.ones(n // FP8_GROUP_SIZE, device=inp.device, dtype=dtype)
+
+    def run():
+        return flag_gems.rms_norm_w8a16_fp8(
+            inp, (n,), weight_q, weight_scale, eps=1e-5, group_size=FP8_GROUP_SIZE
+        )
+
+    if capture:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            res_out = run()
+
+    # Keep storage addresses fixed while changing each input independently.
+    # A warmed cache must not hide updates in eager execution or graph replay.
+    for update in ("initial", "weight", "scale"):
+        if update == "weight":
+            weight_q.copy_((weight_q.float() * 2).to(FP8_DTYPE))
+        elif update == "scale":
+            weight_scale.mul_(2)
+        if capture:
+            graph.replay()
+        else:
+            res_out = run()
+        dequant_weight = (
+            weight_q.float() * weight_scale.float().repeat_interleave(FP8_GROUP_SIZE)
+        ).to(dtype)
+        ref_out = torch.nn.functional.rms_norm(
+            utils.to_reference(inp),
+            (n,),
+            utils.to_reference(dequant_weight),
+            eps=1e-5,
+        )
+        utils.gems_assert_close(res_out, ref_out, dtype)
+
+
+@pytest.mark.rms_norm_w8a16_fp8
 @pytest.mark.parametrize(
     "shape",
     [

@@ -18,10 +18,9 @@ Activation is 16-bit (FP16/BF16). Weight is grouped FP8 E4M3
 (``torch.float8_e4m3fn``) plus per-group scale (group_size=128), matching
 PR #4437.
 
-Weights are typically static, so they are dequantized once per unique
-storage and reused. The hot path is then a Gems-like RMSNorm that does not
-write ``inv_rms``. CUDA Graph capture after warmup therefore records only
-the RMSNorm launch.
+Weights are dequantized on every call before RMSNorm. CUDA Graph capture
+records the dequantization as well, so replay reads the current weights
+and scales from the captured input buffers.
 """
 
 import logging
@@ -39,10 +38,6 @@ from flag_gems.utils import triton_lang_extension as ext
 logger = logging.getLogger(__name__)
 
 _FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
-_DEQUANT_CACHE = {}
-_DEQUANT_CACHE_MAX = 16
-_LAST_DEQUANT_KEY = None
-_LAST_DEQUANT_W = None
 
 
 @triton.jit
@@ -188,27 +183,13 @@ def _launch_rms_norm(y, x, w, M, N, eps):
 
 
 def _dequant_weight(weight_q, weight_scale, group_size, out_dtype):
-    global _LAST_DEQUANT_KEY, _LAST_DEQUANT_W
-    n = weight_q.numel()
-    key = (weight_q.data_ptr(), weight_scale.data_ptr(), n, out_dtype, group_size)
-    if key == _LAST_DEQUANT_KEY and _LAST_DEQUANT_W is not None:
-        return _LAST_DEQUANT_W
-    cached = _DEQUANT_CACHE.get(key)
-    if cached is not None:
-        _LAST_DEQUANT_KEY = key
-        _LAST_DEQUANT_W = cached
-        return cached
     # Cast in PyTorch so PPU does not need Triton fp8e4nv loads.
-    w = (
+    # A data pointer can be reused by another tensor, and both inputs can
+    # change in place. Recompute instead of caching values by storage address.
+    return (
         weight_q.to(torch.float32)
         * weight_scale.to(torch.float32).repeat_interleave(group_size)
     ).to(out_dtype)
-    if len(_DEQUANT_CACHE) >= _DEQUANT_CACHE_MAX:
-        _DEQUANT_CACHE.pop(next(iter(_DEQUANT_CACHE)))
-    _DEQUANT_CACHE[key] = w
-    _LAST_DEQUANT_KEY = key
-    _LAST_DEQUANT_W = w
-    return w
 
 
 def rms_norm_w8a16_fp8(
