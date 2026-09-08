@@ -82,16 +82,6 @@ def _cuda_hopper_w8a8_fp8_available():
     )
 
 
-def _thead_w8a8_fp8_available():
-    return getattr(flag_gems, "vendor_name", None) == "thead" and hasattr(
-        flag_gems, "mm_w8a8_fp8"
-    )
-
-
-def _mm_w8a8_fp8_available():
-    return _thead_w8a8_fp8_available() or _cuda_hopper_w8a8_fp8_available()
-
-
 def _mm_w8a8_fp8_reference(a, b):
     fp8_dtype = torch.float8_e4m3fn
     fp8_info = torch.finfo(fp8_dtype)
@@ -105,18 +95,6 @@ def _mm_w8a8_fp8_reference(a, b):
     b_fp8 = (b_fp32 / b_scale[None, :]).clamp(fp8_info.min, fp8_info.max).to(fp8_dtype)
 
     return torch.mm(a_fp8.float(), b_fp8.float()) * a_scale[:, None] * b_scale[None, :]
-
-
-def _mm_w8a8_int8_reference(a, b):
-    a_fp32 = a.float()
-    a_scale = a_fp32.abs().amax(dim=1).clamp_min(1e-8) / 127.0
-    a_q = torch.round(a_fp32 / a_scale[:, None]).clamp(-127, 127)
-
-    b_fp32 = b.float()
-    b_scale = b_fp32.abs().amax(dim=0).clamp_min(1e-8) / 127.0
-    b_q = torch.round(b_fp32 / b_scale[None, :]).clamp(-127, 127)
-
-    return (a_q @ b_q) * a_scale[:, None] * b_scale[None, :]
 
 
 # Issue #2833: fails at (1, 1, 2)
@@ -171,8 +149,8 @@ def test_mm(M, N, K, dtype, b_column_major):
     ],
 )
 @pytest.mark.skipif(
-    not _mm_w8a8_fp8_available(),
-    reason="mm_w8a8_fp8 requires THead/PPU or CUDA Hopper FP8 TMA support",
+    not _cuda_hopper_w8a8_fp8_available(),
+    reason="mm_w8a8_fp8 requires CUDA Hopper FP8 TMA support",
 )
 def test_mm_w8a8_fp8(M, N, K):
     dtype = torch.bfloat16
@@ -180,12 +158,7 @@ def test_mm_w8a8_fp8(M, N, K):
 
     mat1 = torch.randn((M, K), dtype=dtype, device=flag_gems.device)
     mat2 = torch.randn((K, N), dtype=dtype, device=flag_gems.device)
-    reference = (
-        _mm_w8a8_int8_reference
-        if flag_gems.vendor_name == "thead"
-        else _mm_w8a8_fp8_reference
-    )
-    ref_out = utils.to_reference(reference(mat1, mat2), True)
+    ref_out = utils.to_reference(_mm_w8a8_fp8_reference(mat1, mat2), True)
 
     res_out = flag_gems.mm_w8a8_fp8(mat1, mat2, out_dtype=dtype)
     out = torch.empty((M, N), dtype=dtype, device=flag_gems.device)
@@ -354,114 +327,3 @@ def test_mm_out_self_transpose(M, K, dtype):
     flag_gems.mm_out(mat, mat.t(), out=out)
 
     utils.gems_assert_close(out, ref_out, dtype, reduce_dim=K, atol=_mm_atol_base())
-
-
-@pytest.mark.mm_w8a8_fp8
-@pytest.mark.skipif(not _thead_w8a8_fp8_available(), reason="THead regression")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("use_out", [False, True])
-@pytest.mark.parametrize("n,k", [(16, 128), (1024, 2048)])
-def test_mm_w8a8_fp8_input_updates(dtype, use_out, n, k):
-    a = torch.ones((16, k), dtype=dtype, device=flag_gems.device)
-    b = torch.ones((k, n), dtype=dtype, device=flag_gems.device)
-    out = torch.empty((16, n), dtype=dtype, device=flag_gems.device)
-
-    def call():
-        if use_out:
-            result = flag_gems.mm_w8a8_fp8_out(a, b, out=out)
-            assert result is out
-            return result
-        return flag_gems.mm_w8a8_fp8(a, b)
-
-    for av, bv in [(1, 1), (2, 1), (2, 3), (0, 3), (-1, 2)]:
-        a.fill_(av)
-        b.fill_(bv)
-        torch.testing.assert_close(call(), torch.full_like(out, k * av * bv))
-
-
-@pytest.mark.mm_w8a8_fp8
-@pytest.mark.skipif(not _thead_w8a8_fp8_available(), reason="THead regression")
-@pytest.mark.parametrize("use_out", [False, True])
-@pytest.mark.parametrize("inference_mode", [False, True])
-@pytest.mark.parametrize("n,k", [(16, 128), (1024, 2048)])
-def test_mm_w8a8_fp8_graph_input_updates(use_out, inference_mode, n, k):
-    with torch.inference_mode(inference_mode):
-        a = torch.ones((16, k), dtype=torch.bfloat16, device=flag_gems.device)
-        b = torch.ones((k, n), dtype=a.dtype, device=a.device)
-        out = torch.empty((16, n), dtype=a.dtype, device=a.device)
-
-        def call():
-            if use_out:
-                return flag_gems.mm_w8a8_fp8_out(a, b, out=out)
-            return flag_gems.mm_w8a8_fp8(a, b)
-
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                call()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            result = call()
-        for av, bv in [(1, 1), (2, 1), (2, 3), (0, 3), (-1, 2)]:
-            a.fill_(av)
-            b.fill_(bv)
-            graph.replay()
-            torch.testing.assert_close(result, torch.full_like(out, k * av * bv))
-
-
-@pytest.mark.mm_w8a8_fp8
-@pytest.mark.skipif(not _thead_w8a8_fp8_available(), reason="THead regression")
-@pytest.mark.parametrize("shape", [(2, 3, 0), (0, 3, 8), (2, 0, 8), (0, 0, 0)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_mm_w8a8_fp8_empty(shape, dtype):
-    m, n, k = shape
-    a = torch.empty((m, k), dtype=dtype, device=flag_gems.device)
-    b = torch.empty((k, n), dtype=dtype, device=flag_gems.device)
-    out = torch.full((m, n), float("nan"), dtype=dtype, device=flag_gems.device)
-    expected = torch.zeros_like(out)
-    torch.testing.assert_close(flag_gems.mm_w8a8_fp8(a, b), expected)
-    result = flag_gems.mm_w8a8_fp8_out(a, b, out=out)
-    assert result is out
-    torch.testing.assert_close(result, expected)
-
-
-@pytest.mark.mm_w8a8_fp8
-@pytest.mark.skipif(not _thead_w8a8_fp8_available(), reason="THead regression")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("layout", ["contiguous", "transpose", "slice", "broadcast"])
-@pytest.mark.parametrize(
-    "shape", [(3, 17, 33), (17, 65, 129), (2, 7, 2051), (3, 513, 2051)]
-)
-def test_mm_w8a8_fp8_layouts(shape, dtype, layout):
-    m, n, k = shape
-    if layout == "transpose":
-        a = torch.randn((k, m), dtype=dtype, device=flag_gems.device).t()
-        b = torch.randn((n, k), dtype=dtype, device=flag_gems.device).t()
-    elif layout == "slice":
-        a = torch.randn((2 * m, 2 * k), dtype=dtype, device=flag_gems.device)[
-            1::2, 1::2
-        ]
-        b = torch.randn((2 * k, 2 * n), dtype=dtype, device=flag_gems.device)[
-            1::2, 1::2
-        ]
-    elif layout == "broadcast":
-        a = torch.randn((1, k), dtype=dtype, device=flag_gems.device).expand(m, k)
-        b = torch.randn((k, 1), dtype=dtype, device=flag_gems.device).expand(k, n)
-    else:
-        a = torch.randn((m, k), dtype=dtype, device=flag_gems.device)
-        b = torch.randn((k, n), dtype=dtype, device=flag_gems.device)
-    expected = _mm_w8a8_int8_reference(a, b)
-    result = flag_gems.mm_w8a8_fp8(a, b, out_dtype=torch.float32)
-    torch.testing.assert_close(result, expected, atol=1.0e-4, rtol=1.0e-4)
-
-
-@pytest.mark.mm_w8a8_fp8
-@pytest.mark.skipif(not _thead_w8a8_fp8_available(), reason="THead regression")
-def test_mm_w8a8_fp8_round_to_even():
-    a = torch.tensor([[127.0, 0.5, 1.5, 2.5, -0.5, -1.5]], device=flag_gems.device)
-    b = torch.ones((6, 1), device=flag_gems.device)
-    torch.testing.assert_close(
-        flag_gems.mm_w8a8_fp8(a, b), _mm_w8a8_int8_reference(a, b)
-    )

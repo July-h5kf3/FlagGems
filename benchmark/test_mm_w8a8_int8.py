@@ -20,20 +20,18 @@ import flag_gems
 from . import base
 
 
-def _mm_w8a8_fp8_available():
-    return (
-        getattr(flag_gems, "vendor_name", None) == "thead"
-        and hasattr(torch, "float8_e4m3fn")
-        and hasattr(flag_gems, "mm_w8a8_fp8")
+def _mm_w8a8_int8_available():
+    return getattr(flag_gems, "vendor_name", None) == "thead" and hasattr(
+        flag_gems, "mm_w8a8_int8"
     )
 
 
-def _torch_mm(a, b):
-    return torch.mm(a, b)
+def _torch_mm(a, b, scale_a, scale_b, ref_a, ref_b):
+    return torch.mm(ref_a, ref_b)
 
 
-def _gems_mm_w8a8_fp8(a, b):
-    return flag_gems.mm_w8a8_fp8(a, b, out_dtype=a.dtype)
+def _gems_mm_w8a8_int8(a, b, scale_a, scale_b, ref_a, ref_b):
+    return flag_gems.mm_w8a8_int8(a, b, scale_a, scale_b, out_dtype=ref_a.dtype)
 
 
 # Qwen3.5-35B-A3B-p32768d1024 (M, N, K) from FlagGems#3821. Batch is always 1.
@@ -474,7 +472,7 @@ QWEN35_35B_A3B_P32768D1024_SHAPES = [
 ]
 
 
-class MmW8A8Fp8Benchmark(base.Benchmark):
+class MmW8A8Int8Benchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "M, N, K"
 
     def set_shapes(self, shape_file_path=None):
@@ -483,21 +481,29 @@ class MmW8A8Fp8Benchmark(base.Benchmark):
 
     def get_input_iter(self, dtype):
         for m, n, k in self.shapes:
-            a = torch.randn((m, k), dtype=dtype, device=self.device)
-            b = torch.randn((k, n), dtype=dtype, device=self.device)
-            yield a, b
+            # Input preparation is outside the timed operator. Both paths use
+            # row-major A and column-major B; no hidden packing is timed away.
+            a = torch.randint(-127, 128, (m, k), dtype=torch.int8, device=self.device)
+            b = torch.randint(
+                -127, 128, (n, k), dtype=torch.int8, device=self.device
+            ).t()
+            scale_a = torch.full((m,), 1.0 / 127, device=self.device)
+            scale_b = torch.full((n,), 1.0 / 127, device=self.device)
+            ref_a = (a.float() * scale_a[:, None]).to(dtype)
+            ref_b = (b.float() * scale_b[None, :]).to(dtype)
+            yield a, b, scale_a, scale_b, ref_a, ref_b
 
 
-@pytest.mark.mm_w8a8_fp8
+@pytest.mark.mm_w8a8_int8
 @pytest.mark.skipif(
-    not _mm_w8a8_fp8_available(),
-    reason="mm_w8a8_fp8 is a THead/PPU operator",
+    not _mm_w8a8_int8_available(),
+    reason="mm_w8a8_int8 is a THead/PPU operator",
 )
-def test_mm_w8a8_fp8_vs_torch_bf16():
-    bench = MmW8A8Fp8Benchmark(
-        op_name="mm_w8a8_fp8_vs_torch_bf16",
+def test_mm_w8a8_int8_vs_torch_bf16():
+    bench = MmW8A8Int8Benchmark(
+        op_name="mm_w8a8_int8_vs_torch_bf16",
         torch_op=_torch_mm,
         dtypes=[torch.bfloat16],
     )
-    bench.set_gems(_gems_mm_w8a8_fp8)
+    bench.set_gems(_gems_mm_w8a8_int8)
     bench.run()
