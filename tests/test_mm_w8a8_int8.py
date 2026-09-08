@@ -93,12 +93,14 @@ def test_mm_w8a8_int8_strides(layout):
 @pytest.mark.parametrize("use_graph", [False, True])
 @pytest.mark.parametrize("use_out", [False, True])
 @pytest.mark.mm_w8a8_int8
-def test_mm_w8a8_int8_updates(use_graph, use_out):
-    a = torch.ones((16, 128), device=flag_gems.device, dtype=torch.int8)
-    b = torch.ones((32, 128), device=a.device, dtype=torch.int8).t()
-    sa = torch.ones((16, 1), device=a.device)
-    sb = torch.ones((1, 32), device=a.device)
-    out = torch.empty((16, 32), device=a.device)
+@pytest.mark.parametrize("shape", [(16, 32, 128), (1, 64, 2048), (128, 1, 2048)])
+def test_mm_w8a8_int8_updates(use_graph, use_out, shape):
+    m, n, k = shape
+    a = torch.ones((m, k), device=flag_gems.device, dtype=torch.int8)
+    b = torch.ones((n, k), device=a.device, dtype=torch.int8).t()
+    sa = torch.ones((m, 1), device=a.device)
+    sb = torch.ones((1, n), device=a.device)
+    out = torch.empty((m, n), device=a.device)
 
     def call():
         if use_out:
@@ -131,7 +133,7 @@ def test_mm_w8a8_int8_updates(use_graph, use_out):
             graph.replay()
         else:
             y = call()
-        torch.testing.assert_close(y, torch.full_like(y, 128 * av * bv * sav * sbv))
+        torch.testing.assert_close(y, torch.full_like(y, k * av * bv * sav * sbv))
 
 
 @pytest.mark.parametrize("shape", [(2, 3, 0), (0, 3, 8), (2, 0, 8), (0, 0, 0)])

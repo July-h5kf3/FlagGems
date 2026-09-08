@@ -16,7 +16,8 @@
 
 A is [M, K], B is [K, N], both torch.int8. FP32 scales are per row
 of A and per column of B. C = int32(A @ B) * scale_a * scale_b.
-Row-major A and column-major B use AIU; other layouts use strided loads.
+Row-major A and column-major B use AIU or direct integer GEMV reductions;
+other layouts use strided loads.
 No quantization, data cache, packing or layout copy occurs inside the op.
 AIU requires FlagTree #1026 with correct INT8 .b8 lowering.
 """
@@ -213,6 +214,12 @@ def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
     long K so each CTA does fewer AIU/MMA rounds and can prefetch deeper.
     Never pad BLOCK_N far past N: a 64-wide MMA on N=1 is ~64x wasted work.
     """
+    if 32 < m <= 256 and n >= 1024 and 256 <= k <= 512:
+        return 32, 128, 128, 4, 3, 8
+    if 16 < m <= 64 and 512 <= n < 2048 and k >= 1024:
+        return 32, 64, 128, 4, 3, 8
+    if 32 < m <= 512 and n >= 2048 and k >= 2048:
+        return 64, 128, 128, 8, 3, 8
     if k >= 256:
         block_k = 128
     elif k >= 64:
@@ -245,6 +252,45 @@ def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
         warps = 2 if block_n <= 16 else 4
         return 32, block_n, block_k, warps, stages, group_m
     return 64, block_n, block_k, 4, stages, group_m
+
+
+@libentry()
+@triton.jit
+def _mm_w8a8_vector_kernel(
+    A,
+    B,
+    SCALE_A,
+    SCALE_B,
+    OUT,
+    LENGTH: tl.constexpr,
+    K: tl.constexpr,
+    M_ONE: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # A GEMV has no second matrix dimension to amortize padded MMA work.
+    r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    k = tl.arange(0, BLOCK_K)
+    if M_ONE:
+        a = tl.load(A + k[None, :], k[None, :] < K, other=0).to(tl.int32)
+        b = tl.load(
+            B + r[:, None] * K + k[None, :],
+            (r[:, None] < LENGTH) & (k[None, :] < K),
+            other=0,
+        ).to(tl.int32)
+        sa = tl.load(SCALE_A)
+        sb = tl.load(SCALE_B + r, r < LENGTH, other=0)
+    else:
+        a = tl.load(
+            A + r[:, None] * K + k[None, :],
+            (r[:, None] < LENGTH) & (k[None, :] < K),
+            other=0,
+        ).to(tl.int32)
+        b = tl.load(B + k[None, :], k[None, :] < K, other=0).to(tl.int32)
+        sa = tl.load(SCALE_A + r, r < LENGTH, other=0)
+        sb = tl.load(SCALE_B)
+    value = tl.sum(a * b, 1).to(tl.float32) * sa * sb
+    tl.store(OUT + r, value, r < LENGTH)
 
 
 @libentry()
@@ -369,6 +415,29 @@ def _run_mm(a, b, scale_a, scale_b, out, m, n, k):
     if k == 0:
         with torch_device_fn.device(a.device):
             _zero_output_kernel[(triton.cdiv(m * n, 1024),)](out, m * n, BLOCK=1024)
+        return out
+    if (
+        min(m, n) == 1
+        and k <= 4096
+        and n <= 16384
+        and a.stride() == (k, 1)
+        and b.stride() == (1, k)
+    ):
+        length = max(m, n)
+        with torch_device_fn.device(a.device):
+            _mm_w8a8_vector_kernel[(triton.cdiv(length, 2),)](
+                a,
+                b,
+                scale_a,
+                scale_b,
+                out,
+                length,
+                k,
+                m == 1,
+                BLOCK_R=2,
+                BLOCK_K=triton.next_power_of_2(k),
+                num_warps=1 if k <= 512 else 4,
+            )
         return out
     return _launch(a, scale_a, b, scale_b, out, m, n, k)
 

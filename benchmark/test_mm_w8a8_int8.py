@@ -26,12 +26,12 @@ def _mm_w8a8_int8_available():
     )
 
 
-def _torch_mm(a, b, scale_a, scale_b, ref_a, ref_b):
+def _torch_mm(a, b, scale_a, scale_b, ref_a, ref_b, out):
     return torch.mm(ref_a, ref_b)
 
 
-def _gems_mm_w8a8_int8(a, b, scale_a, scale_b, ref_a, ref_b):
-    return flag_gems.mm_w8a8_int8(a, b, scale_a, scale_b, out_dtype=ref_a.dtype)
+def _gems_mm_w8a8_int8(a, b, scale_a, scale_b, ref_a, ref_b, out):
+    return flag_gems.mm_w8a8_int8_out(a, b, scale_a, scale_b, out=out)
 
 
 # Qwen3.5-35B-A3B-p32768d1024 (M, N, K) from FlagGems#3821. Batch is always 1.
@@ -491,7 +491,9 @@ class MmW8A8Int8Benchmark(base.Benchmark):
             scale_b = torch.full((n,), 1.0 / 127, device=self.device)
             ref_a = (a.float() * scale_a[:, None]).to(dtype)
             ref_b = (b.float() * scale_b[None, :]).to(dtype)
-            yield a, b, scale_a, scale_b, ref_a, ref_b
+            # Match the NVIDIA W8A8 benchmark's reusable output buffer.
+            out = torch.empty((m, n), dtype=dtype, device=self.device)
+            yield a, b, scale_a, scale_b, ref_a, ref_b, out
 
 
 @pytest.mark.mm_w8a8_int8
