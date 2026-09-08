@@ -20,8 +20,8 @@
 Hopper #3821 uses FP8 E4M3 tensor cores. PPU Triton has no ``fp8e4nv``, so this
 backend quantizes BF16/FP16/FP32 inputs to INT8 (per-row A, per-column B) and
 runs an INT8 GEMM. A/B tiles are moved with AIU via
-``tle.load(block_ptr, is_async=True)``. Quantized A/B are cached by storage
-identity.
+``tle.load(block_ptr, is_async=True)``. Both inputs are quantized on every
+call, including CUDA Graph replay; no input data is cached.
 
 Requires a FlagTree build that lowers INT8 AIU to ``ppu.cp.async.aiu...2d.b8``
 (FlagTree #1026 / QCLDC INT8 AIU). Older compilers emit ``.b16`` and fault.
@@ -30,8 +30,6 @@ Requires a FlagTree build that lowers INT8 AIU to ``ppu.cp.async.aiu...2d.b8``
 from __future__ import annotations
 
 import logging
-import os
-from collections import OrderedDict
 from typing import Optional
 
 import torch
@@ -48,12 +46,7 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-_CACHE_MAX_ENTRIES = int(os.environ.get("FLAGGEMS_MM_W8A8_CACHE_MAX_ENTRIES", "64"))
-_AUTO_CACHE_A = os.environ.get("FLAGGEMS_MM_W8A8_AUTO_CACHE_A", "1") != "0"
-_A_CACHE: OrderedDict = OrderedDict()
-_B_CACHE: OrderedDict = OrderedDict()
 _SUPPORTED_FLOAT = {torch.bfloat16, torch.float16, torch.float32}
-_INT8_QMAX = 127
 # Skinny N is padded to this so AIU/MMA can skip boundary_check on B.
 _B_N_ALIGN = 16
 
@@ -259,75 +252,70 @@ def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
     return 64, block_n, block_k, 4, stages, group_m
 
 
-def _cache_key(source: torch.Tensor) -> tuple:
-    return (
-        int(source.data_ptr()),
-        int(source.storage_offset()),
-        tuple(source.shape),
-        tuple(source.stride()),
-        source.dtype,
-        source.device.type,
-        int(source.device.index) if source.device.index is not None else -1,
+@libentry()
+@triton.jit
+def _quantize_rows_kernel(
+    X,
+    Q,
+    SCALE,
+    ROWS: tl.constexpr,
+    K: tl.constexpr,
+    STRIDE_R: tl.constexpr,
+    STRIDE_K: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Logical rows are A rows or B columns. Keep the reduction bounded for long K.
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    ks = tl.arange(0, BLOCK_K)
+    maximum = tl.zeros((BLOCK_R, BLOCK_K), tl.float32)
+    for start in range(tl.cdiv(K, BLOCK_K)):
+        k = start * BLOCK_K + ks
+        x = tl.load(
+            X + rows[:, None] * STRIDE_R + k[None, :] * STRIDE_K,
+            (rows[:, None] < ROWS) & (k[None, :] < K),
+            other=0,
+        ).to(tl.float32)
+        maximum = tl.maximum(maximum, tl.abs(x))
+    scale = tl.maximum(tl.max(maximum, 1), 1.0e-8) / 127.0
+    # Q and SCALE include complete row tiles, including zero-filled B padding.
+    tl.store(SCALE + rows, scale)
+    for start in range(tl.cdiv(K, BLOCK_K)):
+        k = start * BLOCK_K + ks
+        x = tl.load(
+            X + rows[:, None] * STRIDE_R + k[None, :] * STRIDE_K,
+            (rows[:, None] < ROWS) & (k[None, :] < K),
+            other=0,
+        ).to(tl.float32)
+        q = tl.extra.cuda.libdevice.nearbyint(tl.div_rn(x, scale[:, None]))
+        q = tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8)
+        tl.store(Q + rows[:, None] * K + k[None, :], q, k[None, :] < K)
+
+
+@libentry()
+@triton.jit
+def _zero_output_kernel(OUT, SIZE: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(OUT + offsets, 0, offsets < SIZE)
+
+
+def _quantize_rows(x, rows, k, stride_r, stride_k, block_r):
+    padded_rows = triton.cdiv(rows, block_r) * block_r
+    q = torch.empty((padded_rows, k), device=x.device, dtype=torch.int8)
+    scale = torch.empty((padded_rows,), device=x.device, dtype=torch.float32)
+    _quantize_rows_kernel[(triton.cdiv(rows, block_r),)](
+        x,
+        q,
+        scale,
+        rows,
+        k,
+        stride_r,
+        stride_k,
+        BLOCK_R=block_r,
+        BLOCK_K=min(triton.next_power_of_2(k), 1024),
+        num_warps=4,
     )
-
-
-def _quantize_a_per_row(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    source = a.float()
-    scale = source.abs().amax(dim=1).clamp_min(1e-8).div(float(_INT8_QMAX))
-    quantized = (
-        torch.round(source / scale[:, None])
-        .clamp(-_INT8_QMAX, _INT8_QMAX)
-        .to(torch.int8)
-    )
-    return quantized.contiguous(), scale.contiguous()
-
-
-def _quantize_b_per_col(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    source = b.float()
-    scale = source.abs().amax(dim=0).clamp_min(1e-8).div(float(_INT8_QMAX))
-    quantized = (
-        torch.round(source / scale[None, :])
-        .clamp(-_INT8_QMAX, _INT8_QMAX)
-        .to(torch.int8)
-        .t()
-        .contiguous()
-    )
-    n = quantized.shape[0]
-    if 0 < n < _B_N_ALIGN:
-        padded = quantized.new_zeros((_B_N_ALIGN, quantized.shape[1]))
-        padded[:n].copy_(quantized)
-        scale_pad = scale.new_zeros((_B_N_ALIGN,))
-        scale_pad[:n].copy_(scale)
-        return padded, scale_pad.contiguous()
-    return quantized, scale.contiguous()
-
-
-def _store_cache(cache: OrderedDict, key: tuple, value):
-    cache[key] = value
-    cache.move_to_end(key)
-    if len(cache) > _CACHE_MAX_ENTRIES:
-        cache.popitem(last=False)
-    return value
-
-
-def _get_cached_a(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if not _AUTO_CACHE_A:
-        return _quantize_a_per_row(a)
-    key = _cache_key(a)
-    cached = _A_CACHE.get(key)
-    if cached is not None:
-        _A_CACHE.move_to_end(key)
-        return cached
-    return _store_cache(_A_CACHE, key, _quantize_a_per_row(a))
-
-
-def _get_cached_b(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    key = _cache_key(b)
-    cached = _B_CACHE.get(key)
-    if cached is not None:
-        _B_CACHE.move_to_end(key)
-        return cached
-    return _store_cache(_B_CACHE, key, _quantize_b_per_col(b))
+    return q, scale
 
 
 def _validate_mm_inputs(a, b) -> tuple[int, int, int]:
@@ -343,16 +331,18 @@ def _validate_mm_inputs(a, b) -> tuple[int, int, int]:
         raise TypeError(
             f"mm_w8a8_fp8 expects floating inputs, got {a.dtype} and {b.dtype}"
         )
+    if a.device != b.device or a.device.type != "cuda":
+        raise ValueError("a and b must be on the same PPU device")
     return a.shape[0], b.shape[1], a.shape[1]
 
 
 def _prepare_inputs(a: torch.Tensor, b: torch.Tensor):
-    if a.stride(0) > 1 and a.stride(1) > 1:
-        a = a.contiguous()
-    if b.stride(0) > 1 and b.stride(1) > 1:
-        b = b.contiguous()
-    a_q, a_scale = _get_cached_a(a)
-    b_q, b_scale = _get_cached_b(b)
+    # Capture the quantization kernels too: replay must consume current A and B.
+    with torch_device_fn.device(a.device):
+        a_q, a_scale = _quantize_rows(a, a.shape[0], a.shape[1], *a.stride(), 1)
+        b_q, b_scale = _quantize_rows(
+            b, b.shape[1], b.shape[0], b.stride(1), b.stride(0), _B_N_ALIGN
+        )
     return a_q, a_scale, b_q, b_scale
 
 
@@ -438,19 +428,34 @@ def _launch(
     return out
 
 
+def _run_mm(a, b, out, m, n, k):
+    if m == 0 or n == 0:
+        return out
+    if k == 0:
+        with torch_device_fn.device(a.device):
+            _zero_output_kernel[(triton.cdiv(m * n, 1024),)](out, m * n, BLOCK=1024)
+        return out
+    a_q, a_scale, b_q, b_scale = _prepare_inputs(a, b)
+    return _launch(a_q, a_scale, b_q, b_scale, out, m, n, k)
+
+
 def mm_w8a8_fp8(a, b, *, out_dtype: Optional[torch.dtype] = None):
     m, n, k = _validate_mm_inputs(a, b)
-    a_q, a_scale, b_q, b_scale = _prepare_inputs(a, b)
     dtype = out_dtype or a.dtype
+    if dtype not in _SUPPORTED_FLOAT:
+        raise TypeError("out_dtype must be BF16, FP16 or FP32")
     out = torch.empty((m, n), device=a.device, dtype=dtype)
-    return _launch(a_q, a_scale, b_q, b_scale, out, m, n, k)
+    return _run_mm(a, b, out, m, n, k)
 
 
 def mm_w8a8_fp8_out(a, b, *, out):
     m, n, k = _validate_mm_inputs(a, b)
     if out.shape != (m, n):
         raise ValueError(f"out shape must be {(m, n)}, got {tuple(out.shape)}")
+    if out.device != a.device:
+        raise ValueError("out must be on the same device as a and b")
+    if out.dtype not in _SUPPORTED_FLOAT:
+        raise TypeError("out must be BF16, FP16 or FP32")
     if not out.is_contiguous():
         raise ValueError("out must be contiguous")
-    a_q, a_scale, b_q, b_scale = _prepare_inputs(a, b)
-    return _launch(a_q, a_scale, b_q, b_scale, out, m, n, k)
+    return _run_mm(a, b, out, m, n, k)
