@@ -111,7 +111,6 @@ def test_rms_norm(shape, dtype):
     flag_gems.vendor_name != "thead" or not _cuda_fp8_e4m3fn_available(),
     reason="Regression test for THead W8A16 weight dequantization",
 )
-@torch.inference_mode()
 def test_rms_norm_w8a16_fp8_weight_updates(dtype, capture):
     n = 4096
     inp = torch.randn((512, n), device=flag_gems.device, dtype=dtype)
