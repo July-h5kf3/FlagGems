@@ -366,14 +366,20 @@ def _launch(
     n: int,
     k: int,
 ) -> torch.Tensor:
-    block_m, block_n, block_k, num_warps, num_stages, group_m = _pick_tiles(
-        m, n, k
-    )
+    (
+        block_m,
+        block_n,
+        block_k,
+        num_warps,
+        num_stages,
+        group_m,
+    ) = _pick_tiles(m, n, k)
     n_b = int(b_q.shape[0])
     boundary = (m % block_m) != 0 or (n_b % block_n) != 0 or (k % block_k) != 0
     store_mask = boundary or (n != n_b)
     logger.debug(
-        "GEMS_THEAD MM_W8A8_AIU m=%s n=%s k=%s n_b=%s tiles=(%s,%s,%s) warps=%s stages=%s aiu=%s boundary=%s store_mask=%s",
+        "GEMS_THEAD MM_W8A8_AIU m=%s n=%s k=%s n_b=%s "
+        "tiles=(%s,%s,%s) warps=%s stages=%s aiu=%s boundary=%s store_mask=%s",
         m,
         n,
         k,

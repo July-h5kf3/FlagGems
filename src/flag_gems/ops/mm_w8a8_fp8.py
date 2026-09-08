@@ -21,8 +21,13 @@ https://github.com/flagos-ai/FlagGems/pull/3821; do not put a PPU kernel in
 the generic tree.
 """
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def mm_w8a8_fp8(*args, **kwargs):
+    logger.debug("GEMS MM_W8A8_FP8")
     raise NotImplementedError(
         "mm_w8a8_fp8 is implemented for the THead/PPU backend; "
         "import flag_gems.mm_w8a8_fp8 after the vendor registrar has run"
@@ -30,6 +35,7 @@ def mm_w8a8_fp8(*args, **kwargs):
 
 
 def mm_w8a8_fp8_out(*args, **kwargs):
+    logger.debug("GEMS MM_W8A8_FP8_OUT")
     raise NotImplementedError(
         "mm_w8a8_fp8_out is implemented for the THead/PPU backend; "
         "import flag_gems.mm_w8a8_fp8_out after the vendor registrar has run"
