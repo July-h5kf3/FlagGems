@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_FLOAT = {torch.bfloat16, torch.float16, torch.float32}
-# Skinny N is padded to this so AIU/MMA can skip boundary_check on B.
+# Packed B alignment used by the tiled column-quantization path.
 _B_N_ALIGN = 16
 
 
@@ -294,6 +294,113 @@ def _quantize_rows_kernel(
 
 @libentry()
 @triton.jit
+def _b_column_absmax_kernel(
+    B,
+    PARTIAL,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    PAD_N: tl.constexpr,
+    STRIDE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Coalesce B reads along N, and distribute long columns across CTAs.
+    n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    x = tl.load(
+        B + k[:, None] * STRIDE_K + n[None, :],
+        (k[:, None] < K) & (n[None, :] < N),
+        other=0,
+    ).to(tl.float32)
+    maximum = tl.max(tl.abs(x), 0)
+    tl.store(PARTIAL + tl.program_id(1) * PAD_N + n, maximum, n < PAD_N)
+
+
+@libentry()
+@triton.jit
+def _quantize_b_tiles_kernel(
+    B,
+    PARTIAL,
+    Q,
+    SCALE,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    PAD_N: tl.constexpr,
+    STRIDE_K: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BLOCK_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    split = tl.arange(0, BLOCK_SPLITS)
+    maxima = tl.load(
+        PARTIAL + split[:, None] * PAD_N + n[None, :],
+        (split[:, None] < SPLITS) & (n[None, :] < PAD_N),
+        other=0,
+    )
+    scale = tl.maximum(tl.max(maxima, 0), 1.0e-8) / 127.0
+    x = tl.load(
+        B + k[:, None] * STRIDE_K + n[None, :],
+        (k[:, None] < K) & (n[None, :] < N),
+        other=0,
+    ).to(tl.float32)
+    q = tl.extra.cuda.libdevice.nearbyint(tl.div_rn(x, scale[None, :]))
+    q = tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8)
+    # Write the packed [N, K] operand consumed by the INT8 GEMM.
+    tl.store(
+        Q + n[None, :] * K + k[:, None], q, (n[None, :] < PAD_N) & (k[:, None] < K)
+    )
+    if tl.program_id(1) == 0:
+        tl.store(SCALE + n, scale, n < PAD_N)
+
+
+def _quantize_b(b):
+    k, n = b.shape
+    # Small or column-major matrices avoid the extra partial-reduction launch.
+    if b.stride(1) != 1 or n < 512 or not 512 <= k <= 8192:
+        # Narrow B needs more independent CTAs, not a large tile of padded columns.
+        block_r = 1 if n <= 64 or b.stride(0) == 1 else (2 if n < 512 else 16)
+        return _quantize_rows(b, n, k, b.stride(1), b.stride(0), block_r)
+    block_n, block_k = 32, 128
+    pad_n = triton.cdiv(n, _B_N_ALIGN) * _B_N_ALIGN
+    splits = triton.cdiv(k, block_k)
+    q = torch.empty((pad_n, k), device=b.device, dtype=torch.int8)
+    scale = torch.empty((pad_n,), device=b.device, dtype=torch.float32)
+    partial = torch.empty((splits, pad_n), device=b.device, dtype=torch.float32)
+    grid = (triton.cdiv(pad_n, block_n), splits)
+    _b_column_absmax_kernel[grid](
+        b,
+        partial,
+        n,
+        k,
+        pad_n,
+        b.stride(0),
+        block_n,
+        block_k,
+        num_warps=4,
+    )
+    _quantize_b_tiles_kernel[grid](
+        b,
+        partial,
+        q,
+        scale,
+        n,
+        k,
+        pad_n,
+        b.stride(0),
+        splits,
+        triton.next_power_of_2(splits),
+        block_n,
+        block_k,
+        num_warps=4,
+    )
+    return q, scale
+
+
+@libentry()
+@triton.jit
 def _zero_output_kernel(OUT, SIZE: tl.constexpr, BLOCK: tl.constexpr):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     tl.store(OUT + offsets, 0, offsets < SIZE)
@@ -340,9 +447,7 @@ def _prepare_inputs(a: torch.Tensor, b: torch.Tensor):
     # Capture the quantization kernels too: replay must consume current A and B.
     with torch_device_fn.device(a.device):
         a_q, a_scale = _quantize_rows(a, a.shape[0], a.shape[1], *a.stride(), 1)
-        b_q, b_scale = _quantize_rows(
-            b, b.shape[1], b.shape[0], b.stride(1), b.stride(0), _B_N_ALIGN
-        )
+        b_q, b_scale = _quantize_b(b)
     return a_q, a_scale, b_q, b_scale
 
 

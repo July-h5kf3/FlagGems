@@ -360,10 +360,11 @@ def test_mm_out_self_transpose(M, K, dtype):
 @pytest.mark.skipif(not _thead_w8a8_fp8_available(), reason="THead regression")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("use_out", [False, True])
-def test_mm_w8a8_fp8_input_updates(dtype, use_out):
-    a = torch.ones((16, 128), dtype=dtype, device=flag_gems.device)
-    b = torch.ones((128, 16), dtype=dtype, device=flag_gems.device)
-    out = torch.empty((16, 16), dtype=dtype, device=flag_gems.device)
+@pytest.mark.parametrize("n,k", [(16, 128), (1024, 2048)])
+def test_mm_w8a8_fp8_input_updates(dtype, use_out, n, k):
+    a = torch.ones((16, k), dtype=dtype, device=flag_gems.device)
+    b = torch.ones((k, n), dtype=dtype, device=flag_gems.device)
+    out = torch.empty((16, n), dtype=dtype, device=flag_gems.device)
 
     def call():
         if use_out:
@@ -375,18 +376,19 @@ def test_mm_w8a8_fp8_input_updates(dtype, use_out):
     for av, bv in [(1, 1), (2, 1), (2, 3), (0, 3), (-1, 2)]:
         a.fill_(av)
         b.fill_(bv)
-        torch.testing.assert_close(call(), torch.full_like(out, 128 * av * bv))
+        torch.testing.assert_close(call(), torch.full_like(out, k * av * bv))
 
 
 @pytest.mark.mm_w8a8_fp8
 @pytest.mark.skipif(not _thead_w8a8_fp8_available(), reason="THead regression")
 @pytest.mark.parametrize("use_out", [False, True])
 @pytest.mark.parametrize("inference_mode", [False, True])
-def test_mm_w8a8_fp8_graph_input_updates(use_out, inference_mode):
+@pytest.mark.parametrize("n,k", [(16, 128), (1024, 2048)])
+def test_mm_w8a8_fp8_graph_input_updates(use_out, inference_mode, n, k):
     with torch.inference_mode(inference_mode):
-        a = torch.ones((16, 128), dtype=torch.bfloat16, device=flag_gems.device)
-        b = torch.ones((128, 16), dtype=a.dtype, device=a.device)
-        out = torch.empty((16, 16), dtype=a.dtype, device=a.device)
+        a = torch.ones((16, k), dtype=torch.bfloat16, device=flag_gems.device)
+        b = torch.ones((k, n), dtype=a.dtype, device=a.device)
+        out = torch.empty((16, n), dtype=a.dtype, device=a.device)
 
         def call():
             if use_out:
@@ -406,7 +408,7 @@ def test_mm_w8a8_fp8_graph_input_updates(use_out, inference_mode):
             a.fill_(av)
             b.fill_(bv)
             graph.replay()
-            torch.testing.assert_close(result, torch.full_like(out, 128 * av * bv))
+            torch.testing.assert_close(result, torch.full_like(out, k * av * bv))
 
 
 @pytest.mark.mm_w8a8_fp8
@@ -429,7 +431,9 @@ def test_mm_w8a8_fp8_empty(shape, dtype):
 @pytest.mark.skipif(not _thead_w8a8_fp8_available(), reason="THead regression")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("layout", ["contiguous", "transpose", "slice", "broadcast"])
-@pytest.mark.parametrize("shape", [(3, 17, 33), (17, 65, 129), (2, 7, 2051)])
+@pytest.mark.parametrize(
+    "shape", [(3, 17, 33), (17, 65, 129), (2, 7, 2051), (3, 513, 2051)]
+)
 def test_mm_w8a8_fp8_layouts(shape, dtype, layout):
     m, n, k = shape
     if layout == "transpose":
