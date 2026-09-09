@@ -208,7 +208,8 @@ if [ "${COMPILER}" = "flagtree" ]; then
   if [ -n "${FLAGTREE_PKGS}" ]; then
     printf "Installing FlagTree ..."
     uv pip uninstall triton
-    uv pip install -q ${FLAGTREE_PKGS} --default-index "${FLAGOS_PYPI}" || fail
+    uv pip install -q ${FLAGTREE_PKGS} \
+      --default-index "${FLAGOS_PYPI}" --index "${MIRROR}" || fail
     ok
   else
     echo "Error: COMPILER=flagtree but FlagTree is not available for '${BACKEND}'."
