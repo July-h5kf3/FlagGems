@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prequantized INT8 matrix multiplication on THead/PPU.
+"""Floating-input W8A8 INT8 matrix multiplication on THead/PPU.
 
-A is [M, K], B is [K, N], both torch.int8. FP32 scales are per row
-of A and per column of B. C = int32(A @ B) * scale_a * scale_b.
-Row-major A and column-major B use AIU or direct integer GEMV reductions;
-other layouts use strided loads.
-No quantization, data cache, packing or layout copy occurs inside the op.
-AIU requires FlagTree #1026 with correct INT8 .b8 lowering.
+A[M,K] and B[K,N] are quantized symmetrically per A row and B column.
+The public interfaces refresh quantization on every call, including Graph
+replay. Internal prequantized helpers allow benchmarks to time GEMM, scaling
+and conversion separately from input preparation. AIU requires FlagTree #1026
+with correct INT8 .b8 lowering.
 """
 
 from __future__ import annotations
@@ -442,7 +441,7 @@ def _run_mm(a, b, scale_a, scale_b, out, m, n, k):
     return _launch(a, scale_a, b, scale_b, out, m, n, k)
 
 
-def mm_w8a8_int8(a, b, scale_a, scale_b, *, out_dtype=torch.bfloat16):
+def _mm_w8a8_int8_prequantized(a, b, scale_a, scale_b, *, out_dtype=torch.bfloat16):
     m, n, k = _validate_mm_inputs(a, b, scale_a, scale_b)
     if out_dtype not in _SUPPORTED_FLOAT:
         raise TypeError("out_dtype must be BF16, FP16 or FP32")
@@ -450,10 +449,108 @@ def mm_w8a8_int8(a, b, scale_a, scale_b, *, out_dtype=torch.bfloat16):
     return _run_mm(a, b, scale_a, scale_b, out, m, n, k)
 
 
-def mm_w8a8_int8_out(a, b, scale_a, scale_b, *, out):
+def _mm_w8a8_int8_prequantized_out(a, b, scale_a, scale_b, *, out):
     m, n, k = _validate_mm_inputs(a, b, scale_a, scale_b)
     if out.shape != (m, n) or out.device != a.device or not out.is_contiguous():
         raise ValueError("out must be contiguous [M,N] on the input device")
     if out.dtype not in _SUPPORTED_FLOAT:
         raise TypeError("out must be BF16, FP16 or FP32")
     return _run_mm(a, b, scale_a, scale_b, out, m, n, k)
+
+
+@libentry()
+@triton.jit
+def _quantize_mm_input_kernel(
+    X,
+    PEAK,
+    Q,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+    STRIDE_R: tl.constexpr,
+    STRIDE_C: tl.constexpr,
+    PER_ROW: tl.constexpr,
+    COLUMN_MAJOR: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    if COLUMN_MAJOR:
+        row, col = offsets % ROWS, offsets // ROWS
+    else:
+        row, col = offsets // COLS, offsets % COLS
+    mask = offsets < ROWS * COLS
+    value = tl.load(X + row * STRIDE_R + col * STRIDE_C, mask, other=0).to(tl.float32)
+    peak = tl.load(PEAK + (row if PER_ROW else col), mask, other=1)
+    # Correctly-rounded division avoids platform-dependent reciprocal error
+    # changing the integer code at half-integer quantization boundaries.
+    normalized = tl.div_rn(value, peak) * 127.0
+    lower = tl.floor(normalized)
+    frac = normalized - lower
+    odd = (lower.to(tl.int32) & 1) != 0
+    rounded = lower + tl.where((frac > 0.5) | ((frac == 0.5) & odd), 1.0, 0.0)
+    quantized = tl.minimum(tl.maximum(rounded, -127.0), 127.0).to(tl.int8)
+    tl.store(Q + offsets, quantized, mask)
+
+
+def _prepare_mm_w8a8_int8_inputs(a, b):
+    """Quantize current inputs directly into row-major A and column-major B."""
+    if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+        raise TypeError("mm_w8a8_int8 expects Tensor inputs")
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        raise ValueError("expected A[M,K] and B[K,N]")
+    if a.dtype not in _SUPPORTED_FLOAT or b.dtype not in _SUPPORTED_FLOAT:
+        raise TypeError("A and B must be FP16, BF16 or FP32 tensors")
+    if a.device.type != "cuda" or a.device != b.device:
+        raise ValueError("A and B must be on the same PPU device")
+    m, k = a.shape
+    n = b.shape[1]
+    # Empty outputs and empty reductions must not call amax on an empty axis.
+    if m == 0 or n == 0 or k == 0:
+        return (
+            torch.empty((m, k), device=a.device, dtype=torch.int8),
+            torch.empty((k, n), device=a.device, dtype=torch.int8),
+            torch.ones(m, device=a.device, dtype=torch.float32),
+            torch.ones(n, device=a.device, dtype=torch.float32),
+        )
+    peak_a = a.float().abs().amax(dim=1).clamp_min(1e-10)
+    peak_b = b.float().abs().amax(dim=0).clamp_min(1e-10)
+    scale_a = peak_a * (1.0 / 127.0)
+    scale_b = peak_b * (1.0 / 127.0)
+    a_q = torch.empty((m, k), device=a.device, dtype=torch.int8)
+    b_q = torch.empty_strided((k, n), (1, k), device=a.device, dtype=torch.int8)
+    with torch_device_fn.device(a.device):
+        for x, peak, q, per_row, column in (
+            (a, peak_a, a_q, True, False),
+            (b, peak_b, b_q, False, True),
+        ):
+            _quantize_mm_input_kernel[(triton.cdiv(x.numel(), 1024),)](
+                x,
+                peak,
+                q,
+                *x.shape,
+                *x.stride(),
+                per_row,
+                column,
+                BLOCK=1024,
+            )
+    return a_q, b_q, scale_a, scale_b
+
+
+def mm_w8a8_int8(a, b, *, out_dtype=None):
+    """Compute W8A8 GEMM from floating inputs using symmetric INT8 quantization.
+
+    The call signature follows mm_w8a8_fp8; the quantization format is INT8.
+    Default output is BF16. Quantization is recomputed, never cached by pointer.
+    """
+    logger.debug("GEMS MM_W8A8_INT8")
+    out_dtype = torch.bfloat16 if out_dtype is None else out_dtype
+    if out_dtype not in _SUPPORTED_FLOAT:
+        raise TypeError("out_dtype must be BF16, FP16 or FP32")
+    return _mm_w8a8_int8_prequantized(
+        *_prepare_mm_w8a8_int8_inputs(a, b), out_dtype=out_dtype
+    )
+
+
+def mm_w8a8_int8_out(a, b, *, out):
+    """Write floating-input INT8 GEMM into a contiguous caller-owned output."""
+    logger.debug("GEMS MM_W8A8_INT8_OUT")
+    return _mm_w8a8_int8_prequantized_out(*_prepare_mm_w8a8_int8_inputs(a, b), out=out)
