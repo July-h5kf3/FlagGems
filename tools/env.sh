@@ -101,8 +101,6 @@ case $BACKEND in
     fi
     ;;
   thead)
-    export FLAGTREE_BACKEND=ppu
-    export MAX_JOBS="${MAX_JOBS:-32}"
     # The envsetup.sh is provided by the PPU SDK
     source /usr/local/PPU_SDK/envsetup.sh
     ;;

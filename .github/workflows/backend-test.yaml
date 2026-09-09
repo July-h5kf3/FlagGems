@@ -56,9 +56,6 @@ permissions:
 jobs:
   test:
     runs-on: ${{ inputs.runner_label }}
-    # PPU LLVM output requires the SDK 2.1 toolchain validated by this image.
-    container: >-
-      ${{ inputs.backend == 'thead' && fromJSON('{"image":"egslingjun-registry.cn-wulanchabu.cr.aliyuncs.com/egslingjun/inference-xpu-pytorch@sha256:c61fa9b82e2909b49d485688688d6c95779b0f0eb3e1cb8e9d76e3c49abadb9c","options":"--device=/dev/alixpu --device=/dev/alixpu_ctl --device=/dev/alixpu_ppu0"}') || null }}
     concurrency:
       group: >-
         op-test-${{ inputs.backend }}-${{ github.event.pull_request.number || github.ref }}
@@ -67,18 +64,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         continue-on-error: true
       - uses: ./.github/actions/checkout-retry
-      - name: Set up the PPU SDK image
-        if: inputs.backend == 'thead'
-        shell: bash
-        run: |
-          bash tools/setup-thead-ci.sh
-          source .venv/bin/activate
-          gpu_output=$(bash tools/gpu_check_thead.sh)
-          echo "$gpu_output"
-          available_gpus=$(echo "$gpu_output" | grep '^Available GPUs:' | cut -d: -f2 | tr -d ' ')
-          echo "AVAILABLE_GPUS=$available_gpus" >> "$GITHUB_ENV"
       - uses: ./.github/actions/setup-flaggems
-        if: inputs.backend != 'thead'
         with:
           backend: ${{ inputs.backend }}
           gpu_check_script: ${{ inputs.gpu_check_script }}
