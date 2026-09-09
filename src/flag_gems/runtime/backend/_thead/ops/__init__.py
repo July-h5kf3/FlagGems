@@ -15,6 +15,7 @@
 
 from .adaptive_max_pool3d_backward import adaptive_max_pool3d_backward
 from .addmm_ import addmm_
+from .bmm import bmm, bmm_out, fp8_einsum
 from .broadcast_tensors import broadcast_tensors
 from .broadcast_to import broadcast_to
 from .conv_transpose1d import conv_transpose1d, conv_transpose1d_output_size
@@ -57,6 +58,8 @@ from .unbind_copy import unbind_copy
 __all__ = [
     "adaptive_max_pool3d_backward",
     "addmm_",
+    "bmm",
+    "bmm_out",
     "broadcast_tensors",
     "broadcast_to",
     "conv_transpose1d",
@@ -65,6 +68,7 @@ __all__ = [
     "cudnn_convolution",
     "diagonal_scatter",
     "embedding_dense_backward",
+    "fp8_einsum",
     "gcd",
     "gcd_",
     "index_copy",

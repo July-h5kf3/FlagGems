@@ -3933,6 +3933,7 @@ ops:
   - einsum
   labels:
   - aten
+  - KernelGen
   kind:
   - Reduction
   stages:
