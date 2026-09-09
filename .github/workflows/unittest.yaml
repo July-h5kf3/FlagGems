@@ -117,6 +117,15 @@ jobs:
       cancel-in-progress: true
     runs-on: jiuding
     steps:
+      - name: Resolve runner home before checkout
+        shell: bash
+        run: |
+          runner_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+          if [ -z "$runner_home" ] || [ ! -d "$runner_home" ] || [ ! -w "$runner_home" ]; then
+            echo "Cannot resolve a writable home for the runner user" >&2
+            exit 1
+          fi
+          echo "HOME=$runner_home" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         continue-on-error: true
       - uses: ./.github/actions/checkout-retry
