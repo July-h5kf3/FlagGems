@@ -17,7 +17,7 @@ import torch
 
 import flag_gems
 from flag_gems.ops.bmm import bmm_out as triton_bmm_out
-from flag_gems.ops.bmm_w8a8_fp8 import bmm_w8a8_fp8
+from flag_gems.ops.bmm_w8a8_fp8 import bmm_w8a8_fp8 as nvidia_bmm_w8a8_fp8
 
 from . import base, consts
 
@@ -73,18 +73,27 @@ def test_bmm_out(monkeypatch):
     bench.run()
 
 
-FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
+# Retain the upstream FP8 path on NVIDIA; PPU uses signed INT8 quantization.
+IS_PPU = flag_gems.vendor_name == "thead"
+FP8_DTYPE = torch.int8 if IS_PPU else getattr(torch, "float8_e4m3fn", None)
+bmm_w8a8_fp8 = flag_gems.bmm_w8a8_int8 if IS_PPU else nvidia_bmm_w8a8_fp8
 
 
 def _is_fp8e4nv_supported():
+    if IS_PPU:
+        return torch.cuda.is_available()
     if FP8_DTYPE is None or not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability()
     return major + minor / 10 >= 8.9
 
 
+def _round_for_ppu(x):
+    return x.round() if IS_PPU else x
+
+
 def _quantize_a_fp8_per_mk_block(A, block_m=128, block_k=128):
-    fp8_info = torch.finfo(FP8_DTYPE)
+    fp8_info = torch.iinfo(FP8_DTYPE) if IS_PPU else torch.finfo(FP8_DTYPE)
     batch, M, K = A.shape
     num_m_blocks = (M + block_m - 1) // block_m
     num_k_blocks = (K + block_k - 1) // block_k
@@ -116,7 +125,7 @@ def _quantize_a_fp8_per_mk_block(A, block_m=128, block_k=128):
     ).float()
     scale = (A_blocked.abs().amax(dim=(2, 4)) / fp8_info.max).clamp(min=1e-8)
     A_fp8 = (
-        (A_blocked / scale[:, :, None, :, None])
+        (_round_for_ppu(A_blocked / scale[:, :, None, :, None]))
         .clamp(fp8_info.min, fp8_info.max)
         .to(FP8_DTYPE)
     )
@@ -125,7 +134,7 @@ def _quantize_a_fp8_per_mk_block(A, block_m=128, block_k=128):
 
 
 def _quantize_b_fp8_per_nk_block(B, block_n=128, block_k=128):
-    fp8_info = torch.finfo(FP8_DTYPE)
+    fp8_info = torch.iinfo(FP8_DTYPE) if IS_PPU else torch.finfo(FP8_DTYPE)
     batch, K, N = B.shape
     num_k_blocks = (K + block_k - 1) // block_k
     num_n_blocks = (N + block_n - 1) // block_n
@@ -157,7 +166,7 @@ def _quantize_b_fp8_per_nk_block(B, block_n=128, block_k=128):
     ).float()
     scale = (B_blocked.abs().amax(dim=(2, 4)) / fp8_info.max).clamp(min=1e-8)
     B_fp8 = (
-        (B_blocked / scale[:, :, None, :, None])
+        (_round_for_ppu(B_blocked / scale[:, :, None, :, None]))
         .clamp(fp8_info.min, fp8_info.max)
         .to(FP8_DTYPE)
     )
@@ -169,6 +178,12 @@ def _triton_bmm_bf16_block_scale_baseline(
     A, B, A_fp8, B_fp8, A_scale, B_scale, out, block_m, block_n, block_k
 ):
     return triton_bmm_out(A, B, out)
+
+
+def _torch_bmm_bf16_block_scale_baseline(
+    A, B, A_fp8, B_fp8, A_scale, B_scale, out, block_m, block_n, block_k
+):
+    return torch.bmm(A, B, out=out)
 
 
 def _gems_bmm_w8a8_fp8(
@@ -210,15 +225,39 @@ class BmmW8A8Fp8Benchmark(base.Benchmark):
             yield A, B, A_fp8, B_fp8, A_scale, B_scale, out, 128, 128, 128
 
 
-@pytest.mark.bmm_w8a8_fp8
+# The report hook uses the operator marker as its JSON key. Keep it identical
+# to Benchmark.op_name so status and timing details belong to the same entry.
+_BLOCK_BMM_BENCHMARK_CASES = (
+    [
+        (baseline, f"bmm_w8a8_int8_vs_{baseline}_bf16")
+        for baseline in ("flaggems", "torch")
+    ]
+    if IS_PPU
+    else [("flaggems", "bmm_w8a8_fp8_vs_triton_bf16")]
+)
+
+
 @pytest.mark.skipif(
     not _is_fp8e4nv_supported(),
-    reason="FP8 BMM W8A8 block-scale requires CUDA fp8e4nv support",
+    reason="Block-scale BMM requires NVIDIA FP8 or T-Head INT8 support",
 )
-def test_bmm_w8a8_fp8_vs_triton_bf16():
+@pytest.mark.parametrize(
+    "baseline,op_name",
+    [
+        pytest.param(
+            baseline, op_name, id=baseline, marks=getattr(pytest.mark, op_name)
+        )
+        for baseline, op_name in _BLOCK_BMM_BENCHMARK_CASES
+    ],
+)
+def test_bmm_w8a8_vs_bf16(baseline, op_name):
     bench = BmmW8A8Fp8Benchmark(
-        op_name="bmm_w8a8_fp8_vs_triton_bf16",
-        torch_op=_triton_bmm_bf16_block_scale_baseline,
+        op_name=op_name,
+        torch_op=(
+            _torch_bmm_bf16_block_scale_baseline
+            if baseline == "torch"
+            else _triton_bmm_bf16_block_scale_baseline
+        ),
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_bmm_w8a8_fp8)
