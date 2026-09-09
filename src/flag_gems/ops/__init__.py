@@ -267,7 +267,7 @@ from flag_gems.ops.bitwise_xor import (
 )
 from flag_gems.ops.blackman_window import blackman_window, blackman_window_periodic
 from flag_gems.ops.block_diag import block_diag
-from flag_gems.ops.bmm import bmm, bmm_out
+from flag_gems.ops.bmm import bmm, bmm_out, fp8_einsum
 from flag_gems.ops.bmm_w8a8_fp8 import bmm_w8a8_fp8
 from flag_gems.ops.broadcast_tensors import broadcast_tensors
 from flag_gems.ops.broadcast_to import broadcast_to
@@ -1362,6 +1362,7 @@ __all__ = [
     "fmod_scalar_",
     "fmod_tensor",
     "fmod_tensor_",
+    "fp8_einsum",
     "fp8_matmul",
     "fp8_mqa_logits",
     "fp8_paged_mqa_logits",

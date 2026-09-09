@@ -5029,6 +5029,17 @@ ops:
   - Math
   stages:
   - alpha: '5.3'
+- id: fp8_einsum
+  description: Block-scaled bhr,hdr->bhd contraction using FP8 on NVIDIA or INT8 on PPU.
+  for:
+  - fp8_einsum
+  labels:
+  - NoCPU
+  - Quantization
+  kind:
+  - BLAS
+  stages:
+  - alpha: '5.4'
 - id: fp8_fp4_mega_moe
   description: 'Functional Triton fallback for local FP8 x FP4 MegaMoE. It consumes
 
