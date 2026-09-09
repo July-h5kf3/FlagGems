@@ -656,54 +656,70 @@ def _int8_block_bmm(
     return out
 
 
-def fp8_einsum(
-    equation, x, xs, y, ys, block_size=(128, 128), output_dtype=torch.bfloat16
-):
-    """Block-scaled ``bhr,hdr->bhd``; PPU uses INT8 for the low-precision route.
+def w8a8_block_fp8_bmm(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    xs: torch.Tensor | None,
+    ys: torch.Tensor | None,
+    block_size=(128, 128),
+    z: torch.Tensor | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """PPU implementation of the upstream W8A8 BMM interface.
 
-    x/xs have shapes [b,h,r] / [b,h,ceil(r/block_k)], y/ys have
-    shapes [h,d,r] / [h,ceil(d/block_n),ceil(r/block_k)]. Floating inputs
-    with no scales use the existing floating BMM kernel in this file.
+    x/y use [B,M,K]/[B,N,K], xs/ys use [B,M,ceil(K/block_k)] /
+    [B,ceil(N/block_n),ceil(K/block_k)]. PPU quantized inputs are INT8;
+    floating inputs with xs=ys=None use the floating kernel in this file.
+    A supplied z[B,M,N] is written in place, including interleaved batch views.
     """
-    logger.debug("GEMS_THEAD FP8_EINSUM")
-    if equation != "bhr,hdr->bhd":
-        raise ValueError("fp8_einsum only supports 'bhr,hdr->bhd'")
+    logger.debug("GEMS_THEAD W8A8_BLOCK_FP8_BMM")
     if x.ndim != 3 or y.ndim != 3:
-        raise ValueError("fp8_einsum inputs must have three dimensions")
-    b, h, r = x.shape
-    if y.shape[0] != h or y.shape[2] != r or x.device != y.device:
-        raise ValueError("fp8_einsum input shape or device mismatch")
+        raise ValueError("W8A8 BMM inputs must have three dimensions")
+    batch, m, k = x.shape
+    if y.shape[0] != batch or y.shape[2] != k or x.device != y.device:
+        raise ValueError("W8A8 BMM input shape or device mismatch")
     if x.dtype != y.dtype:
-        raise TypeError("fp8_einsum inputs must have matching dtypes")
+        raise TypeError("W8A8 BMM inputs must have matching dtypes")
     if len(block_size) != 2 or any(type(v) is not int or v <= 0 for v in block_size):
         raise ValueError("block_size must contain block_n and block_k")
     if output_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError("unsupported output dtype")
-    d = y.shape[1]
-    z = torch.empty((b, h, d), device=x.device, dtype=output_dtype)
+    n = y.shape[1]
     if x.dtype == torch.int8:
         if xs is None or ys is None:
-            raise ValueError("INT8 fp8_einsum requires both scale tensors")
-        if xs.shape != (b, h, triton.cdiv(r, block_size[1])) or ys.shape != (
-            h,
-            triton.cdiv(d, block_size[0]),
-            triton.cdiv(r, block_size[1]),
+            raise ValueError("INT8 W8A8 BMM requires both scale tensors")
+        if xs.shape != (batch, m, triton.cdiv(k, block_size[1])) or ys.shape != (
+            batch,
+            triton.cdiv(n, block_size[0]),
+            triton.cdiv(k, block_size[1]),
         ):
-            raise ValueError("incorrect fp8_einsum scale shape")
-        bmm_out(
-            x.permute(1, 0, 2),
+            raise ValueError("incorrect W8A8 BMM scale shape")
+        return _int8_block_bmm(
+            x,
             y.transpose(1, 2),
-            z.permute(1, 0, 2),
-            a_scale=xs.permute(1, 0, 2),
-            b_scale=ys.transpose(1, 2),
+            xs,
+            ys.transpose(1, 2),
             block_size=(1, block_size[0], block_size[1]),
+            out_dtype=output_dtype,
+            out=z,
         )
-    else:
-        if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-            raise TypeError("unsupported einsum input dtype")
-        if xs is not None or ys is not None:
-            raise ValueError("floating einsum inputs must not have quantization scales")
-        if z.numel() == 0:
-            return z
-        bmm_out(x.permute(1, 0, 2), y.transpose(1, 2), z.permute(1, 0, 2))
-    return z
+    if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise TypeError("unsupported W8A8 BMM input dtype")
+    if xs is not None or ys is not None:
+        raise ValueError("floating BMM inputs must not have quantization scales")
+    if z is None:
+        z = torch.empty((batch, m, n), device=x.device, dtype=output_dtype)
+    elif (
+        z.shape != (batch, m, n)
+        or z.device != x.device
+        or z.dtype != output_dtype
+        or z.stride(2) != 1
+        or z.stride(0) <= 0
+        or z.stride(1) <= 0
+    ):
+        raise ValueError(
+            "z must have matching shape, device, dtype and unit column stride"
+        )
+    if z.numel() == 0:
+        return z
+    return bmm_out(x, y.transpose(1, 2), z)

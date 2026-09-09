@@ -38,7 +38,7 @@ _EINSUM_BLOCK_SHAPES = [
     not _einsum_low_precision_available(), reason="requires PPU INT8 or Hopper FP8"
 )
 @pytest.mark.parametrize("shape", _EINSUM_BLOCK_SHAPES)
-def test_fp8_einsum_block_scaled(shape):
+def test_accuracy_fp8_einsum(shape):
     x, xs, y, ys, xf, yf = _make_block_einsum_inputs(
         *shape, (128, 128), flag_gems.device, EINSUM_LOW_PRECISION_DTYPE
     )
@@ -153,3 +153,68 @@ def test_fp8_einsum_validation_and_extremes():
         flag_gems.fp8_einsum("bhr,hdr->bhd", x, None, y, ys)
     with pytest.raises(TypeError, match="matching"):
         flag_gems.fp8_einsum("bhr,hdr->bhd", x, xs, y.float(), ys)
+
+
+@pytest.mark.fp8_einsum
+@pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="PPU W8A8 interface")
+@pytest.mark.parametrize("shape", [(3, 2, 129, 33), (128, 2, 256, 128)])
+@pytest.mark.parametrize(
+    "dtype", [torch.int8, torch.bfloat16, torch.float16, torch.float32]
+)
+@pytest.mark.parametrize("provide_output", [False, True])
+def test_w8a8_block_fp8_bmm_interface(shape, dtype, provide_output):
+    b, h, k, n = shape
+    x, xs, y, ys, xf, yf = _make_block_einsum_inputs(
+        b,
+        h,
+        k,
+        n,
+        (128, 128),
+        flag_gems.device,
+        torch.int8 if dtype == torch.int8 else torch.bfloat16,
+    )
+    if dtype != torch.int8:
+        x, y = x.to(dtype), y.to(dtype)
+    # Match PR #3297: y/ys retain [B,N,K]/[B,N-block,K-block].
+    x = x.permute(1, 0, 2)
+    xs = xs.permute(1, 0, 2) if xs is not None else None
+    z = (
+        torch.empty((b, h, n), dtype=torch.float32, device=x.device).permute(1, 0, 2)
+        if provide_output
+        else None
+    )
+    result = flag_gems.w8a8_block_fp8_bmm(
+        x, y, xs, ys, block_size=[128, 128], z=z, output_dtype=torch.float32
+    )
+    if provide_output:
+        assert result is z
+    assert result.shape == (h, b, n) and result.dtype == torch.float32
+    if dtype == torch.int8:
+        kk = torch.arange(k, device=x.device) // 128
+        nn = torch.arange(n, device=x.device) // 128
+        ref = torch.bmm(
+            x.float() * xs[:, :, kk],
+            (y.float() * ys[:, nn, :][:, :, kk]).transpose(1, 2),
+        )
+    else:
+        ref = torch.bmm(x.float(), y.float().transpose(1, 2))
+    nrms = ((result - ref).square().mean() / ref.square().mean()).sqrt()
+    assert torch.isfinite(result).all() and nrms.item() < (
+        0.10 if dtype == torch.int8 else 0.01
+    )
+
+
+@pytest.mark.fp8_einsum
+@pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="PPU W8A8 interface")
+def test_w8a8_block_fp8_bmm_output_validation():
+    x = torch.ones((2, 3, 128), dtype=torch.int8, device=flag_gems.device)
+    y = torch.ones((2, 128, 128), dtype=torch.int8, device=x.device)
+    xs = torch.ones((2, 3, 1), device=x.device)
+    ys = torch.ones((2, 1, 1), device=x.device)
+    with pytest.raises(ValueError, match="shape"):
+        flag_gems.w8a8_block_fp8_bmm(x, y, xs.transpose(1, 2), ys)
+    z = torch.empty((2, 3, 128), dtype=torch.float32, device=x.device)
+    with pytest.raises(ValueError, match="dtype"):
+        flag_gems.w8a8_block_fp8_bmm(x, y, xs, ys, z=z)
+    with pytest.raises(ValueError, match="scale"):
+        flag_gems.w8a8_block_fp8_bmm(x.bfloat16(), y.bfloat16(), xs, ys)

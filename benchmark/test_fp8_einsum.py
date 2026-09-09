@@ -21,7 +21,6 @@ import triton
 import flag_gems
 
 from . import base, conftest
-from .test_einsum import EinsumBenchmark
 
 # The upstream FP8 einsum shape grid and quantization structure are shared by
 # the floating and low-precision routes. PPU quantizes to signed INT8.
@@ -89,13 +88,10 @@ def per_block_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool = True, gran_k: int =
 
 
 def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
-    """Build block-wise FP8 ``bhr,hdr->bhd`` inputs
+    """Build upstream per-token x and per-block y inputs for bhr,hdr->bhd.
 
-    Returns (x_data, x_scale, y_data, y_scale):
-      x_data:  (b, h, r) FP8           per-token scaled
-      x_scale: (b, h, r // block_k) FP32
-      y_data:  (h, d, r) FP8           per-block scaled
-      y_scale: (h, d // block_n, r // block_k) FP32
+    Return x, xs, y, ys and the two original BF16 tensors used by baselines.
+    PPU quantized inputs are INT8; NVIDIA quantized inputs are FP8.
     """
     block_n, block_k = block_shape
     torch.manual_seed(seed)
@@ -120,7 +116,7 @@ def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
     return x_data, x_scale, y_data, y_scale, x, y
 
 
-class BlockScaledEinsumBenchmark(EinsumBenchmark):
+class FP8EinsumBenchmark(base.Benchmark):
     """Benchmark for block-wise FP8 ``bhr,hdr->bhd`` einsum (FlagGems vs DeepGEMM)."""
 
     DEFAULT_METRICS = base.consts.DEFAULT_METRICS[:] + ["tflops"]
@@ -200,7 +196,7 @@ def _deepgemm_einsum_wrapper(x, xs, y, ys, x_bf16, y_bf16):
         ),
     ],
 )
-def test_einsum_block_scaled(dtype):
+def test_perf_fp8_einsum(dtype):
     low_precision = dtype == EINSUM_LOW_PRECISION_DTYPE
     if low_precision and not _einsum_low_precision_available():
         pytest.skip("requires PPU INT8 or NVIDIA Hopper FP8 support")
@@ -217,9 +213,7 @@ def test_einsum_block_scaled(dtype):
                 baselines.append(("deepgemm", _deepgemm_einsum_wrapper))
     for baseline_name, baseline in baselines:
         previous = len(conftest.TEST_RESULTS.get(op_name, {}).get("details", []))
-        bench = BlockScaledEinsumBenchmark(
-            op_name=op_name, torch_op=baseline, dtypes=[dtype]
-        )
+        bench = FP8EinsumBenchmark(op_name=op_name, torch_op=baseline, dtypes=[dtype])
         bench.set_gems(_gems_einsum_precision_wrapper)
         bench.run()
         # Keep the public operator ID exact; distinguish references as metadata.
