@@ -164,7 +164,7 @@ class BlasBenchmark(Benchmark):
         total_flops = 0
         # shape(m,k)(k,n)
         # total_flops mxnx2k
-        if self.op_name in ("mm", "mm_w8a8_fp8", "mm_w8a8_int8"):
+        if self.op_name in ("mm", "mm_w8a8_fp8"):
             total_flops = args[0].shape[0] * args[0].shape[1] * args[1].shape[1] * 2
         # shape(m,n)(n,p)
         # total_flops mxpx(2n+1)
@@ -789,7 +789,6 @@ class ParallelBenchmarkMixin:
             if self.op_name in {
                 "mm",
                 "mm_w8a8_fp8",
-                "mm_w8a8_int8",
                 "addmm",
                 "bmm",
                 "baddbmm",
@@ -811,7 +810,6 @@ class ParallelBenchmarkMixin:
                 if self.op_name in {
                     "mm",
                     "mm_w8a8_fp8",
-                    "mm_w8a8_int8",
                     "bmm",
                     "w8a8_block_fp8_matmul",
                     "router_gemm",
@@ -1106,27 +1104,10 @@ def _mm_w8a8_fp8_out_cached(a, b):
     return flag_gems.mm_w8a8_fp8_out(a, b, out=out)
 
 
-def _prepare_mm_w8a8_int8_benchmark(a, b):
-    # Reuse the NVIDIA workload and timer, preparing the INT8 representation
-    # outside timing just as NVIDIA warms its prequantization caches. Keep this
-    # state local to one measurement; the public API never caches mutable input.
-    backend = sys.modules[flag_gems.mm_w8a8_int8.__module__]
-
-    out_dtype = _mm_w8a8_fp8_output_dtype(a)
-    if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError("INT8 W8A8 benchmark requires a floating non-FP8 output")
-    prepared = backend._prepare_mm_w8a8_int8_inputs(a, b)
-    out = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=out_dtype)
-    return lambda: backend._mm_w8a8_int8_prequantized_out(*prepared, out=out)
-
-
 class ParallelMmW8A8Fp8Benchmark(ParallelBlasBenchmark):
     SHAPE_CONFIG_KEYS = ("mm",)
 
     def get_latency(self, op, *args, **kwargs):
-        if self.op_name == "mm_w8a8_int8" and op is not self.torch_op:
-            op = _prepare_mm_w8a8_int8_benchmark(*args, **kwargs)
-            args, kwargs = (), {}
         if op is not self.torch_op:
             # Populate prequantization, descriptor, output, and autotune caches
             # before CUDA Graph capture so replay measures the FP8 GEMM only.
