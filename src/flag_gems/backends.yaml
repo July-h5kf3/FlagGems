@@ -294,8 +294,7 @@ backends:
 
   thead:
     python: "3.12"
-    # Build PPU from the pinned main commit, including async INT8 AIU support.
-    flagtree: git+https://github.com/flagos-ai/FlagTree.git@d96f5339bf73752cf5e3b83e76bdeff055966de2
+    flagtree: flagtree==0.6.2a2+ppu3.6
     triton: triton==3.5.0+ppu2.0.0.oe
     env_source:
       - /usr/local/PPU_SDK/envsetup.sh
