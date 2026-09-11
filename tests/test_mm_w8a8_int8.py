@@ -17,6 +17,7 @@ import sys
 
 import pytest
 import torch
+import triton
 
 import flag_gems
 
@@ -170,59 +171,83 @@ def test_mm_w8a8_int8_reject_float():
         )
 
 
-def _floating_int8_reference(a, b, dtype):
-    # CPU reference computes the integer product exactly, independently of the
-    # backend quantization preparation and GEMM implementation.
-    a, b = a.detach().float().cpu(), b.detach().float().cpu()
+DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+
+
+def _dynamic_reference(a, b, scale_b, dtype=torch.float32):
+    a = a.detach().float().cpu()
+    b = b.cpu().long()
     if not a.shape[0] or not b.shape[1] or not a.shape[1]:
         return torch.zeros((a.shape[0], b.shape[1]), dtype=dtype)
-    peak_a = a.abs().amax(1).clamp_min(1e-10)
-    peak_b = b.abs().amax(0).clamp_min(1e-10)
-    sa, sb = peak_a * (1.0 / 127), peak_b * (1.0 / 127)
-    aq = torch.round((a / peak_a[:, None]) * 127).clamp(-127, 127).to(torch.int64)
-    bq = torch.round((b / peak_b[None, :]) * 127).clamp(-127, 127).to(torch.int64)
-    return ((aq @ bq).float() * sa[:, None] * sb[None, :]).to(dtype)
+    peak = a.abs().amax(1).clamp_min(1e-10)
+    aq = (a / peak[:, None] * 127).round().clamp(-127, 127).long()
+    return ((aq @ b).float() * (peak[:, None] / 127) * scale_b.cpu().reshape(1, -1)).to(
+        dtype
+    )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype,out_dtype", list(itertools.product(DTYPES, DTYPES)))
+@pytest.mark.parametrize(
+    "shape", [(1, 17, 32), (17, 35, 67), (64, 128, 128), (2, 7, 4097)]
+)
 @pytest.mark.parametrize("column_major", [False, True])
-@pytest.mark.parametrize("shape", [(1, 17, 32), (17, 35, 67), (64, 128, 128)])
-def test_mm_w8a8_int8_floating(dtype, out_dtype, column_major, shape):
+def test_dynamic_accuracy(dtype, out_dtype, shape, column_major):
     m, n, k = shape
-    torch.manual_seed(42)
     a = torch.randn((m, k), device=flag_gems.device, dtype=dtype)
-    b = torch.randn((n, k) if column_major else (k, n), device=a.device, dtype=dtype)
+    b = torch.randint(-128, 128, (k, n), device=a.device, dtype=torch.int8)
     if column_major:
-        b = b.t()
-    # Include all-zero rows/columns in scale handling.
-    a[0] = 0
-    b[:, 0] = 0
-    ref = _floating_int8_reference(a, b, out_dtype)
-    y = flag_gems.mm_w8a8_int8(a, b, out_dtype=out_dtype)
-    # Allow one output-dtype rounding step at a halfway value; retain the
-    # strict FP32 tolerance and independent integer reference.
-    rtol = {torch.float16: 1e-3, torch.bfloat16: 8e-3, torch.float32: 1e-5}
-    torch.testing.assert_close(y.cpu(), ref, rtol=rtol[out_dtype], atol=1e-4)
-    out = torch.empty_like(y)
-    assert flag_gems.mm_w8a8_int8_out(a, b, out=out) is out
-    torch.testing.assert_close(out, y, rtol=0, atol=0)
+        b = b.t().contiguous().t()
+    sb = torch.rand(n, device=a.device) * 0.01
+    expected = _dynamic_reference(a, b, sb, out_dtype)
+    actual = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=out_dtype)
+    torch.testing.assert_close(
+        actual.cpu(),
+        expected,
+        rtol={torch.float16: 0.001, torch.bfloat16: 0.008, torch.float32: 1e-5}[
+            out_dtype
+        ],
+        atol=1e-4,
+    )
+    out = torch.empty_like(actual)
+    assert flag_gems.mm_w8a8_int8_out(a, b, sb, out=out) is out
+    torch.testing.assert_close(out, actual, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("use_graph", [False, True])
-@pytest.mark.parametrize("use_out", [False, True])
-@pytest.mark.parametrize("column_major", [False, True])
-def test_mm_w8a8_int8_floating_updates(use_graph, use_out, column_major):
-    a = torch.ones((16, 32), device=flag_gems.device)
-    b = torch.ones((17, 32) if column_major else (32, 17), device=a.device)
-    if column_major:
-        b = b.t()
-    out = torch.empty((16, 17), device=a.device)
+@pytest.mark.parametrize("layout", ["transpose", "slice", "broadcast"])
+def test_dynamic_strides(layout):
+    a = torch.randn(17, 66, device=flag_gems.device)
+    b = torch.randint(-128, 128, (66, 35), device=a.device, dtype=torch.int8)
+    if layout == "transpose":
+        a = a.t().contiguous().t()
+        b = b.t().contiguous().t()
+    elif layout == "slice":
+        a, b = a[:, 1::2], b[1::2, :]
+    else:
+        a, b = a[:1].expand(17, 66), b[:, :1].expand(66, 35)
+    sb = torch.rand(1, 35, device=a.device)
+    actual = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
+    torch.testing.assert_close(
+        actual.cpu(), _dynamic_reference(a, b, sb), rtol=1e-5, atol=1e-4
+    )
+
+
+@pytest.mark.parametrize(
+    "use_graph,use_out", list(itertools.product([False, True], repeat=2))
+)
+@pytest.mark.parametrize(
+    "shape", [(1, 512, 1024), (17, 35, 67), (2, 7, 4097), (4, 17, 8193)]
+)
+def test_dynamic_updates(use_graph, use_out, shape):
+    m, n, k = shape
+    a = torch.randn(m, k, device=flag_gems.device)
+    b = torch.randint(-128, 128, (k, n), device=a.device, dtype=torch.int8)
+    sb = torch.rand(n, device=a.device)
+    out = torch.empty(m, n, device=a.device)
 
     def call():
         if use_out:
-            return flag_gems.mm_w8a8_int8_out(a, b, out=out)
-        return flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
+            return flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
+        return flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -233,334 +258,175 @@ def test_mm_w8a8_int8_floating_updates(use_graph, use_out, column_major):
     if use_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            y = call()
-    for av, bv in [(1, 1), (2, -3), (0, 2), (0.5, 4)]:
-        a.fill_(av)
-        b.fill_(bv)
+            actual = call()
+    # Change individual elements as well as row peaks, so stale activation
+    # codes or scales cannot pass by relying on uniform rescaling alone.
+    for change in ["activation", "weight", "scale", "zero"]:
+        if change == "activation":
+            a.normal_()
+            a[:, 0] = 17
+        elif change == "weight":
+            b.random_(-128, 128)
+        elif change == "scale":
+            sb.mul_(0.5)
+        else:
+            a.zero_()
         if use_graph:
             graph.replay()
         else:
-            y = call()
-        torch.testing.assert_close(y, torch.full_like(y, 32 * av * bv))
+            actual = call()
+        torch.testing.assert_close(
+            actual.cpu(), _dynamic_reference(a, b, sb), rtol=1e-5, atol=1e-3
+        )
 
 
-@pytest.mark.parametrize("shape", [(2, 3, 0), (0, 3, 8), (2, 0, 8)])
-def test_mm_w8a8_int8_floating_empty(shape):
+@pytest.mark.parametrize("shape", [(2, 3, 0), (0, 3, 8), (2, 0, 8), (0, 0, 0)])
+def test_dynamic_empty(shape):
     m, n, k = shape
-    a = torch.empty((m, k), device=flag_gems.device)
-    b = torch.empty((k, n), device=a.device)
-    y = flag_gems.mm_w8a8_int8(a, b)
-    assert y.dtype == torch.bfloat16
-    torch.testing.assert_close(y, torch.zeros_like(y))
-    out = torch.empty((m, n), device=a.device)
-    assert flag_gems.mm_w8a8_int8_out(a, b, out=out) is out
+    a = torch.empty(m, k, device=flag_gems.device)
+    b = torch.empty(k, n, device=a.device, dtype=torch.int8)
+    sb = torch.ones(n, device=a.device)
+    actual = flag_gems.mm_w8a8_int8(a, b, sb)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, torch.zeros_like(actual))
+    out = torch.full((m, n), float("nan"), device=a.device)
+    assert flag_gems.mm_w8a8_int8_out(a, b, sb, out=out) is out
     torch.testing.assert_close(out, torch.zeros_like(out))
 
 
-def test_mm_w8a8_int8_floating_strides_and_validation():
-    a = torch.randn((34, 134), device=flag_gems.device)[::2, ::2]
-    b = torch.randn((134, 70), device=a.device)[::2, ::2]
-    y = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-    torch.testing.assert_close(
-        y.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-4
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("k", [32, 4097])
+def test_dynamic_rounding_and_tiny_values(dtype, k):
+    a = torch.zeros((3, k), device=flag_gems.device, dtype=dtype)
+    vals = torch.tensor(
+        [-127, -3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 127],
+        device=a.device,
+        dtype=dtype,
     )
-    with pytest.raises(TypeError, match="FP16, BF16 or FP32"):
-        flag_gems.mm_w8a8_int8(a.to(torch.int8), b.to(torch.int8))
-    with pytest.raises(TypeError, match="out_dtype"):
-        flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.int8)
-    with pytest.raises(ValueError, match="out must"):
-        flag_gems.mm_w8a8_int8_out(a, b, out=torch.empty((1, 1), device=a.device))
-
-
-@pytest.mark.parametrize("layout", ["row_major", "column_major", "sliced", "broadcast"])
-def test_mm_w8a8_int8_floating_packs_weight(layout):
-    # All caller layouts must produce K-contiguous quantized weights for the prequantized GEMM.
-    a = torch.randn((17, 67), device=flag_gems.device, dtype=torch.bfloat16)
-    b = torch.randn((67, 35), device=a.device, dtype=a.dtype)
-    if layout == "column_major":
-        b = b.t().contiguous().t()
-    elif layout == "sliced":
-        storage = torch.empty((134, 70), device=a.device, dtype=a.dtype)
-        storage[::2, ::2] = b
-        b = storage[::2, ::2]
-    elif layout == "broadcast":
-        b = b[:, :1].expand(67, 35)
-    aq, bq, _, _ = _backend._prepare_mm_w8a8_int8_inputs(a, b)
-    assert aq.stride() == (67, 1)
-    assert bq.stride() == (1, 67)
-    expected_bq = _backend._prepare_mm_w8a8_int8_inputs(a, b.contiguous())[1]
-    torch.testing.assert_close(bq, expected_bq, rtol=0, atol=0)
-    y = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
+    a[0, :10] = vals
+    a[1, :10] = vals * 1e-13
+    b = torch.zeros(k, 10, device=a.device, dtype=torch.int8)
+    b[:10] = torch.eye(10, device=a.device, dtype=torch.int8)
+    sb = torch.ones(10, device=a.device)
+    actual = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
     torch.testing.assert_close(
-        y.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-4
+        actual.cpu(), _dynamic_reference(a, b, sb), rtol=1e-6, atol=1e-20
     )
 
 
-DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+def test_dynamic_alias():
+    a = torch.randn(17, 67, device=flag_gems.device)
+    b = torch.randint(-128, 128, (67, 67), device=a.device, dtype=torch.int8)
+    sb = torch.rand(67, device=a.device)
+    expected = _dynamic_reference(a, b, sb)
+    assert flag_gems.mm_w8a8_int8_out(a, b, sb, out=a) is a
+    torch.testing.assert_close(a.cpu(), expected, rtol=1e-5, atol=1e-4)
+    # Reject shared weight/scale storage even for shifted views.
+    with pytest.raises(ValueError, match="alias"):
+        flag_gems.mm_w8a8_int8_out(a[:1], b, sb, out=sb[None, :])
+    storage = torch.empty(67 * 68, device=a.device)
+    weight = storage.view(torch.int8)[: 67 * 67].reshape(67, 67)
+    with pytest.raises(ValueError, match="alias"):
+        flag_gems.mm_w8a8_int8_out(
+            a, weight, sb, out=storage[: 17 * 67].reshape(17, 67)
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "a_dtype",
+        "b_dtype",
+        "matrix",
+        "shape",
+        "device",
+        "scale_dtype",
+        "scale_shape",
+        "scale_stride",
+        "out_dtype",
+        "out_shape",
+        "out_stride",
+    ],
+)
+def test_dynamic_invalid(case):
+    a = torch.ones(2, 3, device=flag_gems.device)
+    b = torch.ones(3, 4, device=a.device, dtype=torch.int8)
+    sb = torch.ones(4, device=a.device)
+    with pytest.raises((TypeError, ValueError)):
+        if case == "a_dtype":
+            flag_gems.mm_w8a8_int8(a.int(), b, sb)
+        elif case == "b_dtype":
+            flag_gems.mm_w8a8_int8(a, b.float(), sb)
+        elif case == "matrix":
+            flag_gems.mm_w8a8_int8(a[0], b, sb)
+        elif case == "shape":
+            flag_gems.mm_w8a8_int8(a, b[:2], sb)
+        elif case == "device":
+            flag_gems.mm_w8a8_int8(a, b, sb.cpu())
+        elif case == "scale_dtype":
+            flag_gems.mm_w8a8_int8(a, b, sb.half())
+        elif case == "scale_shape":
+            flag_gems.mm_w8a8_int8(a, b, sb[:, None])
+        elif case == "scale_stride":
+            flag_gems.mm_w8a8_int8(a, b, torch.ones(8, device=a.device)[::2])
+        elif case == "out_dtype":
+            flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.int8)
+        elif case == "out_shape":
+            flag_gems.mm_w8a8_int8_out(a, b, sb, out=torch.empty(1, 4, device=a.device))
+        else:
+            flag_gems.mm_w8a8_int8_out(
+                a, b, sb, out=torch.empty(4, 2, device=a.device).t()
+            )
 
 
 @pytest.mark.parametrize(
     "shape",
     [
-        (1, 1, 1),
-        (3, 17, 33),
-        (17, 65, 129),
-        (64, 128, 256),
-        (128, 128, 1024),
-        (2, 7, 2051),
+        (2, 1024, 4096),
+        (4, 512, 3584),
+        (8, 1024, 4096),
+        (98, 2049, 1024),
+        (98, 4096, 4096),
+        (98, 3584, 3584),
+        (98, 4608, 3584),
+        (256, 1024, 1024),
+        (2048, 1024, 1024),
+        (4096, 1024, 1024),
+        (8192, 1024, 1024),
+        (8192, 8192, 1024),
+        (2048, 2048, 2048),
+        (256, 18944, 3584),
+        (256, 28672, 4096),
+        (1, 3584, 18944),
+        (4, 3584, 18944),
+        (4, 14336, 4096),
+        (4, 37888, 3584),
+        (2, 128256, 4096),
+        (8192, 512, 3584),
     ],
 )
-@pytest.mark.parametrize("dtype,out_dtype", list(itertools.product(DTYPES, DTYPES)))
-def test_accuracy(shape, dtype, out_dtype):
-    m, n, k = shape
-    torch.manual_seed(5972)
-    a = torch.randn(m, k, device=flag_gems.device, dtype=dtype)
-    b = torch.randn(k, n, device=flag_gems.device, dtype=dtype)
-    expected = _floating_int8_reference(a, b, out_dtype)
-    actual = flag_gems.mm_w8a8_int8(a, b, out_dtype=out_dtype)
-    torch.testing.assert_close(
-        actual.cpu(),
-        expected,
-        rtol={torch.float16: 0.001, torch.bfloat16: 0.008, torch.float32: 1e-5}[
-            out_dtype
-        ],
-        atol=1e-4,
-    )
-    out = torch.empty_like(actual)
-    assert flag_gems.mm_w8a8_int8_out(a, b, out=out) is out
-    torch.testing.assert_close(out, actual, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("layout", ["transpose", "slice", "broadcast"])
-def test_strides(layout):
-    a = torch.randn(17, 66, device=flag_gems.device)
-    b = torch.randn(66, 35, device=flag_gems.device)
-    if layout == "transpose":
-        a = a.t().contiguous().t()
-        b = b.t().contiguous().t()
-    elif layout == "slice":
-        a = a[:, ::2]
-        b = b[::2, :]
-    else:
-        a = a[:1].expand(17, -1)
-        b = b[:, :1].expand(-1, 35)
-    y = flag_gems.mm_w8a8_int8(a, b)
-    torch.testing.assert_close(
-        y.cpu(), _floating_int8_reference(a, b, torch.bfloat16), rtol=1e-5, atol=1e-4
-    )
-
-
-@pytest.mark.parametrize("shape", [(0, 5, 3), (3, 0, 5), (3, 5, 0), (0, 0, 0)])
-def test_empty(shape):
-    m, n, k = shape
-    a = torch.empty(m, k, device=flag_gems.device)
-    b = torch.empty(k, n, device=flag_gems.device)
-    y = flag_gems.mm_w8a8_int8(a, b)
-    assert y.shape == (m, n)
-    if k == 0:
-        assert torch.count_nonzero(y).item() == 0
-
-
-def test_boundaries_and_updates():
-    # Exact half-integers test nearest-even, including negative ties.
-    v = torch.tensor(
-        [127.0, -127.0, 0.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5], device=flag_gems.device
-    )
-    a = v.repeat(4, 1)
-    b = torch.eye(9, device=flag_gems.device)
-    a[1].zero_()
-    a[2] *= 1e-12
-    for _ in range(2):
-        y = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-        torch.testing.assert_close(
-            y.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-6
-        )
-        a.mul_(-2)
-        b.mul_(3)
-
-
-def test_graph_replay_and_alias():
-    a = torch.randn(32, 32, device=flag_gems.device)
-    b = torch.randn(32, 32, device=flag_gems.device)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            flag_gems.mm_w8a8_int8(a, b)
-    torch.cuda.current_stream().wait_stream(stream)
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        y = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-    for _ in range(2):
-        a.normal_()
-        b.normal_()
-        g.replay()
-        torch.testing.assert_close(
-            y.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-4
-        )
-    expected = _floating_int8_reference(a, b, torch.float32)
-    assert flag_gems.mm_w8a8_int8_out(a, b, out=a) is a
-    torch.testing.assert_close(a.cpu(), expected, rtol=1e-5, atol=1e-4)
-
-
-@pytest.mark.parametrize(
-    "case",
-    ["dtype", "ndim", "shape", "device", "outdtype", "outshape", "outstride"],
-)
-def test_invalid(case):
-    a = torch.ones(3, 4, device=flag_gems.device)
-    b = torch.ones(4, 5, device=flag_gems.device)
-    with pytest.raises((TypeError, ValueError)):
-        if case == "dtype":
-            flag_gems.mm_w8a8_int8(a.int(), b)
-        elif case == "ndim":
-            flag_gems.mm_w8a8_int8(a[0], b)
-        elif case == "shape":
-            flag_gems.mm_w8a8_int8(a, b[:3])
-        elif case == "device":
-            flag_gems.mm_w8a8_int8(a, b.cpu())
-        elif case == "outdtype":
-            flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.int8)
-        elif case == "outshape":
-            flag_gems.mm_w8a8_int8_out(
-                a, b, out=torch.empty(5, 3, device=flag_gems.device)
-            )
-        elif case == "outstride":
-            flag_gems.mm_w8a8_int8_out(
-                a, b, out=torch.empty(5, 3, device=flag_gems.device).t()
-            )
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_quantized_codes(dtype):
-    backend = _backend
-    x = torch.randn(19, 2051, device=flag_gems.device, dtype=dtype)
-    q, _, scale, _ = backend._prepare_mm_w8a8_int8_inputs(x, x.t())
-    cpu = x.cpu().float()
-    peak = cpu.abs().amax(1).clamp_min(1e-10)
-    torch.testing.assert_close(
-        q.cpu(), (cpu / peak[:, None] * 127).round().to(torch.int8), rtol=0, atol=0
-    )
-    torch.testing.assert_close(scale.cpu(), peak * (1 / 127), rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(
-    "adtype,bdtype", [(torch.float16, torch.bfloat16), (torch.float32, torch.float16)]
-)
-def test_mixed_dtypes(adtype, bdtype):
-    a = torch.randn(5, 37, device=flag_gems.device, dtype=adtype)
-    b = torch.randn(37, 9, device=flag_gems.device, dtype=bdtype)
-    y = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-    torch.testing.assert_close(
-        y.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-4
-    )
-
-
-def test_int32_limit():
-    k = 2147483647 // (127 * 127)
-    a = torch.ones(1, k, device=flag_gems.device)
-    b = torch.ones(k, 1, device=flag_gems.device)
-    y = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-    torch.testing.assert_close(y, torch.full_like(y, float(k)), rtol=1e-6, atol=0)
-
-
-@pytest.mark.parametrize(
-    "shape",
-    [(1, 128, 128), (1, 257, 381), (1, 4096, 4096), (4, 128, 2051), (1025, 129, 257)],
-)
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_optimized_paths(shape, dtype):
-    m, n, k = shape
-    a = torch.randn(m, k, device=flag_gems.device, dtype=dtype)
-    b = torch.randn(k, n, device=flag_gems.device, dtype=dtype)
-    out = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-    torch.testing.assert_close(
-        out.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-4
-    )
-
-
-def test_fused_graph_updates_and_shifted_alias():
-    a = torch.randn(1, 257, device=flag_gems.device)
-    b = torch.randn(257, 257, device=flag_gems.device)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-    torch.cuda.current_stream().wait_stream(stream)
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        y = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-    for _ in range(2):
-        a.normal_()
-        b.normal_()
-        g.replay()
-        torch.testing.assert_close(
-            y.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-4
-        )
-    ref = _floating_int8_reference(a, b, torch.float32)
-    out = b.flatten()[5:262].view(1, 257)
-    flag_gems.mm_w8a8_int8_out(a, b, out=out)
-    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=1e-4)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_optimized_quantization_ties(dtype):
-    backend = _backend
-    values = torch.tensor(
-        [127.0, -127.0, 0.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5],
-        device=flag_gems.device,
-        dtype=dtype,
-    )
-    x = values.repeat(19, 29)[:, :257].contiguous()
-    q, _, scale, _ = backend._prepare_mm_w8a8_int8_inputs(x, x.t())
-    cpu = x.cpu().float()
-    peak = cpu.abs().amax(1).clamp_min(1e-10)
-    ref = (cpu / peak[:, None] * 127).round().to(torch.int8)
-    torch.testing.assert_close(q.cpu(), ref, rtol=0, atol=0)
-    b = x.t().contiguous()
-    _, bq, _, scale = backend._prepare_mm_w8a8_int8_inputs(x, b)
-    q = bq.t()
-    torch.testing.assert_close(q.cpu(), ref, rtol=0, atol=0)
-    torch.testing.assert_close(scale.cpu(), peak * (1.0 / 127.0), rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("k", [133145, 151936, 152064])
-@pytest.mark.skipif(
-    flag_gems.vendor_name != "hygon", reason="requires overflow-safe long-K reduction"
-)
-def test_long_k_overflow(k):
-    backend = _backend
-    a = torch.ones(1, k, device=flag_gems.device)
-    b = torch.ones(k, 1, device=flag_gems.device)
-    actual = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-    torch.testing.assert_close(
-        actual, torch.full_like(actual, float(k)), rtol=1e-6, atol=0
-    )
-    aq = torch.full((1, k), -128, device=flag_gems.device, dtype=torch.int8)
-    bq = torch.full((k, 1), -128, device=flag_gems.device, dtype=torch.int8)
-    scale = torch.ones(1, device=flag_gems.device)
-    actual = backend._mm_w8a8_int8_prequantized(
-        aq, bq, scale, scale, out_dtype=torch.float32
-    )
-    expected = torch.full_like(actual, float(k * 128 * 128))
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("shape", [(1, 128, 257), (17, 65, 129), (128, 256, 1024)])
-def test_prequantized_entry(shape):
-    backend = _backend
+def test_dynamic_dispatch(shape):
     m, n, k = shape
     a = torch.randn(m, k, device=flag_gems.device, dtype=torch.bfloat16)
-    b = torch.randn(k, n, device=flag_gems.device, dtype=torch.bfloat16)
-    prepared = backend._prepare_mm_w8a8_int8_inputs(a, b)
-    y = backend._mm_w8a8_int8_prequantized(*prepared, out_dtype=torch.float32)
+    b = torch.randint(-128, 128, (n, k), device=a.device, dtype=torch.int8).t()
+    sb = torch.rand(n, device=a.device) * 0.01
+    actual = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
+    rows, cols = [0, m // 2, m - 1], [0, n // 2, n - 1]
+    expected = _dynamic_reference(a[rows], b[:, cols], sb[cols])
     torch.testing.assert_close(
-        y.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-4
+        actual[rows][:, cols].cpu(), expected, rtol=1e-5, atol=1e-4
     )
-    out = torch.empty_like(y)
-    assert backend._mm_w8a8_int8_prequantized_out(*prepared, out=out) is out
-    torch.testing.assert_close(out, y, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("k", [131071, 131072, 151936, 152064])
+def test_dynamic_long_k(k):
+    a = torch.full((2, k), 127.0, device=flag_gems.device)
+    b = torch.full((5, k), -128, device=a.device, dtype=torch.int8).t()
+    sb = torch.full((5,), 0.5, device=a.device)
+    actual = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
+    torch.testing.assert_close(
+        actual, torch.full_like(actual, float(k * 127 * -128) * 0.5), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize(
@@ -602,3 +468,127 @@ def test_large_tile_long_k_overflow():
     actual = backend._mm_w8a8_int8_prequantized(a, b, sa, sb, out_dtype=torch.float32)
     expected = torch.full_like(actual, float(k * 128 * 128) * -0.125)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype,mantissa", [(torch.float16, 1024), (torch.bfloat16, 128)]
+)
+def test_half_quantization_mantissas(dtype, mantissa):
+    # Exhaust all significand pairs whose normalized magnitude can round nonzero.
+    # Larger exponent gaps are strictly below 0.5. Compare against CPU FP32
+    # division followed by multiplication, including their intermediate rounding.
+    values = 1.0 + torch.arange(mantissa, dtype=torch.float32) / mantissa
+    for shift in range(9):
+        positive = (values[None, :].expand(mantissa, -1) / (2.0**shift)).minimum(
+            values[:, None]
+        )
+        x = torch.cat([positive, -positive, values[:, None]], 1).to(dtype)
+        xf = x.float()
+        peak = xf.abs().amax(1).clamp_min(1e-10)
+        expected = (xf / peak[:, None] * 127).round().to(torch.int8)
+        a = x.to(flag_gems.device)
+        m, k = a.shape
+        q = torch.empty_like(a, dtype=torch.int8)
+        scale = torch.empty(m, device=a.device)
+        _backend._quantize_half_rows[(triton.cdiv(m, 2),)](
+            a,
+            q,
+            scale,
+            m,
+            k,
+            *a.stride(),
+            2,
+            triton.next_power_of_2(k),
+            num_warps=4,
+            enable_fp_fusion=False
+        )
+        torch.testing.assert_close(q.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(scale.cpu(), peak * (1.0 / 127), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_half_quantization_extremes(dtype):
+    exponents = (
+        [-24, -20, -10, 0, 10]
+        if dtype == torch.float16
+        else [-120, -34, 0, 100, 120, 127]
+    )
+    for exponent in exponents:
+        for significand in [1.0, 1.5, 127.0 / 64]:
+            peak_value = torch.tensor(2.0**exponent * significand, dtype=dtype)
+            x = torch.linspace(-1, 1, 257).mul(peak_value.float()).to(dtype)[None, :]
+            a = x.to(flag_gems.device)
+            q = torch.empty_like(a, dtype=torch.int8)
+            scale = torch.empty(1, device=a.device)
+            _backend._quantize_half_rows[(1,)](
+                a,
+                q,
+                scale,
+                1,
+                a.shape[1],
+                *a.stride(),
+                1,
+                512,
+                num_warps=4,
+                enable_fp_fusion=False
+            )
+            p = x.float().abs().amax(1).clamp_min(1e-10)
+            expected = (x.float() / p[:, None] * 127).round().to(torch.int8)
+            torch.testing.assert_close(q.cpu(), expected, rtol=0, atol=0)
+            torch.testing.assert_close(scale.cpu(), p * (1.0 / 127), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_graph", [False, True])
+def test_dynamic_long_vector_updates(dtype, use_graph):
+    m, k = 65, 152064
+    a = torch.rand(m, k, device=flag_gems.device, dtype=dtype)
+    a[:, -1] = 7.9375
+    b = torch.randint(-128, 128, (k, 1), device=a.device, dtype=torch.int8)
+    sb = torch.full((1,), 0.5, device=a.device)
+    out = torch.empty(m, 1, device=a.device)
+
+    def call():
+        return flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            call()
+    torch.cuda.current_stream().wait_stream(stream)
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+    for phase in range(3):
+        if phase == 1:
+            a.uniform_(-1, 1)
+            a[:, -1] = 4.5
+        elif phase == 2:
+            a.fill_(127)
+            b.fill_(-128)
+        if use_graph:
+            graph.replay()
+        else:
+            call()
+        if phase == 2:
+            torch.testing.assert_close(
+                out, torch.full_like(out, float(k * 127 * -128) * 0.5), rtol=0, atol=0
+            )
+        else:
+            torch.testing.assert_close(
+                out.cpu(), _dynamic_reference(a, b, sb), rtol=1e-5, atol=1e-3
+            )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_dynamic_long_vector_alias(dtype):
+    m, k = 65, 65537
+    a = torch.ones(m, k, device=flag_gems.device, dtype=dtype)
+    b = torch.ones(k, 1, device=a.device, dtype=torch.int8)
+    sb = torch.full((1,), 0.001, device=a.device)
+    expected = _dynamic_reference(a, b, sb, dtype)
+    out = a.flatten()[:m].view(m, 1)
+    assert flag_gems.mm_w8a8_int8_out(a, b, sb, out=out) is out
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)

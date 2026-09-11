@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-
 import pytest
 import torch
 
@@ -24,7 +22,7 @@ from .test_blas_perf_parallel import ParallelBlasBenchmark, mm_input_fn
 
 
 class ParallelMmW8A8Int8Benchmark(ParallelBlasBenchmark):
-    """Shared W8A8 INT8 workloads; preparation is outside the selected timer.
+    """W8A8 INT8 workloads including GPU activation quantization.
 
     Use --mode cudagraph --level comprehensive --dtypes bfloat16 --dtypes
     float16 to cover the reference PR's 121 configurations and two B layouts.
@@ -37,16 +35,21 @@ class ParallelMmW8A8Int8Benchmark(ParallelBlasBenchmark):
         if op is self.torch_op:
             a_bf16, b_bf16 = a.to(torch.bfloat16), b.to(torch.bfloat16)
             return lambda: op(a_bf16, b_bf16)
-        backend = sys.modules[flag_gems.mm_w8a8_int8.__module__]
-        prepared = backend._prepare_mm_w8a8_int8_inputs(a, b)
+        # Only weights are quantized offline; keep floating activations live
+        # inside the timed public call, including every CUDA Graph replay.
+        weight = b.float()
+        peak = weight.abs().amax(dim=0).clamp_min(1e-10)
+        scale_b = peak * (1.0 / 127.0)
+        bq = (weight / peak[None, :] * 127.0).round().clamp(-127, 127).to(torch.int8)
+        bq = bq.t().contiguous().t()
         out = torch.empty(
             (a.shape[0], b.shape[1]), device=a.device, dtype=torch.bfloat16
         )
-        return lambda: backend._mm_w8a8_int8_prequantized_out(*prepared, out=out)
+        return lambda: flag_gems.mm_w8a8_int8_out(a, bq, scale_b, out=out)
 
     def get_latency(self, op, *args, **kwargs):
-        # BF16 conversion, quantization, packing, and output allocation happen
-        # before the inherited warmup/timing, including CUDA Graph capture.
+        # Baseline conversion, weight preparation and output allocation are offline.
+        # The timed operator includes dynamic A quantization and all GEMM kernels.
         return super().get_latency(self.prepare_call(op, *args), **kwargs)
 
     def get_tflops(self, op, *args, **kwargs):
@@ -66,5 +69,7 @@ def test_mm_w8a8_int8(baseline):
         dtypes=FLOAT_DTYPES,
     )
     bench.set_gems(flag_gems.mm_w8a8_int8)
-    print(f"BF16 baseline: {baseline}; quantization/layout preparation excluded")
+    print(
+        f"BF16 baseline: {baseline}; dynamic A quantization included; weights offline"
+    )
     bench.run()
