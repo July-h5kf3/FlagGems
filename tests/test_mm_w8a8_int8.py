@@ -372,3 +372,114 @@ def test_mm_w8a8_int8_activation_validation(use_out, invalid):
             flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
         else:
             flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=out_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("n", [1, 17])
+def test_mm_w8a8_int8_long_reduction(dtype, n):
+    m, k = 3, 33001
+    a = torch.randn(m * 2, k * 2, device=flag_gems.device, dtype=dtype)[::2, ::2]
+    b = torch.randint(-128, 128, (k * 2, n * 2), device=a.device, dtype=torch.int8)[
+        ::2, ::2
+    ]
+    sb = torch.rand(n, device=a.device) * 0.01
+    ref = _activation_int8_reference(a, b, sb, torch.float32)
+    out = torch.empty(m, n, device=a.device)
+    flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=1e-4)
+
+
+@pytest.mark.parametrize("dtype,bits", [(torch.float16, 10), (torch.bfloat16, 7)])
+def test_mm_w8a8_int8_quantization_mantissas(dtype, bits):
+    # Enumerate activation mantissas around all relevant exponent differences.
+    mant = torch.arange(2**bits, 2 ** (bits + 1), dtype=torch.float32) / (2**bits)
+    pool = (
+        mant[None, :] * 2.0 ** (-torch.arange(12, dtype=torch.float32)[:, None])
+    ).flatten()
+    pool = torch.cat([pool, -pool])
+    peaks = mant[:: max(1, mant.numel() // 16)]
+    a = pool[None, :].expand(peaks.numel(), -1).clone()
+    a[a.abs() > peaks[:, None]] = 0
+    a = torch.cat([peaks[:, None], a], dim=1).to(dtype)
+    af = a.float()
+    peak = af.abs().amax(1).clamp_min(1e-10)
+    ref = torch.round((af / peak[:, None]) * 127).clamp(-127, 127).to(torch.int8)
+    a = a.to(flag_gems.device)
+    b = torch.zeros(a.shape[1], 1, device=a.device, dtype=torch.int8)
+    sb = torch.ones(1, device=a.device)
+    aq, _, _, _ = _backend._prepare_mm_w8a8_int8_inputs(a, b, sb)
+    torch.testing.assert_close(aq.cpu(), ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mm_w8a8_int8_low_precision_ties(dtype):
+    # A reciprocal alone can move a true half-integer across the rounding tie.
+    a = torch.tensor(
+        [[1.736328125, 0.0888671875, -0.0888671875, 0.0]],
+        dtype=dtype,
+        device=flag_gems.device,
+    )
+    b = torch.eye(4, device=a.device, dtype=torch.int8)
+    sb = torch.ones(4, device=a.device)
+    out = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
+    torch.testing.assert_close(
+        out.cpu(), _activation_int8_reference(a, b, sb, torch.float32), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("magnitude", [1e-30, 1e-12, 1e-10, 1e20, 1e30])
+def test_mm_w8a8_int8_bfloat16_exponents(magnitude):
+    a = (
+        torch.tensor([[1.0, 0.5, -0.25, 0.0]], device=flag_gems.device) * magnitude
+    ).bfloat16()
+    b = torch.eye(4, device=a.device, dtype=torch.int8)
+    sb = torch.ones(4, device=a.device)
+    out = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
+    torch.testing.assert_close(
+        out.cpu(),
+        _activation_int8_reference(a, b, sb, torch.float32),
+        rtol=1e-5,
+        atol=1e-35,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mm_w8a8_int8_persistent_reduction(dtype):
+    m, k = 257, 33001
+    a = torch.randn(m, k, device=flag_gems.device, dtype=dtype)
+    b = torch.randint(-128, 128, (k, 1), device=a.device, dtype=torch.int8)
+    sb = torch.tensor([0.03], device=a.device)
+    ref = _activation_int8_reference(a, b, sb, torch.float32)
+    out = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=1e-4)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
+    for av, bv, sv in [(1, 2, 0.5), (0, 2, 0.5), (2, -128, 0.03)]:
+        a.fill_(av)
+        b.fill_(bv)
+        sb.fill_(sv)
+        graph.replay()
+        torch.testing.assert_close(out, torch.full_like(out, k * av * bv * sv))
+
+
+def test_mm_w8a8_int8_unaligned_weight():
+    m, n, k = 2, 16, 128
+    a = torch.randn(m, k, device=flag_gems.device, dtype=torch.bfloat16)
+    storage = torch.randint(-128, 128, (n * k + 1,), device=a.device, dtype=torch.int8)
+    b = storage[1:].view(n, k).t()
+    sb = torch.rand(n, device=a.device)
+    out = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
+    torch.testing.assert_close(
+        out.cpu(),
+        _activation_int8_reference(a, b, sb, torch.float32),
+        rtol=1e-5,
+        atol=1e-4,
+    )

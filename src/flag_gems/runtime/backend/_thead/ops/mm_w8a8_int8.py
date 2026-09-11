@@ -144,6 +144,12 @@ def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
     long K so each CTA does fewer AIU/MMA rounds and can prefetch deeper.
     Never pad BLOCK_N far past N: a 64-wide MMA on N=1 is ~64x wasted work.
     """
+    if 32 < m <= 128 and n <= 512 and k >= 2048:
+        return 16, 16, 128, 1, 2, 8
+    if 128 < m <= 256 and n <= 512 and k >= 2048:
+        return 32, 32, 128, 4, 2, 8
+    if m >= 1024 and n <= 1024 and k >= 2048:
+        return 64, 128, 128, 4, 3, 8
     if 32 < m <= 256 and n >= 1024 and 256 <= k <= 512:
         return 32, 128, 128, 4, 3, 8
     if 16 < m <= 64 and 512 <= n < 2048 and k >= 1024:
@@ -321,6 +327,31 @@ def _run_mm(a, b, scale_a, scale_b, out, m, n, k):
             _zero_output_kernel[(triton.cdiv(m * n, 1024),)](out, m * n, BLOCK=1024)
         return out
     if (
+        1 < m <= 8
+        and n <= 512
+        and k <= 4096
+        and k % 4 == 0
+        and a.is_contiguous()
+        and b.stride() == (1, k)
+        and a.data_ptr() % 4 == 0
+        and b.data_ptr() % 4 == 0
+    ):
+        r, warps = (1, 1) if m > 4 else (2, 4)
+        with torch_device_fn.device(a.device):
+            _small_rows[(triton.cdiv(n, r), m)](
+                a,
+                b,
+                scale_a,
+                scale_b,
+                out,
+                n,
+                k,
+                R=r,
+                BK=triton.next_power_of_2(k),
+                num_warps=warps,
+            )
+        return out
+    if (
         min(m, n) == 1
         and k <= 4096
         and n <= 16384
@@ -366,36 +397,98 @@ def _mm_w8a8_int8_prequantized_out(a, b, scale_a, scale_b, *, out):
     return _run_mm(a, b, scale_a, scale_b, out, m, n, k)
 
 
+@triton.jit
+def _quantize_values(value, peak, LOW_PRECISION: tl.constexpr = False):
+    if LOW_PRECISION and peak > 1.0e-10:
+        # FP16/BF16 inputs have at most 11 significant bits. Non-ties are
+        # separated from half-integers by more than 2**-20 in relative value.
+        # Rounding away three low FP32 mantissa bits restores exact ties
+        # without moving a non-tie across an integer-rounding boundary.
+        normalized = value * tl.div_rn(127.0, peak)
+        normalized = ((normalized.to(tl.uint32, bitcast=True) + 4) & 0xFFFFFFF8).to(
+            tl.float32, bitcast=True
+        )
+    else:
+        normalized = tl.div_rn(value, peak) * 127.0
+    rounded = tl.inline_asm_elementwise(
+        "cvt.rni.s32.f32 $0, $1;",
+        constraints="=r,f",
+        args=[normalized],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    return tl.minimum(tl.maximum(rounded, -127), 127).to(tl.int8)
+
+
 @libentry()
 @triton.jit
-def _quantize_mm_input_kernel(
+def _quantize_activation_rows(
     X,
-    PEAK,
     Q,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
+    SCALE,
+    K: tl.constexpr,
     STRIDE_R: tl.constexpr,
     STRIDE_C: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    row, col = offsets // COLS, offsets % COLS
-    mask = offsets < ROWS * COLS
-    value = tl.load(X + row * STRIDE_R + col * STRIDE_C, mask, other=0).to(tl.float32)
-    peak = tl.load(PEAK + row, mask, other=1)
-    # Correctly-rounded division avoids platform-dependent reciprocal error
-    # changing the integer code at half-integer quantization boundaries.
-    normalized = tl.div_rn(value, peak) * 127.0
-    lower = tl.floor(normalized)
-    frac = normalized - lower
-    odd = (lower.to(tl.int32) & 1) != 0
-    rounded = lower + tl.where((frac > 0.5) | ((frac == 0.5) & odd), 1.0, 0.0)
-    quantized = tl.minimum(tl.maximum(rounded, -127.0), 127.0).to(tl.int8)
-    tl.store(Q + offsets, quantized, mask)
+    row = tl.program_id(0)
+    k = tl.arange(0, BLOCK)
+    value = tl.load(X + row * STRIDE_R + k * STRIDE_C, k < K, other=0).to(tl.float32)
+    peak = tl.maximum(tl.max(tl.abs(value), 0), 1.0e-10)
+    quantized = _quantize_values(value, peak, X.dtype.element_ty != tl.float32)
+    tl.store(Q + row * K + k, quantized, k < K)
+    tl.store(SCALE + row, peak * (1.0 / 127.0))
 
 
-def _prepare_mm_w8a8_int8_inputs(a, b, scale_b):
-    """Quantize activations and pack existing INT8 weights for the AIU loader."""
+@libentry()
+@triton.jit
+def _activation_partial_peaks(
+    X,
+    PEAK,
+    K: tl.constexpr,
+    SR: tl.constexpr,
+    SC: tl.constexpr,
+    PARTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row, part = tl.program_id(0), tl.program_id(1)
+    k = part * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(X + row * SR + k * SC, k < K, other=0).to(tl.float32)
+    tl.store(PEAK + row * PARTS + part, tl.max(tl.abs(x), 0))
+
+
+@libentry()
+@triton.jit
+def _quantize_activation_chunks(
+    X,
+    PEAK,
+    Q,
+    SCALE,
+    K: tl.constexpr,
+    SR: tl.constexpr,
+    SC: tl.constexpr,
+    PARTS: tl.constexpr,
+    BP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row, part = tl.program_id(0), tl.program_id(1)
+    p = tl.arange(0, BP)
+    peaks = tl.load(PEAK + row * PARTS + p, p < PARTS, other=0)
+    peak = tl.maximum(tl.max(peaks, 0), 1.0e-10)
+    k = part * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(X + row * SR + k * SC, k < K, other=0).to(tl.float32)
+    tl.store(
+        Q + row * K + k,
+        _quantize_values(value, peak, X.dtype.element_ty != tl.float32),
+        k < K,
+    )
+    if part == 0:
+        tl.store(SCALE + row, peak * (1.0 / 127.0))
+
+
+def _validate_activation_inputs(a, b, scale_b):
+    """Validate the public floating-activation / INT8-weight contract."""
     if not all(isinstance(x, torch.Tensor) for x in (a, b, scale_b)):
         raise TypeError("mm_w8a8_int8 expects Tensor inputs and weight scales")
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
@@ -412,22 +505,299 @@ def _prepare_mm_w8a8_int8_inputs(a, b, scale_b):
         raise ValueError("expected scale_b[N] or [1,N]")
     if scale_b.dtype != torch.float32 or not scale_b.is_contiguous():
         raise ValueError("scale_b must be a contiguous FP32 tensor")
+    return m, n, k
+
+
+def _prepare_mm_w8a8_int8_inputs(a, b, scale_b):
+    m, n, k = _validate_activation_inputs(a, b, scale_b)
     a_q = torch.empty((m, k), device=a.device, dtype=torch.int8)
     # Empty outputs and reductions must not call amax on an empty axis.
     if m == 0 or n == 0 or k == 0:
         return a_q, b, torch.ones(m, device=a.device, dtype=torch.float32), scale_b
-    peak_a = a.float().abs().amax(dim=1).clamp_min(1e-10)
-    scale_a = peak_a * (1.0 / 127.0)
+    scale_a = torch.empty(m, device=a.device, dtype=torch.float32)
     with torch_device_fn.device(a.device):
-        _quantize_mm_input_kernel[(triton.cdiv(a.numel(), 1024),)](
-            a,
-            peak_a,
-            a_q,
-            *a.shape,
-            *a.stride(),
-            BLOCK=1024,
-        )
+        if k <= 32768:
+            _quantize_activation_rows[(m,)](
+                a,
+                a_q,
+                scale_a,
+                k,
+                *a.stride(),
+                BLOCK=triton.next_power_of_2(k),
+                num_warps=32 if m <= 32 else (8 if k <= 512 else 4),
+            )
+        else:
+            parts = triton.cdiv(k, 4096)
+            peaks = torch.empty((m, parts), device=a.device, dtype=torch.float32)
+            _activation_partial_peaks[(m, parts)](
+                a,
+                peaks,
+                k,
+                *a.stride(),
+                parts,
+                BLOCK=4096,
+                num_warps=4,
+            )
+            _quantize_activation_chunks[(m, triton.cdiv(k, 1024))](
+                a,
+                peaks,
+                a_q,
+                scale_a,
+                k,
+                *a.stride(),
+                parts,
+                BP=triton.next_power_of_2(parts),
+                BLOCK=1024,
+                num_warps=4,
+            )
     return a_q, b.t().contiguous().t(), scale_a, scale_b
+
+
+@libentry()
+@triton.jit
+def _long_mv_partials(
+    A,
+    B,
+    PEAK,
+    PARTIAL,
+    SCALE,
+    K: tl.constexpr,
+    SR: tl.constexpr,
+    SC: tl.constexpr,
+    BS: tl.constexpr,
+    PARTS: tl.constexpr,
+    BP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row, part = tl.program_id(0), tl.program_id(1)
+    ps = tl.arange(0, BP)
+    peaks = tl.load(PEAK + row * PARTS + ps, ps < PARTS, other=0)
+    peak = tl.maximum(tl.max(peaks, 0), 1.0e-10)
+    k = part * BLOCK + tl.arange(0, BLOCK)
+    a = tl.load(A + row * SR + k * SC, k < K, other=0).to(tl.float32)
+    aq = _quantize_values(a, peak, A.dtype.element_ty != tl.float32).to(tl.int32)
+    b = tl.load(B + k * BS, k < K, other=0).to(tl.int32)
+    tl.store(PARTIAL + row * PARTS + part, tl.sum(aq * b, 0))
+    if part == 0:
+        tl.store(SCALE + row, peak * (1.0 / 127.0))
+
+
+@libentry()
+@triton.jit
+def _long_mv_reduce(PARTIAL, SCALE, SB, OUT, PARTS: tl.constexpr, BP: tl.constexpr):
+    row = tl.program_id(0)
+    ps = tl.arange(0, BP)
+    p = tl.load(PARTIAL + row * PARTS + ps, ps < PARTS, other=0)
+    acc = tl.sum(p, 0).to(tl.float32)
+    sa, sb = tl.load(SCALE + row), tl.load(SB)
+    tl.store(OUT + row, acc * sa * sb)
+
+
+@libentry()
+@triton.jit
+def _fused_single_row(
+    A, B, S, OUT, N: tl.constexpr, K: tl.constexpr, R: tl.constexpr, BK: tl.constexpr
+):
+    m = tl.program_id(1)
+    r = tl.program_id(0) * R + tl.arange(0, R)
+    k = tl.arange(0, BK)
+    a = tl.load(A + m * K + k, k < K, other=0).to(tl.float32)
+    peak = tl.maximum(tl.max(tl.abs(a), 0), 1.0e-10)
+    q = _quantize_values(a, peak, A.dtype.element_ty != tl.float32).to(tl.int32)
+    q = tl.reshape(q, (BK // 4, 4)).to(tl.uint32) & 255
+    shift = tl.arange(0, 4) * 8
+    packed = tl.sum(q << shift[None, :], 1).to(tl.int32)
+    kk = tl.arange(0, BK // 4)
+    b = tl.load(
+        B.to(tl.pointer_type(tl.int32)) + r[:, None] * (K // 4) + kk[None, :],
+        (r[:, None] < N) & (kk[None, :] < K // 4),
+        other=0,
+    )
+    partial = tl.inline_asm_elementwise(
+        "dp4a.s32.s32 $0, $1, $2, 0;",
+        constraints="=r,r,r",
+        args=[packed[None, :], b],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    acc = tl.sum(partial, 1)
+    sb = tl.load(S + r, r < N, other=0)
+    tl.store(OUT + m * N + r, acc.to(tl.float32) * (peak * (1.0 / 127.0)) * sb, r < N)
+
+
+@libentry()
+@triton.jit
+def _small_rows(
+    A,
+    B,
+    SA,
+    SB,
+    OUT,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    R: tl.constexpr,
+    BK: tl.constexpr,
+):
+    m = tl.program_id(1)
+    r = tl.program_id(0) * R + tl.arange(0, R)
+    k = tl.arange(0, BK // 4)
+    a = tl.load(A.to(tl.pointer_type(tl.int32)) + m * (K // 4) + k, k < K // 4, other=0)
+    b = tl.load(
+        B.to(tl.pointer_type(tl.int32)) + r[:, None] * (K // 4) + k[None, :],
+        (r[:, None] < N) & (k[None, :] < K // 4),
+        other=0,
+    )
+    partial = tl.inline_asm_elementwise(
+        "dp4a.s32.s32 $0, $1, $2, 0;",
+        constraints="=r,r,r",
+        args=[a[None, :], b],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    acc = tl.sum(partial, 1)
+    sa = tl.load(SA + m)
+    sb = tl.load(SB + r, r < N, other=0)
+    tl.store(OUT + m * N + r, acc.to(tl.float32) * sa * sb, r < N)
+
+
+@libentry()
+@triton.jit
+def _persistent_long_mv(
+    A,
+    B,
+    S,
+    OUT,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+):
+    ks = tl.arange(0, BLOCK)
+    for row in range(tl.program_id(0), M, PROGRAMS):
+        vmax = tl.zeros((BLOCK,), tl.float32)
+        for part in range(triton.cdiv(K, BLOCK)):
+            k = part * BLOCK + ks
+            a = tl.load(A + row * K + k, k < K, other=0, cache_modifier=".ca").to(
+                tl.float32
+            )
+            vmax = tl.maximum(vmax, tl.abs(a))
+        peak = tl.maximum(tl.max(vmax, 0), 1.0e-10)
+        inv = tl.div_rn(127.0, peak)
+        acc = tl.zeros((BLOCK,), tl.int32)
+        for part in range(triton.cdiv(K, BLOCK)):
+            k = part * BLOCK + ks
+            a = tl.load(A + row * K + k, k < K, other=0, cache_modifier=".ca").to(
+                tl.float32
+            )
+            if peak > 1.0e-10:
+                norm = a * inv
+                norm = ((norm.to(tl.uint32, bitcast=True) + 4) & 0xFFFFFFF8).to(
+                    tl.float32, bitcast=True
+                )
+            else:
+                norm = tl.div_rn(a, peak) * 127.0
+            q = tl.inline_asm_elementwise(
+                "cvt.rni.s32.f32 $0, $1;",
+                constraints="=r,f",
+                args=[norm],
+                dtype=tl.int32,
+                is_pure=True,
+                pack=1,
+            )
+            b = tl.load(B + k, k < K, other=0).to(tl.int32)
+            acc += q * b
+        result = tl.sum(acc, 0).to(tl.float32) * (peak * (1.0 / 127.0)) * tl.load(S)
+        tl.store(OUT + row, result)
+
+
+def _run_activation_mm(a, b, scale_b, out, m, n, k):
+    if (
+        m == 1
+        and 128 <= k <= 4096
+        and k % 4 == 0
+        and 0 < n <= 1024
+        and a.is_contiguous()
+        and b.stride() == (1, k)
+        and a.dtype != torch.float32
+        and b.data_ptr() % 4 == 0
+    ):
+        with torch_device_fn.device(a.device):
+            _fused_single_row[(triton.cdiv(n, 2), 1)](
+                a,
+                b,
+                scale_b,
+                out,
+                n,
+                k,
+                R=2,
+                BK=triton.next_power_of_2(k),
+                num_warps=4,
+            )
+        return out
+    if (
+        m >= 256
+        and n == 1
+        and k > 32768
+        and a.dtype != torch.float32
+        and a.is_contiguous()
+        and b.stride(0) == 1
+    ):
+        with torch_device_fn.device(a.device):
+            _persistent_long_mv[(128,)](
+                a,
+                b,
+                scale_b,
+                out,
+                m,
+                k,
+                BLOCK=8192,
+                PROGRAMS=128,
+                num_warps=16,
+            )
+        return out
+    if m and n == 1 and k > 32768:
+        parts = triton.cdiv(k, 4096)
+        peaks = torch.empty((m, parts), device=a.device, dtype=torch.float32)
+        partial = torch.empty((m, parts), device=a.device, dtype=torch.int32)
+        scale = torch.empty(m, device=a.device, dtype=torch.float32)
+        with torch_device_fn.device(a.device):
+            _activation_partial_peaks[(m, parts)](
+                a,
+                peaks,
+                k,
+                *a.stride(),
+                parts,
+                BLOCK=4096,
+                num_warps=4,
+            )
+            _long_mv_partials[(m, parts)](
+                a,
+                b,
+                peaks,
+                partial,
+                scale,
+                k,
+                *a.stride(),
+                b.stride(0),
+                parts,
+                BP=triton.next_power_of_2(parts),
+                BLOCK=4096,
+                num_warps=4,
+            )
+            _long_mv_reduce[(m,)](
+                partial,
+                scale,
+                scale_b,
+                out,
+                parts,
+                BP=triton.next_power_of_2(parts),
+                num_warps=4,
+            )
+        return out
+    aq, bq, sa, sb = _prepare_mm_w8a8_int8_inputs(a, b, scale_b)
+    return _run_mm(aq, bq, sa, sb, out, m, n, k)
 
 
 def mm_w8a8_int8(a, b, scale_b, *, out_dtype=None):
@@ -446,14 +816,17 @@ def mm_w8a8_int8(a, b, scale_b, *, out_dtype=None):
     out_dtype = torch.bfloat16 if out_dtype is None else out_dtype
     if out_dtype not in _SUPPORTED_FLOAT:
         raise TypeError("out_dtype must be BF16, FP16 or FP32")
-    return _mm_w8a8_int8_prequantized(
-        *_prepare_mm_w8a8_int8_inputs(a, b, scale_b), out_dtype=out_dtype
-    )
+    m, n, k = _validate_activation_inputs(a, b, scale_b)
+    out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+    return _run_activation_mm(a, b, scale_b, out, m, n, k)
 
 
 def mm_w8a8_int8_out(a, b, scale_b, *, out):
     """Write mm_w8a8_int8(a, b, scale_b) into contiguous FP16/BF16/FP32 out."""
     logger.debug("GEMS MM_W8A8_INT8_OUT")
-    return _mm_w8a8_int8_prequantized_out(
-        *_prepare_mm_w8a8_int8_inputs(a, b, scale_b), out=out
-    )
+    m, n, k = _validate_activation_inputs(a, b, scale_b)
+    if out.shape != (m, n) or out.device != a.device or not out.is_contiguous():
+        raise ValueError("out must be contiguous [M,N] on the input device")
+    if out.dtype not in _SUPPORTED_FLOAT:
+        raise TypeError("out must be BF16, FP16 or FP32")
+    return _run_activation_mm(a, b, scale_b, out, m, n, k)
