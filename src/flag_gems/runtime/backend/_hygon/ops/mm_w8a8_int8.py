@@ -428,7 +428,7 @@ def _run(a, b, out, m, n, k):
                 *a.stride(),
                 triton.next_power_of_2(k),
                 num_warps=4,
-                enable_fp_fusion=False
+                enable_fp_fusion=False,
             )
         else:
             _quantize[(m,)](
@@ -468,7 +468,7 @@ def _run(a, b, out, m, n, k):
                 256,
                 16,
                 num_warps=4,
-                enable_fp_fusion=False
+                enable_fp_fusion=False,
             )
         else:
             _quantize[(n,)](
@@ -641,7 +641,7 @@ def _prepare_mm_w8a8_int8_inputs(a, b):
                     *a.stride(),
                     triton.next_power_of_2(k),
                     num_warps=4,
-                    enable_fp_fusion=False
+                    enable_fp_fusion=False,
                 )
             else:
                 _quantize[(m,)](
@@ -664,7 +664,7 @@ def _prepare_mm_w8a8_int8_inputs(a, b):
                     256,
                     16,
                     num_warps=4,
-                    enable_fp_fusion=False
+                    enable_fp_fusion=False,
                 )
             else:
                 _quantize[(n,)](
