@@ -38,11 +38,22 @@ _SUPPORTED_FLOAT = {torch.bfloat16, torch.float16, torch.float32}
 
 
 @triton.jit
-def _grouped_pids(pid, m, n, block_m, block_n, group_m):
+def _grouped_pids(
+    pid,
+    m: tl.constexpr,
+    n: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    group_m: tl.constexpr,
+):
     grid_m = tl.cdiv(m, block_m)
     grid_n = tl.cdiv(n, block_n)
+    if grid_m <= group_m:
+        return pid % grid_m, pid // grid_m
     width = group_m * grid_n
     group_id = pid // width
+    if grid_m % group_m == 0:
+        return group_id * group_m + pid % group_m, (pid % width) // group_m
     group_size = tl.minimum(grid_m - group_id * group_m, group_m)
     pid_m = group_id * group_m + (pid % group_size)
     pid_n = (pid % width) // group_size
@@ -68,6 +79,7 @@ def _mm_w8a8_aiu_kernel(
     BOUNDARY: tl.constexpr,
     STORE_MASK: tl.constexpr,
     NUM_WARPS: tl.constexpr,
+    TRANSPOSE_OUT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     pid_m, pid_n = _grouped_pids(pid, M, N, BLOCK_M, BLOCK_N, GROUP_M)
@@ -120,30 +132,40 @@ def _mm_w8a8_aiu_kernel(
     if STORE_MASK:
         a_scale = tl.load(A_SCALE + offs_m, mask=offs_m < M, other=0.0).to(tl.float32)
         b_scale = tl.load(B_SCALE + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+    else:
+        a_scale = tl.load(A_SCALE + offs_m).to(tl.float32)
+        b_scale = tl.load(B_SCALE + offs_n).to(tl.float32)
+    if TRANSPOSE_OUT:
+        # The swapped GEMM is W @ A.T. Keep activation scaling first and
+        # write its transpose directly into the caller's contiguous output.
+        out = (acc.to(tl.float32) * b_scale[None, :] * a_scale[:, None]).to(
+            OUT.dtype.element_ty
+        )
+        offsets = offs_m[:, None] + offs_n[None, :] * M
+    else:
         out = (acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]).to(
             OUT.dtype.element_ty
         )
+        offsets = offs_m[:, None] * OUT_N + offs_n[None, :]
+    if STORE_MASK:
         tl.store(
-            OUT + offs_m[:, None] * OUT_N + offs_n[None, :],
+            OUT + offsets,
             out,
             mask=(offs_m[:, None] < M) & (offs_n[None, :] < OUT_N),
         )
     else:
-        a_scale = tl.load(A_SCALE + offs_m).to(tl.float32)
-        b_scale = tl.load(B_SCALE + offs_n).to(tl.float32)
-        out = (acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]).to(
-            OUT.dtype.element_ty
-        )
-        tl.store(OUT + offs_m[:, None] * OUT_N + offs_n[None, :], out)
+        tl.store(OUT + offsets, out)
 
 
 def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
     """Return BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, GROUP_M.
 
-    INT8 AIU v1 wants channel bytes of 32/64/128. Prefer BLOCK_K=128 on
-    long K so each CTA does fewer AIU/MMA rounds and can prefetch deeper.
+    INT8 AIU v1 uses channels of 32/64/128 bytes. Wide decode projections
+    load two 128-byte K segments per tile to amortize async load overhead.
     Never pad BLOCK_N far past N: a 64-wide MMA on N=1 is ~64x wasted work.
     """
+    if 1 < m <= 8 and n >= 32768 and 2048 <= k <= 4096:
+        return 16, 128, 256, 4, 3, 8
     if 32 < m <= 128 and n <= 512 and k >= 2048:
         return 16, 16, 128, 1, 2, 8
     if 128 < m <= 256 and n <= 512 and k >= 2048:
@@ -155,7 +177,7 @@ def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
     if 16 < m <= 64 and 512 <= n < 2048 and k >= 1024:
         return 32, 64, 128, 4, 3, 8
     if 32 < m <= 512 and n >= 2048 and k >= 2048:
-        return 64, 128, 128, 8, 3, 8
+        return 64, 128, 128, 4 if n >= 16384 else 8, 3, 8
     if k >= 256:
         block_k = 128
     elif k >= 64:
@@ -163,7 +185,7 @@ def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
     else:
         block_k = 32
     if k >= 2048:
-        stages = 4
+        stages = 3 if m >= 1024 else 4
     elif k >= 512:
         stages = 3
     else:
@@ -268,14 +290,32 @@ def _launch(
     n: int,
     k: int,
 ) -> torch.Tensor:
-    (
-        block_m,
-        block_n,
-        block_k,
-        num_warps,
-        num_stages,
-        group_m,
-    ) = _pick_tiles(m, n, k)
+    transpose_out = (m == 256 and n >= 16384 and 2048 <= k <= 4096) or (
+        m >= 1024 and n <= 1024 and 2048 <= k <= 4096
+    )
+    if transpose_out:
+        # Both operands are already in the required physical layout.
+        # Swapping them lets one tile reuse more activation rows.
+        a_q, b_q = b_q, a_q
+        a_scale, b_scale = b_scale, a_scale
+        m, n = n, m
+        block_m, block_n, block_k, num_warps, num_stages, group_m = (
+            64,
+            256,
+            128,
+            8,
+            3,
+            8,
+        )
+    else:
+        (
+            block_m,
+            block_n,
+            block_k,
+            num_warps,
+            num_stages,
+            group_m,
+        ) = _pick_tiles(m, n, k)
     n_b = n
     boundary = (m % block_m) != 0 or (n_b % block_n) != 0 or (k % block_k) != 0
     store_mask = boundary or (n != n_b)
@@ -313,6 +353,7 @@ def _launch(
             BOUNDARY=boundary,
             STORE_MASK=store_mask,
             NUM_WARPS=num_warps,
+            TRANSPOSE_OUT=transpose_out,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -374,6 +415,30 @@ def _run_mm(a, b, scale_a, scale_b, out, m, n, k):
                 num_warps=1 if k <= 512 else 4,
             )
         return out
+    if (
+        m == 1
+        and n >= 32768
+        and 1024 <= k <= 4096
+        and k % 4 == 0
+        and a.is_contiguous()
+        and b.stride() == (1, k)
+        and a.data_ptr() % 4 == 0
+        and b.data_ptr() % 4 == 0
+    ):
+        with torch_device_fn.device(a.device):
+            _small_rows[(triton.cdiv(n, 4), 1)](
+                a,
+                b,
+                scale_a,
+                scale_b,
+                out,
+                n,
+                k,
+                R=4,
+                BK=triton.next_power_of_2(k),
+                num_warps=4,
+            )
+        return out
     # Normalize inputs for the required async AIU loader.
     a = a.contiguous()
     b = b.t().contiguous().t()
@@ -431,6 +496,7 @@ def _quantize_activation_rows(
     STRIDE_R: tl.constexpr,
     STRIDE_C: tl.constexpr,
     BLOCK: tl.constexpr,
+    NUM_WARPS: tl.constexpr = 4,
 ):
     row = tl.program_id(0)
     k = tl.arange(0, BLOCK)
@@ -517,6 +583,9 @@ def _prepare_mm_w8a8_int8_inputs(a, b, scale_b):
     scale_a = torch.empty(m, device=a.device, dtype=torch.float32)
     with torch_device_fn.device(a.device):
         if k <= 32768:
+            # LibEntry keys include constexpr arguments, not launch metadata.
+            # Keep small-row and throughput quantizers in separate cache entries.
+            quant_warps = 32 if m <= 32 else (8 if k <= 512 else 4)
             _quantize_activation_rows[(m,)](
                 a,
                 a_q,
@@ -524,7 +593,8 @@ def _prepare_mm_w8a8_int8_inputs(a, b, scale_b):
                 k,
                 *a.stride(),
                 BLOCK=triton.next_power_of_2(k),
-                num_warps=32 if m <= 32 else (8 if k <= 512 else 4),
+                NUM_WARPS=quant_warps,
+                num_warps=quant_warps,
             )
         else:
             parts = triton.cdiv(k, 4096)

@@ -483,3 +483,68 @@ def test_mm_w8a8_int8_unaligned_weight():
         rtol=1e-5,
         atol=1e-4,
     )
+
+
+def test_mm_w8a8_int8_quantizer_cache_keeps_warp_configuration(monkeypatch):
+    # Alternating small and large batches must not reuse the first launch's
+    # warp count: LibEntry otherwise caches a 32-warp kernel for large batches.
+    quantizer = _backend._quantize_activation_rows
+    launched_warps = []
+
+    class RecordLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                result = quantizer[grid](*args, **kwargs)
+                launched_warps.append(result[0].metadata.num_warps)
+                return result
+
+            return launch
+
+    monkeypatch.setattr(_backend, "_quantize_activation_rows", RecordLaunch())
+    b = torch.ones(4096, 128, device=flag_gems.device, dtype=torch.int8)
+    sb = torch.ones(128, device=b.device)
+    for m in (8, 256, 8, 256):
+        a = torch.ones(m, 4096, device=b.device, dtype=torch.bfloat16)
+        aq, _, _, _ = _backend._prepare_mm_w8a8_int8_inputs(a, b, sb)
+        torch.testing.assert_close(aq, torch.full_like(aq, 127))
+    assert launched_warps == [32, 4, 32, 4]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 32769, 2048),
+        (3, 32769, 2049),
+        (8, 32768, 3584),
+        (256, 32768, 2048),
+        (1025, 65, 2048),
+    ],
+)
+def test_mm_w8a8_int8_optimized_shapes_and_graph(dtype, shape):
+    m, n, k = shape
+    a = torch.randn(m, k, device=flag_gems.device, dtype=dtype)
+    b = torch.randint(-128, 128, (n, k), device=a.device, dtype=torch.int8).t()
+    sb = torch.rand(n, device=a.device) * 0.01
+    rows = torch.tensor(sorted({0, m // 2, m - 1}), device=a.device)
+    cols = torch.tensor(sorted({0, n // 2, n - 1}), device=a.device)
+    out = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
+    reference = _activation_int8_reference(a[rows], b[:, cols], sb[cols], out.dtype)
+    torch.testing.assert_close(
+        out[rows][:, cols].cpu(), reference, rtol=1e-5, atol=1e-4
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
+    for av, bv, sv in [(1, 2, 0.5), (2, 2, 0.5), (2, -128, 0.03), (0, 1, 1)]:
+        a.fill_(av)
+        b.fill_(bv)
+        sb.fill_(sv)
+        graph.replay()
+        torch.testing.assert_close(out, torch.full_like(out, k * av * bv * sv))
