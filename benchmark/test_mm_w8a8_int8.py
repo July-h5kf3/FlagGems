@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-
 import pytest
 import torch
 
@@ -28,25 +26,34 @@ from .test_blas_perf_parallel import (
 
 
 class ParallelMmW8A8Int8Benchmark(ParallelMmW8A8Fp8Benchmark):
-    """Adapt input preparation while retaining upstream workloads and timing."""
+    """Time activation quantization and GEMM with weights quantized offline."""
 
     def get_latency(self, op, *args, **kwargs):
         if op is not self.torch_op:
             a, b = args
-            backend = sys.modules[flag_gems.mm_w8a8_int8.__module__]
             out_dtype = _mm_w8a8_fp8_output_dtype(a)
             if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
                 raise ValueError(
                     "INT8 W8A8 benchmark requires a floating non-FP8 output"
                 )
-            prepared = backend._prepare_mm_w8a8_int8_inputs(a, b)
+            peak_b = b.float().abs().amax(dim=0).clamp_min(1e-10)
+            scale_b = peak_b * (1.0 / 127.0)
+            b_q = (
+                torch.round((b.float() / peak_b[None, :]) * 127)
+                .clamp(-127, 127)
+                .to(torch.int8)
+                .t()
+                .contiguous()
+                .t()
+            )
             out = torch.empty(
                 (a.shape[0], b.shape[1]), device=a.device, dtype=out_dtype
             )
 
-            # Preparation is outside the inherited warmup and CUDA Graph timer.
+            # Only offline weight preparation and output allocation are untimed.
+            # Every replay includes activation quantization, GEMM and scaling.
             def op():
-                return backend._mm_w8a8_int8_prequantized_out(*prepared, out=out)
+                return flag_gems.mm_w8a8_int8_out(a, b_q, scale_b, out=out)
 
             args, kwargs = (), {}
         return super().get_latency(op, *args, **kwargs)

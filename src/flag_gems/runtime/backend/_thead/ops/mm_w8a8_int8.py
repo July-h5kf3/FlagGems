@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Floating-input W8A8 INT8 matrix multiplication on THead/PPU.
+"""W8A8 INT8 matrix multiplication on THead/PPU.
 
-A[M,K] and B[K,N] are quantized symmetrically per A row and B column.
-The public interfaces refresh quantization on every call, including Graph
-replay. Internal prequantized helpers allow benchmarks to time GEMM, scaling
-and conversion separately from input preparation. AIU requires FlagTree #1026
-with correct INT8 .b8 lowering.
+A[M,K] contains floating activations; B[K,N] contains prequantized INT8
+weights with caller-provided per-column FP32 dequantization scales.
+Only activations are quantized per row on each call and CUDA Graph replay.
+AIU requires FlagTree #1026 with correct INT8 .b8 lowering.
 """
 
 from __future__ import annotations
@@ -344,8 +343,7 @@ def _run_mm(a, b, scale_a, scale_b, out, m, n, k):
                 num_warps=1 if k <= 512 else 4,
             )
         return out
-    # Normalize private prequantized inputs for the required async AIU loader.
-    # Public floating-input preparation already produces these strides.
+    # Normalize inputs for the required async AIU loader.
     a = a.contiguous()
     b = b.t().contiguous().t()
     return _launch(a, scale_a, b, scale_b, out, m, n, k)
@@ -378,18 +376,13 @@ def _quantize_mm_input_kernel(
     COLS: tl.constexpr,
     STRIDE_R: tl.constexpr,
     STRIDE_C: tl.constexpr,
-    PER_ROW: tl.constexpr,
-    COLUMN_MAJOR: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if COLUMN_MAJOR:
-        row, col = offsets % ROWS, offsets // ROWS
-    else:
-        row, col = offsets // COLS, offsets % COLS
+    row, col = offsets // COLS, offsets % COLS
     mask = offsets < ROWS * COLS
     value = tl.load(X + row * STRIDE_R + col * STRIDE_C, mask, other=0).to(tl.float32)
-    peak = tl.load(PEAK + (row if PER_ROW else col), mask, other=1)
+    peak = tl.load(PEAK + row, mask, other=1)
     # Correctly-rounded division avoids platform-dependent reciprocal error
     # changing the integer code at half-integer quantization boundaries.
     normalized = tl.div_rn(value, peak) * 127.0
@@ -401,66 +394,66 @@ def _quantize_mm_input_kernel(
     tl.store(Q + offsets, quantized, mask)
 
 
-def _prepare_mm_w8a8_int8_inputs(a, b):
-    """Quantize current inputs directly into row-major A and column-major B."""
-    if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
-        raise TypeError("mm_w8a8_int8 expects Tensor inputs")
+def _prepare_mm_w8a8_int8_inputs(a, b, scale_b):
+    """Quantize activations and pack existing INT8 weights for the AIU loader."""
+    if not all(isinstance(x, torch.Tensor) for x in (a, b, scale_b)):
+        raise TypeError("mm_w8a8_int8 expects Tensor inputs and weight scales")
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
-    if a.dtype not in _SUPPORTED_FLOAT or b.dtype not in _SUPPORTED_FLOAT:
-        raise TypeError("A and B must be FP16, BF16 or FP32 tensors")
-    if a.device.type != "cuda" or a.device != b.device:
-        raise ValueError("A and B must be on the same PPU device")
+    if a.dtype not in _SUPPORTED_FLOAT:
+        raise TypeError("A must be an FP16, BF16 or FP32 tensor")
+    if b.dtype != torch.int8:
+        raise TypeError("B must be a prequantized torch.int8 tensor")
+    if a.device.type != "cuda" or any(x.device != a.device for x in (b, scale_b)):
+        raise ValueError("inputs and scales must be on the same PPU device")
     m, k = a.shape
     n = b.shape[1]
-    # Empty outputs and empty reductions must not call amax on an empty axis.
-    if m == 0 or n == 0 or k == 0:
-        return (
-            torch.empty((m, k), device=a.device, dtype=torch.int8),
-            torch.empty((k, n), device=a.device, dtype=torch.int8),
-            torch.ones(m, device=a.device, dtype=torch.float32),
-            torch.ones(n, device=a.device, dtype=torch.float32),
-        )
-    peak_a = a.float().abs().amax(dim=1).clamp_min(1e-10)
-    peak_b = b.float().abs().amax(dim=0).clamp_min(1e-10)
-    scale_a = peak_a * (1.0 / 127.0)
-    scale_b = peak_b * (1.0 / 127.0)
+    if scale_b.shape not in ((n,), (1, n)):
+        raise ValueError("expected scale_b[N] or [1,N]")
+    if scale_b.dtype != torch.float32 or not scale_b.is_contiguous():
+        raise ValueError("scale_b must be a contiguous FP32 tensor")
     a_q = torch.empty((m, k), device=a.device, dtype=torch.int8)
-    b_q = torch.empty_strided((k, n), (1, k), device=a.device, dtype=torch.int8)
+    # Empty outputs and reductions must not call amax on an empty axis.
+    if m == 0 or n == 0 or k == 0:
+        return a_q, b, torch.ones(m, device=a.device, dtype=torch.float32), scale_b
+    peak_a = a.float().abs().amax(dim=1).clamp_min(1e-10)
+    scale_a = peak_a * (1.0 / 127.0)
     with torch_device_fn.device(a.device):
-        for x, peak, q, per_row, column in (
-            (a, peak_a, a_q, True, False),
-            (b, peak_b, b_q, False, True),
-        ):
-            _quantize_mm_input_kernel[(triton.cdiv(x.numel(), 1024),)](
-                x,
-                peak,
-                q,
-                *x.shape,
-                *x.stride(),
-                per_row,
-                column,
-                BLOCK=1024,
-            )
-    return a_q, b_q, scale_a, scale_b
+        _quantize_mm_input_kernel[(triton.cdiv(a.numel(), 1024),)](
+            a,
+            peak_a,
+            a_q,
+            *a.shape,
+            *a.stride(),
+            BLOCK=1024,
+        )
+    return a_q, b.t().contiguous().t(), scale_a, scale_b
 
 
-def mm_w8a8_int8(a, b, *, out_dtype=None):
-    """Compute W8A8 GEMM from floating inputs using symmetric INT8 quantization.
+def mm_w8a8_int8(a, b, scale_b, *, out_dtype=None):
+    """Multiply floating A[M,K] by prequantized INT8 weights B[K,N].
 
-    The call signature follows mm_w8a8_fp8; the quantization format is INT8.
-    Default output is BF16. Quantization is recomputed, never cached by pointer.
+    A supports FP16, BF16 and FP32. scale_b is a contiguous FP32 tensor of
+    shape [N] or [1,N], with dequantized weights B * scale_b. Weights use
+    symmetric quantization with zero point 0; no weight quantization occurs.
+    Column-major B avoids a layout copy; other strided inputs are supported.
+    A is dynamically quantized per row to [-127,127] using round-to-even.
+    INT32 products are scaled by the activation and weight scales in FP32.
+    Output defaults to BF16, with FP16 and FP32 also supported. All inputs
+    must reside on the same PPU. Input and scale updates are read on Graph replay.
     """
     logger.debug("GEMS MM_W8A8_INT8")
     out_dtype = torch.bfloat16 if out_dtype is None else out_dtype
     if out_dtype not in _SUPPORTED_FLOAT:
         raise TypeError("out_dtype must be BF16, FP16 or FP32")
     return _mm_w8a8_int8_prequantized(
-        *_prepare_mm_w8a8_int8_inputs(a, b), out_dtype=out_dtype
+        *_prepare_mm_w8a8_int8_inputs(a, b, scale_b), out_dtype=out_dtype
     )
 
 
-def mm_w8a8_int8_out(a, b, *, out):
-    """Write floating-input INT8 GEMM into a contiguous caller-owned output."""
+def mm_w8a8_int8_out(a, b, scale_b, *, out):
+    """Write mm_w8a8_int8(a, b, scale_b) into contiguous FP16/BF16/FP32 out."""
     logger.debug("GEMS MM_W8A8_INT8_OUT")
-    return _mm_w8a8_int8_prequantized_out(*_prepare_mm_w8a8_int8_inputs(a, b), out=out)
+    return _mm_w8a8_int8_prequantized_out(
+        *_prepare_mm_w8a8_int8_inputs(a, b, scale_b), out=out
+    )

@@ -166,56 +166,60 @@ def test_mm_w8a8_int8_reject_float():
         )
 
 
-def _floating_int8_reference(a, b, dtype):
-    # CPU reference computes the integer product exactly, independently of the
-    # PPU quantization preparation and GEMM implementation.
-    a, b = a.detach().float().cpu(), b.detach().float().cpu()
+def _activation_int8_reference(a, b, sb, dtype):
+    # CPU INT64 accumulation is independent of PPU quantization and GEMM.
+    a = a.detach().float().cpu()
+    b, sb = b.detach().cpu().to(torch.int64), sb.detach().float().cpu().reshape(-1)
     if not a.shape[0] or not b.shape[1] or not a.shape[1]:
         return torch.zeros((a.shape[0], b.shape[1]), dtype=dtype)
     peak_a = a.abs().amax(1).clamp_min(1e-10)
-    peak_b = b.abs().amax(0).clamp_min(1e-10)
-    sa, sb = peak_a * (1.0 / 127), peak_b * (1.0 / 127)
+    sa = peak_a * (1.0 / 127)
     aq = torch.round((a / peak_a[:, None]) * 127).clamp(-127, 127).to(torch.int64)
-    bq = torch.round((b / peak_b[None, :]) * 127).clamp(-127, 127).to(torch.int64)
-    return ((aq @ bq).float() * sa[:, None] * sb[None, :]).to(dtype)
+    return ((aq @ b).float() * sa[:, None] * sb[None, :]).to(dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("column_major", [False, True])
 @pytest.mark.parametrize("shape", [(1, 17, 32), (17, 35, 67), (64, 128, 128)])
-def test_mm_w8a8_int8_floating(dtype, out_dtype, column_major, shape):
+def test_mm_w8a8_int8_activation(dtype, out_dtype, column_major, shape):
     m, n, k = shape
     torch.manual_seed(42)
     a = torch.randn((m, k), device=flag_gems.device, dtype=dtype)
-    b = torch.randn((n, k) if column_major else (k, n), device=a.device, dtype=dtype)
+    b = torch.randint(-128, 128, (k, n), device=a.device, dtype=torch.int8)
     if column_major:
-        b = b.t()
-    # Include all-zero rows/columns in scale handling.
-    a[0] = 0
+        b = b.t().contiguous().t()
+    sb = torch.rand(n, device=a.device) * 0.03
+    if m > 1:
+        a[-1] = 0
+    else:
+        a[0, 0] = 0
     b[:, 0] = 0
-    ref = _floating_int8_reference(a, b, out_dtype)
-    y = flag_gems.mm_w8a8_int8(a, b, out_dtype=out_dtype)
+    ref = _activation_int8_reference(a, b, sb, out_dtype)
+    y = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=out_dtype)
     torch.testing.assert_close(y.cpu(), ref, rtol=1e-5, atol=1e-4)
     out = torch.empty_like(y)
-    assert flag_gems.mm_w8a8_int8_out(a, b, out=out) is out
+    assert flag_gems.mm_w8a8_int8_out(a, b, sb, out=out) is out
     torch.testing.assert_close(out, y, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("use_graph", [False, True])
 @pytest.mark.parametrize("use_out", [False, True])
 @pytest.mark.parametrize("column_major", [False, True])
-def test_mm_w8a8_int8_floating_updates(use_graph, use_out, column_major):
-    a = torch.ones((16, 32), device=flag_gems.device)
-    b = torch.ones((17, 32) if column_major else (32, 17), device=a.device)
+@pytest.mark.parametrize("shape", [(16, 17, 32), (1, 64, 128), (128, 1, 128)])
+def test_mm_w8a8_int8_activation_updates(use_graph, use_out, column_major, shape):
+    m, n, k = shape
+    a = torch.ones((m, k), device=flag_gems.device)
+    b = torch.ones((k, n), device=a.device, dtype=torch.int8)
     if column_major:
-        b = b.t()
-    out = torch.empty((16, 17), device=a.device)
+        b = b.t().contiguous().t()
+    sb = torch.ones((1, n), device=a.device)
+    out = torch.empty((m, n), device=a.device)
 
     def call():
         if use_out:
-            return flag_gems.mm_w8a8_int8_out(a, b, out=out)
-        return flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
+            return flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
+        return flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -227,63 +231,144 @@ def test_mm_w8a8_int8_floating_updates(use_graph, use_out, column_major):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             y = call()
-    for av, bv in [(1, 1), (2, -3), (0, 2), (0.5, 4)]:
+    for av, bv, sbv in [
+        (1, 1, 1),
+        (2, 1, 1),
+        (2, -128, 1),
+        (2, -128, 0.03),
+        (0, 2, 1),
+        (0.5, 4, 0),
+    ]:
         a.fill_(av)
         b.fill_(bv)
+        sb.fill_(sbv)
         if use_graph:
             graph.replay()
         else:
             y = call()
-        torch.testing.assert_close(y, torch.full_like(y, 32 * av * bv))
+        torch.testing.assert_close(y, torch.full_like(y, k * av * bv * sbv))
 
 
-@pytest.mark.parametrize("shape", [(2, 3, 0), (0, 3, 8), (2, 0, 8)])
-def test_mm_w8a8_int8_floating_empty(shape):
+@pytest.mark.parametrize("shape", [(2, 3, 0), (0, 3, 8), (2, 0, 8), (0, 0, 0)])
+def test_mm_w8a8_int8_activation_empty(shape):
     m, n, k = shape
     a = torch.empty((m, k), device=flag_gems.device)
-    b = torch.empty((k, n), device=a.device)
-    y = flag_gems.mm_w8a8_int8(a, b)
+    b = torch.empty((k, n), device=a.device, dtype=torch.int8)
+    sb = torch.ones(n, device=a.device)
+    y = flag_gems.mm_w8a8_int8(a, b, sb)
     assert y.dtype == torch.bfloat16
     torch.testing.assert_close(y, torch.zeros_like(y))
-    out = torch.empty((m, n), device=a.device)
-    assert flag_gems.mm_w8a8_int8_out(a, b, out=out) is out
+    out = torch.full((m, n), float("nan"), device=a.device)
+    assert flag_gems.mm_w8a8_int8_out(a, b, sb, out=out) is out
     torch.testing.assert_close(out, torch.zeros_like(out))
 
 
-def test_mm_w8a8_int8_floating_strides_and_validation():
-    a = torch.randn((34, 134), device=flag_gems.device)[::2, ::2]
-    b = torch.randn((134, 70), device=a.device)[::2, ::2]
-    y = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
-    torch.testing.assert_close(
-        y.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-4
-    )
-    with pytest.raises(TypeError, match="FP16, BF16 or FP32"):
-        flag_gems.mm_w8a8_int8(a.to(torch.int8), b.to(torch.int8))
-    with pytest.raises(TypeError, match="out_dtype"):
-        flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.int8)
-    with pytest.raises(ValueError, match="out must be contiguous"):
-        flag_gems.mm_w8a8_int8_out(a, b, out=torch.empty((1, 1), device=a.device))
-
-
 @pytest.mark.parametrize("layout", ["row_major", "column_major", "sliced", "broadcast"])
-def test_mm_w8a8_int8_floating_packs_weight(layout):
-    # All caller layouts must produce K-contiguous quantized weights for AIU.
-    a = torch.randn((17, 67), device=flag_gems.device, dtype=torch.bfloat16)
-    b = torch.randn((67, 35), device=a.device, dtype=a.dtype)
+def test_mm_w8a8_int8_activation_strides(layout):
+    a = torch.randn((34, 134), device=flag_gems.device)[::2, ::2]
+    b = torch.randint(-128, 128, (67, 35), device=a.device, dtype=torch.int8)
     if layout == "column_major":
         b = b.t().contiguous().t()
     elif layout == "sliced":
-        storage = torch.empty((134, 70), device=a.device, dtype=a.dtype)
+        storage = torch.empty((134, 70), device=a.device, dtype=torch.int8)
         storage[::2, ::2] = b
         b = storage[::2, ::2]
     elif layout == "broadcast":
+        a = a[:1].expand(17, 67)
         b = b[:, :1].expand(67, 35)
-    aq, bq, _, _ = _backend._prepare_mm_w8a8_int8_inputs(a, b)
+    sb = torch.rand(35, device=a.device)
+    before_b, before_sb = b.clone(), sb.clone()
+    aq, bq, _, returned_sb = _backend._prepare_mm_w8a8_int8_inputs(a, b, sb)
     assert aq.stride() == (67, 1)
     assert bq.stride() == (1, 67)
-    expected_bq = _backend._prepare_mm_w8a8_int8_inputs(a, b.contiguous())[1]
-    torch.testing.assert_close(bq, expected_bq, rtol=0, atol=0)
-    y = flag_gems.mm_w8a8_int8(a, b, out_dtype=torch.float32)
+    assert returned_sb is sb
+    torch.testing.assert_close(bq, before_b, rtol=0, atol=0)
+    y = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
     torch.testing.assert_close(
-        y.cpu(), _floating_int8_reference(a, b, torch.float32), rtol=1e-5, atol=1e-4
+        y.cpu(),
+        _activation_int8_reference(a, b, sb, torch.float32),
+        rtol=1e-5,
+        atol=1e-4,
     )
+    torch.testing.assert_close(b, before_b, rtol=0, atol=0)
+    torch.testing.assert_close(sb, before_sb, rtol=0, atol=0)
+
+
+def test_mm_w8a8_int8_activation_rounding():
+    # Peak=127 gives exact half-integer ties, including negative values.
+    a = torch.tensor(
+        [[127, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5, -127]], device=flag_gems.device
+    )
+    b = torch.eye(8, device=a.device, dtype=torch.int8)
+    sb = torch.ones(8, device=a.device)
+    y = flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=torch.float32)
+    torch.testing.assert_close(y, torch.round(a), rtol=0, atol=0)
+    assert flag_gems.mm_w8a8_int8(a, b, sb).dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("use_out", [False, True])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "a_dtype",
+        "b_dtype",
+        "scale_dtype",
+        "scale_shape",
+        "scale_stride",
+        "scale_device",
+        "shape",
+        "tensor",
+        "output_dtype",
+        "output_shape",
+        "output_stride",
+    ],
+)
+def test_mm_w8a8_int8_activation_validation(use_out, invalid):
+    a = torch.ones((2, 3), device=flag_gems.device)
+    b = torch.ones((3, 4), device=a.device, dtype=torch.int8)
+    sb = torch.ones(4, device=a.device)
+    out = torch.empty((2, 4), device=a.device)
+    out_dtype = torch.float32
+    error, match = ValueError, ""
+    if invalid == "a_dtype":
+        a = a.to(torch.int8)
+        error, match = TypeError, "A must"
+    elif invalid == "b_dtype":
+        b = b.float()
+        error, match = TypeError, "prequantized"
+    elif invalid == "scale_dtype":
+        sb = sb.half()
+        match = "FP32"
+    elif invalid == "scale_shape":
+        sb = sb[:, None]
+        match = "scale_b"
+    elif invalid == "scale_stride":
+        sb = torch.ones(8, device=a.device)[::2]
+        match = "contiguous FP32"
+    elif invalid == "scale_device":
+        sb = sb.cpu()
+        match = "same PPU"
+    elif invalid == "shape":
+        b = b[:2]
+        match = "expected A"
+    elif invalid == "tensor":
+        sb = 1.0
+        error, match = TypeError, "Tensor"
+    elif invalid == "output_dtype":
+        out, out_dtype = out.to(torch.int8), torch.int8
+        error, match = TypeError, "BF16, FP16 or FP32"
+    elif invalid == "output_shape":
+        if not use_out:
+            pytest.skip("out-only validation")
+        out = out[:1]
+        match = "out must be contiguous"
+    elif invalid == "output_stride":
+        if not use_out:
+            pytest.skip("out-only validation")
+        out = torch.empty((2, 8), device=a.device)[:, ::2]
+        match = "out must be contiguous"
+    with pytest.raises(error, match=match):
+        if use_out:
+            flag_gems.mm_w8a8_int8_out(a, b, sb, out=out)
+        else:
+            flag_gems.mm_w8a8_int8(a, b, sb, out_dtype=out_dtype)
