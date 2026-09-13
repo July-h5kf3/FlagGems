@@ -500,7 +500,7 @@ def test_half_quantization_mantissas(dtype, mantissa):
             2,
             triton.next_power_of_2(k),
             num_warps=4,
-            enable_fp_fusion=False
+            enable_fp_fusion=False,
         )
         torch.testing.assert_close(q.cpu(), expected, rtol=0, atol=0)
         torch.testing.assert_close(scale.cpu(), peak * (1.0 / 127), rtol=0, atol=0)
@@ -530,7 +530,7 @@ def test_half_quantization_extremes(dtype):
                 1,
                 512,
                 num_warps=4,
-                enable_fp_fusion=False
+                enable_fp_fusion=False,
             )
             p = x.float().abs().amax(1).clamp_min(1e-10)
             expected = (x.float() / p[:, None] * 127).round().to(torch.int8)
