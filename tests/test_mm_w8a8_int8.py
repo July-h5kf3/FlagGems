@@ -67,6 +67,7 @@ def reference(a, b, sa, sb, bias=None, dtype=torch.float32):
     "scalar,bias_on,layout",
     [(False, False, False), (False, True, True), (True, True, False)],
 )
+@pytest.mark.mm_w8a8_int8
 def test_prequantized(shape, dtype, scalar, bias_on, layout):
     a, b, sa, sb = inputs(*shape, scalar=scalar, layout=layout)
     bias = (
