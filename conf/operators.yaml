@@ -9302,9 +9302,9 @@ ops:
   stages:
   - alpha: '5.4'
 - id: mm_w8a8_int8
-  description: Dynamically quantizes floating activations to INT8 and multiplies
-    them by prequantized INT8 weights with INT32 accumulation, applying per-row
-    activation scales and caller-provided per-column FP32 weight scales.
+  description: Multiplies prequantized INT8 matrices with INT32 accumulation,
+    applies caller-provided FP32 tensor or row/column scales and optional bias,
+    and converts to the requested floating output dtype.
   for:
   - None
   labels:

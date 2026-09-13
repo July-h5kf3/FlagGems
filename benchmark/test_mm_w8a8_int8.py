@@ -26,7 +26,7 @@ from .test_blas_perf_parallel import (
 
 
 class ParallelMmW8A8Int8Benchmark(ParallelMmW8A8Fp8Benchmark):
-    """Time activation quantization and GEMM with weights quantized offline."""
+    """Reuse upstream workloads and timing with prequantized INT8 inputs."""
 
     def get_latency(self, op, *args, **kwargs):
         if op is not self.torch_op:
@@ -36,6 +36,13 @@ class ParallelMmW8A8Int8Benchmark(ParallelMmW8A8Fp8Benchmark):
                 raise ValueError(
                     "INT8 W8A8 benchmark requires a floating non-FP8 output"
                 )
+            peak_a = a.float().abs().amax(dim=1).clamp_min(1e-10)
+            scale_a = peak_a * (1.0 / 127.0)
+            a_q = (
+                torch.round(a.float() / peak_a[:, None] * 127)
+                .clamp(-127, 127)
+                .to(torch.int8)
+            )
             peak_b = b.float().abs().amax(dim=0).clamp_min(1e-10)
             scale_b = peak_b * (1.0 / 127.0)
             b_q = (
@@ -50,10 +57,10 @@ class ParallelMmW8A8Int8Benchmark(ParallelMmW8A8Fp8Benchmark):
                 (a.shape[0], b.shape[1]), device=a.device, dtype=out_dtype
             )
 
-            # Only offline weight preparation and output allocation are untimed.
-            # Every replay includes activation quantization, GEMM and scaling.
+            # Both quantizations, scales and the output allocation are untimed.
+            # Replay invokes the public scaled-input API, including any copies.
             def op():
-                return flag_gems.mm_w8a8_int8_out(a, b_q, scale_b, out=out)
+                return flag_gems.mm_w8a8_int8_out(a_q, b_q, scale_a, scale_b, out=out)
 
             args, kwargs = (), {}
         return super().get_latency(op, *args, **kwargs)
