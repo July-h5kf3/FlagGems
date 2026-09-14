@@ -13,14 +13,15 @@
 # limitations under the License.
 
 from functools import lru_cache
-from pathlib import Path
+from importlib import import_module
 
 import torch
 import triton
 import triton.language as tl
+from triton.experimental.tle.language import dsa
 
 from flag_gems.runtime import torch_device_fn
-from flag_gems.runtime.backend._ascend.utils import CORE_NUM, compile_topk
+from flag_gems.runtime.backend._ascend.utils import CORE_NUM
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
@@ -32,42 +33,8 @@ def _prepare():
     global al
     from triton.language.extra.cann import extension as al
 
-    cpp = Path(__file__).with_suffix(".cpp")
-    bc, command, revision = compile_topk.build(cpp)
-
-    class VectorOp:
-        core = al.CORE.VECTOR
-        pipe = al.PIPE.PIPE_V
-        mode = al.MODE.SIMD
-        bitcode = str(bc)
-        source = str(cpp)
-        compile = command
-        extra_attr = "flaggems_pass_outputs=true"
-
-    @al.register_custom_op
-    class topk_sort_pairs(VectorOp):
-        name = symbol = "topk_sort_pairs"
-
-        def __init__(self, values, indices, scratch, n, out=None):
-            self.arg_type["n"] = tl.int32
-
-    @al.register_custom_op
-    class topk_sort_prefix(VectorOp):
-        name = symbol = "topk_sort_prefix"
-
-        def __init__(self, values, indices, scratch, n, keep, out=None):
-            self.arg_type["n"] = tl.int32
-            self.arg_type["keep"] = tl.int32
-
-    @al.register_custom_op
-    class topk_select_codes(VectorOp):
-        name = symbol = "topk_select_codes"
-
-        def __init__(self, q, index, v, i, row, n, k, flip, scratch, out=None):
-            for arg in ("row", "n", "k", "flip"):
-                self.arg_type[arg] = tl.int32
-
-    return revision
+    # Primitive implementations and bitcode are provided by FlagTree #1156.
+    import_module("triton.experimental.tle.language.dsa.ascend.custom_ops")
 
 
 @lru_cache(None)
@@ -90,21 +57,46 @@ def _decode(q, E5: tl.constexpr):
 
 
 @triton.jit
-def _sort(v, ids, B: tl.constexpr, K: tl.constexpr):
-    scratch = tl.full((2 * B,), 0, tl.float32)
-    dst = tl.full((2 * B,), 0, tl.float32)
-    if B >= 128 and triton.next_power_of_2(K) <= 32:
-        pairs = al.custom(
-            "topk_sort_prefix",
-            v,
-            ids,
-            scratch,
-            B,
-            max(8, triton.next_power_of_2(K)),
-            out=dst,
-        )
+def _prefix_view(pairs, GROUPS: tl.constexpr, WIDTH: tl.constexpr, KEEP: tl.constexpr):
+    view = tl.reshape(pairs, (GROUPS, WIDTH))
+    prefix = dsa.extract_slice(view, [0, 0], [GROUPS, KEEP], [1, 1])
+    return tl.reshape(prefix, (GROUPS * KEEP,))
+
+
+@triton.jit
+def _merge_stage(
+    pairs,
+    B: tl.constexpr,
+    KEEP: tl.constexpr,
+    PREFIX: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    RUNS: tl.constexpr = B // (32 * (4**STAGE))
+    LANES: tl.constexpr = 4 if RUNS >= 4 else 2
+    LENGTH: tl.constexpr = KEEP if PREFIX else 32 * (4**STAGE)
+    merged = al.custom(
+        "merge_sort4",
+        pairs,
+        LENGTH,
+        LANES,
+        out=tl.full((2 * RUNS * LENGTH,), 0, tl.float32),
+    )
+    if PREFIX:
+        return _prefix_view(merged, RUNS // LANES, 2 * LANES * KEEP, 2 * KEEP)
     else:
-        pairs = al.custom("topk_sort_pairs", v, ids, scratch, B, out=dst)
+        return merged
+
+
+@triton.jit
+def _sort(v, ids, B: tl.constexpr, K: tl.constexpr):
+    PREFIX: tl.constexpr = B >= 128 and triton.next_power_of_2(K) <= 32
+    KEEP: tl.constexpr = triton.next_power_of_2(K) if K >= 8 else 8
+    pairs = al.custom("sort32", v, ids, out=tl.full((2 * B,), 0, tl.float32))
+    if PREFIX:
+        pairs = _prefix_view(pairs, B // 32, 64, 2 * KEEP)
+    for stage in tl.static_range(0, 6):
+        if 32 * (4**stage) < B:
+            pairs = _merge_stage(pairs, B, KEEP, PREFIX, stage)
     return pairs
 
 
@@ -125,14 +117,13 @@ def _stage1(
     E5: tl.constexpr,
     TOTAL: tl.constexpr,
     CORES: tl.constexpr,
-    REV: tl.constexpr,
 ):
     with al.scope(core_mode="vector"):
         pid = ext.program_id(0)
         for pid in range(pid, TOTAL, CORES):
             row = pid // P
             part = pid % P
-            col = part * B + tl.arange(0, B)
+            col = part.to(tl.int32) * B + tl.arange(0, B)
             q = tl.load(Q + row * N + col, col < N, other=0)
             if G >= N:
                 s = tl.load(S + row).to(tl.float32)
@@ -172,7 +163,6 @@ def _merge(
     DESC: tl.constexpr,
     M: tl.constexpr,
     CORES: tl.constexpr,
-    REV: tl.constexpr,
 ):
     with al.scope(core_mode="vector"):
         for row in range(ext.program_id(0), M, CORES):
@@ -208,7 +198,6 @@ def _row_finish(
     C: tl.constexpr,
     DESC: tl.constexpr,
     E5: tl.constexpr,
-    REV: tl.constexpr,
 ):
     with al.scope(core_mode="vector"):
         for row in range(ext.program_id(0), M, C):
@@ -228,6 +217,41 @@ def _row_finish(
             tl.store(J + row * K + col, idx, col < K)
 
 
+@triton.jit
+def _compact(key, values, threshold, mode: tl.constexpr, B: tl.constexpr):
+    mask = al.custom(
+        "compare_scalar",
+        key,
+        threshold.to(tl.float32),
+        2 - mode,
+        out=dsa.to_tensor(dsa.alloc((B // 16,), tl.uint16, dsa.ascend.UB)),
+    )
+    vals, count = al.custom(
+        "gather_mask",
+        values,
+        mask,
+        out=[
+            dsa.to_tensor(dsa.alloc((B,), tl.float16, dsa.ascend.UB)),
+            dsa.to_tensor(dsa.alloc((1,), tl.int32, dsa.ascend.UB)),
+        ],
+    )
+    return vals, tl.max(count, 0)
+
+
+@triton.jit
+def _gather_only(values, mask, B: tl.constexpr):
+    vals, count = al.custom(
+        "gather_mask",
+        values,
+        mask,
+        out=[
+            dsa.to_tensor(dsa.alloc((B,), tl.float16, dsa.ascend.UB)),
+            dsa.to_tensor(dsa.alloc((1,), tl.int32, dsa.ascend.UB)),
+        ],
+    )
+    return vals, tl.max(count, 0)
+
+
 @libentry()
 @triton.jit
 def _row_select(
@@ -241,28 +265,93 @@ def _row_select(
     M: tl.constexpr,
     C: tl.constexpr,
     DESC: tl.constexpr,
-    WORDS: tl.constexpr,
-    REV: tl.constexpr,
 ):
     with al.scope(core_mode="vector"):
+        CHUNK: tl.constexpr = 4096 if N == 4096 else 8192
+        SCAN: tl.constexpr = N
+        cc = tl.arange(0, CHUNK)
+        kk = tl.arange(0, K)
         for row in range(ext.program_id(0), M, C):
             scale = tl.load(S + row).to(tl.float32)
             flip = (scale < 0) ^ (not DESC)
-            scratch = tl.full((WORDS,), 0, tl.int32)
-            dummy = tl.full((16,), 0, tl.int32)
-            al.custom(
-                "topk_select_codes",
-                Q,
-                Index,
-                V,
-                Indices,
-                row,
-                N,
-                K,
-                flip.to(tl.int32),
-                scratch,
-                out=dummy,
+            keybuf = dsa.alloc((N,), tl.float16, dsa.ascend.UB)
+            if N == CHUNK:
+                raw = tl.load(Q + row * N + cc).to(tl.int8, bitcast=True).to(tl.float16)
+                keypart = tl.where(raw < 0, -raw - 1, raw + 128).to(tl.float16)
+                if flip:
+                    keypart = (255 - keypart).to(tl.float16)
+            else:
+                for part in range(N // CHUNK):
+                    raw = (
+                        tl.load(Q + row * N + part.to(tl.int32) * CHUNK + cc)
+                        .to(tl.int8, bitcast=True)
+                        .to(tl.float16)
+                    )
+                    keypart = tl.where(raw < 0, -raw - 1, raw + 128).to(tl.float16)
+                    if flip:
+                        keypart = (255 - keypart).to(tl.float16)
+                    dest = dsa.subview(
+                        keybuf, [part.to(tl.int32) * CHUNK], [CHUNK], [1]
+                    )
+                    dsa.to_buffer(keypart, bind_buffer=dest)
+            if N == CHUNK:
+                key = keypart
+            else:
+                key = dsa.to_tensor(keybuf)
+            lo = 0
+            hi = 255
+            for step in range(8):
+                mid = (lo + hi + 1) // 2
+                count = 0
+                for half in range(N // SCAN):
+                    if N == CHUNK:
+                        kh = key
+                    else:
+                        kh = dsa.to_tensor(
+                            dsa.subview(keybuf, [half.to(tl.int32) * SCAN], [SCAN], [1])
+                        )
+                    _, nh = _compact(kh, kh, mid, 0, SCAN)
+                    count += nh
+                enough = count >= K
+                lo = tl.where(enough, mid, lo)
+                hi = tl.where(enough, hi, mid - 1)
+            if N == CHUNK:
+                key = keypart
+            else:
+                key = dsa.to_tensor(keybuf)
+            gt = al.custom(
+                "compare_scalar",
+                key,
+                lo.to(tl.float32),
+                1,
+                out=dsa.to_tensor(dsa.alloc((N // 16,), tl.uint16, dsa.ascend.UB)),
             )
+            eq = al.custom(
+                "compare_scalar",
+                key,
+                lo.to(tl.float32),
+                0,
+                out=dsa.to_tensor(dsa.alloc((N // 16,), tl.uint16, dsa.ascend.UB)),
+            )
+            values, above = _gather_only(key, gt, N)
+            chosen = dsa.extract_slice(values, [0], [K], [1])
+            tl.store(V + row * K + kk, tl.where(kk < above, chosen, lo).to(tl.float32))
+            # Keys are no longer read after this point; masks carry both predicates.
+            ids = tl.load(Index + tl.arange(0, N)).to(tl.float16, bitcast=True)
+            selected, _ = _gather_only(ids, gt, N)
+            chosen_ids = (
+                dsa.extract_slice(selected, [0], [K], [1])
+                .to(tl.int16, bitcast=True)
+                .to(tl.int32)
+            )
+            tl.store(Indices + row * K + kk, chosen_ids, kk < above)
+            equal, _ = _gather_only(ids, eq, N)
+            equal_ids = (
+                dsa.extract_slice(equal, [0], [K], [1])
+                .to(tl.int16, bitcast=True)
+                .to(tl.int32)
+            )
+            tl.store(Indices + row * K + above + kk, equal_ids, above + kk < K)
 
 
 def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=128):
@@ -287,7 +376,7 @@ def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=
     if k == 0 or m == 0:
         return out, indices
     with torch_device_fn.device(x.device):
-        revision = _prepare()
+        _prepare()
         e5 = x.dtype == torch.float8_e5m2
         q = x.view(torch.uint8)
         cores = min(CORE_NUM, m)
@@ -311,8 +400,6 @@ def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=
                 m,
                 cores,
                 largest,
-                (5 * n + n // 4 + 8192) // 4,
-                revision,
                 multibuffer=False,
             )
             _row_finish[(cores,)](
@@ -327,7 +414,6 @@ def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=
                 cores,
                 largest,
                 e5,
-                revision,
                 multibuffer=False,
             )
         else:
@@ -361,7 +447,6 @@ def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=
                 e5,
                 m * parts,
                 grid,
-                revision,
                 multibuffer=False,
             )
             if parts > 1:
@@ -376,7 +461,6 @@ def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=
                     largest,
                     m,
                     cores,
-                    revision,
                     multibuffer=False,
                 )
     return out, indices
