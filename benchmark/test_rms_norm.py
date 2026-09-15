@@ -43,7 +43,7 @@ FP8_DTYPE = torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else None
 def _cuda_fp8_e4m3fn_available():
     if FP8_DTYPE is None or not torch.cuda.is_available():
         return False
-    if flag_gems.vendor_name == "thead":
+    if flag_gems.vendor_name in ("thead", "metax"):
         return True
     major, _ = torch.cuda.get_device_capability()
     return major >= 9
