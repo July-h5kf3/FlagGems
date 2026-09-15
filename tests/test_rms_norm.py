@@ -28,13 +28,14 @@ else:
 
 FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 GROUP_SIZE = 128
+_FP8_W8A16_VENDORS = ("thead", "metax")
 
 
 def _cuda_fp8_e4m3fn_available():
     if FP8_DTYPE is None or not torch.cuda.is_available():
         return False
-    # PPU can store and cast e4m3fn even though it reports sm_80.
-    if flag_gems.vendor_name == "thead":
+    # PPU and MetaX can store and cast e4m3fn even though they report sm_80.
+    if flag_gems.vendor_name in _FP8_W8A16_VENDORS:
         return True
     major, _ = torch.cuda.get_device_capability()
     return major >= 9
@@ -122,8 +123,9 @@ def test_rms_norm(shape, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("capture", [False, True], ids=["eager", "cudagraph"])
 @pytest.mark.skipif(
-    flag_gems.vendor_name != "thead" or not _cuda_fp8_e4m3fn_available(),
-    reason="Regression test for THead W8A16 weight dequantization",
+    flag_gems.vendor_name not in _FP8_W8A16_VENDORS
+    or not _cuda_fp8_e4m3fn_available(),
+    reason="Regression test for W8A16 weight dequantization",
 )
 def test_rms_norm_w8a16_fp8_weight_updates(dtype, capture):
     n = 4096
@@ -177,8 +179,9 @@ def test_rms_norm_w8a16_fp8_weight_updates(dtype, capture):
     [(2, 256, 128), (2, 384, 128), (2, 32768, 64), (2, 33024, 128), (513, 4096, 128)],
 )
 @pytest.mark.skipif(
-    flag_gems.vendor_name != "thead" or not _cuda_fp8_e4m3fn_available(),
-    reason="THead E4M3FN byte decoding across all kernel paths",
+    flag_gems.vendor_name not in _FP8_W8A16_VENDORS
+    or not _cuda_fp8_e4m3fn_available(),
+    reason="E4M3FN byte decoding across all kernel paths",
 )
 def test_rms_norm_w8a16_fp8_encodings(dtype, m, n, group_size):
     # Cover all 256 encodings, including signed zero, subnormals, and NaNs.
