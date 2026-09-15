@@ -283,10 +283,7 @@ def _simple_warps(M, N):
 
 def _use_grouped(N, group_size):
     return (
-        group_size == 128
-        and 4096 <= N <= 8192
-        and N % group_size == 0
-        and _is_pow2(N)
+        group_size == 128 and 4096 <= N <= 8192 and N % group_size == 0 and _is_pow2(N)
     )
 
 
