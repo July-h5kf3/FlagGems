@@ -17,6 +17,8 @@ import torch
 
 import flag_gems
 
+from .accuracy_utils import gems_assert_equal
+
 pytestmark = [
     pytest.mark.mm_w8a8_int8,
     pytest.mark.skipif(flag_gems.vendor_name != "hygon", reason="Hygon only"),
@@ -75,10 +77,10 @@ def test_prequantized(shape, dtype, scalar, bias_on, layout):
     )
     expected = reference(a, b, sa, sb, bias, dtype)
     actual = flag_gems.mm_w8a8_int8(a, b, sa, sb, dtype, bias)
-    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    gems_assert_equal(actual.cpu(), expected)
     out = torch.empty_like(actual)
     assert flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias) is out
-    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    gems_assert_equal(out.cpu(), expected)
 
 
 @pytest.mark.parametrize("code", [-128, 127])
@@ -89,7 +91,7 @@ def test_long_k_overflow(code):
     sa.fill_(1)
     sb.fill_(1)
     y = flag_gems.mm_w8a8_int8(a, b, sa, sb, torch.float32)
-    torch.testing.assert_close(y.cpu(), reference(a, b, sa, sb), rtol=0, atol=0)
+    gems_assert_equal(y.cpu(), reference(a, b, sa, sb))
 
 
 @pytest.mark.parametrize("a_scalar,b_scalar", [(True, False), (False, True)])
@@ -99,9 +101,7 @@ def test_mixed_scales(a_scalar, b_scalar):
     sb = sb[:, :1].contiguous() if b_scalar else sb.flatten()
     y = flag_gems.mm_w8a8_int8(a, b, sa, sb)
     assert y.dtype == torch.bfloat16
-    torch.testing.assert_close(
-        y.cpu(), reference(a, b, sa, sb, dtype=torch.bfloat16), rtol=0, atol=0
-    )
+    gems_assert_equal(y.cpu(), reference(a, b, sa, sb, dtype=torch.bfloat16))
 
 
 def test_graph_updates():
@@ -119,7 +119,7 @@ def test_graph_updates():
     sb.mul_(3)
     bias.add_(1)
     graph.replay()
-    torch.testing.assert_close(out.cpu(), reference(a, b, sa, sb, bias), rtol=0, atol=0)
+    gems_assert_equal(out.cpu(), reference(a, b, sa, sb, bias))
 
 
 @pytest.mark.parametrize(
