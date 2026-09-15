@@ -26,7 +26,7 @@ class ParallelMmW8A8Int8Benchmark(ParallelBlasBenchmark):
 
     Use --mode cudagraph --level comprehensive --dtypes bfloat16 --dtypes
     float16 to cover the reference PR's 121 configurations and two B layouts.
-    Both baseline variants use BF16, independently of the original input dtype.
+    The Torch baseline uses BF16, independently of the original input dtype.
     """
 
     SHAPE_CONFIG_KEYS = ("mm_w8a8_int8", "BlasBenchmark")
@@ -66,18 +66,15 @@ class ParallelMmW8A8Int8Benchmark(ParallelBlasBenchmark):
 
 
 @pytest.mark.mm_w8a8_int8
-@pytest.mark.parametrize("baseline", ["torch", "flaggems"])
-def test_mm_w8a8_int8(baseline):
+def test_mm_w8a8_int8():
     if not hasattr(flag_gems, "mm_w8a8_int8_out"):
         pytest.skip("mm_w8a8_int8 is not implemented by the active backend")
     bench = ParallelMmW8A8Int8Benchmark(
         input_fn=mm_input_fn,
         op_name="mm_w8a8_int8",
-        torch_op=torch.mm if baseline == "torch" else flag_gems.mm,
+        torch_op=torch.mm,
         dtypes=FLOAT_DTYPES,
     )
     bench.set_gems(flag_gems.mm_w8a8_int8)
-    print(
-        f"BF16 baseline: {baseline}; A/B quantization offline; INT8 GEMM and scaling timed"
-    )
+    print("BF16 baseline: torch; A/B quantization offline; INT8 GEMM and scaling timed")
     bench.run()
