@@ -1280,6 +1280,16 @@ def _build_adaptive_execution_meta(
     elif (
         max_pages == 520
         and h_q == 64
+        and len(capacity_pages) == 16
+        and all(pages == 520 for pages in capacity_pages)
+    ):
+        fixed_pages = 65
+        selection = (
+            {"pages": 65, "pairs": 33, "policy": "b16_l33280_uniform_grain65"},
+        )
+    elif (
+        max_pages == 520
+        and h_q == 64
         and len(capacity_pages) >= 16
         and all(pages == 520 for pages in capacity_pages)
     ):
@@ -1299,6 +1309,13 @@ def _build_adaptive_execution_meta(
                 "max_pages": max_pages,
             },
         )
+    elif (
+        h_q == 64
+        and len(capacity_pages) == 16
+        and all(pages == 128 for pages in capacity_pages)
+    ):
+        fixed_pages = 16
+        selection = ({"pages": 16, "pairs": 8, "policy": "b16_l8192_balanced_grain16"},)
     else:
         sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
         fixed_pages, selection = _wave_grain_selection(
@@ -1550,8 +1567,13 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
         ENABLE_PDL: tl.constexpr,
         USE_TMA_OUTPUT: tl.constexpr,
         DIRECT_LSE: tl.constexpr,
+        KNOWN_NUM_PAGES: tl.constexpr,
     ):
         """WG0: Q owner, even-page math, and the left output half."""
+        if KNOWN_NUM_PAGES > 0:
+            # The immutable host plan proves this logical page count.
+            # Keep it opaque to layout propagation and specialize in LLVM.
+            tl.assume(num_pages == KNOWN_NUM_PAGES)
         # The three CUDA-aligned Q payloads are one-shot TMA transactions.  The
         # scale temporarily occupies state1_m; WG1 cannot overwrite that field
         # until state0_ready, after both workers have consumed Q scale.
@@ -1686,7 +1708,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             tle.gpu.barrier_wait(k_scale_full[0], phaseIdx=0)
             prime_valid = offs_t < split_cache_seqlen
             ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
-            ks = tl.where(prime_valid, ks_raw, 0.0)
+            ks = ks_raw if FULL_TAIL else tl.where(prime_valid, ks_raw, 0.0)
 
         steady_pairs = tl.maximum(num_pairs - 1, 0)
         for pair in tl.range(steady_pairs, disable_licm=True):
@@ -1764,7 +1786,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             # shared write. Do not serialize WG1 softmax behind the unrelated
             # V repack that follows in WG0.
             if not MERGE_STATE_V:
-                tle.gpu.barrier_arrive(state0_ready, phaseIdx=pair)
+                tle.gpu.barrier_arrive(state0_ready)
 
             # This loop excludes the final pair, so its even page is always a
             # complete logical page.  Match CUDA's compile-time steady-state
@@ -1775,7 +1797,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             _cuda_vtranspose_fp8_64x128(s_kc_a2, s_vt1_a, 0, FULL_TAIL)
             _cuda_vtranspose_fp8_64x128(s_kc_a3, s_vt1_a, DP // 2, FULL_TAIL)
 
-            tle.gpu.barrier_arrive(v0_ready, phaseIdx=pair)
+            tle.gpu.barrier_arrive(v0_ready)
 
             # CUDA local-P wait point: finish current local PV, then launch
             # slot-A generation pair+1 content0/1 for p+2.
@@ -1807,7 +1829,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
 
             odd_page = page + 1
             if True:
-                tle.gpu.barrier_wait(v1_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v1_ready)
                 beta1 = tl.load(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)))
                 acc_left *= beta1[:, None]
                 acc_left = tle.gpu.wgmma(s_p_b, s_vt0_b, acc_left, trans_b=True)
@@ -1823,7 +1845,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     tle.gpu.barrier_wait(k_content_full[1], phaseIdx=next_generation)
                     next_qk = tle.gpu.wgmma(q_c1, k_a_c1, next_qk, trans_b=True)
                     phase0_waited_qk = tle.gpu.wgmma_wait(2, next_qk)
-                    tle.gpu.barrier_arrive(slot1_empty, phaseIdx=pair)
+                    tle.gpu.barrier_arrive(slot1_empty)
 
                     # CUDA wait2 point starts p+3 content0/1 before p+2
                     # phase-2.
@@ -1865,15 +1887,19 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                         next_even_page * PAGE_SIZE + offs_t < split_cache_seqlen
                     )
                     next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_a_row, (offs_t,)))
-                    next_ks = tl.where(next_valid, next_ks_raw, 0.0)
+                    next_ks = (
+                        next_ks_raw
+                        if FULL_TAIL
+                        else tl.where(next_valid, next_ks_raw, 0.0)
+                    )
 
                 else:
                     # Tail pair: no younger QK groups exist to retain.
                     acc_left = tle.gpu.wgmma_wait(0, acc_left)
-                    tle.gpu.barrier_arrive(slot1_empty, phaseIdx=pair)
+                    tle.gpu.barrier_arrive(slot1_empty)
 
                 if not MERGE_STATE_V:
-                    tle.gpu.barrier_wait(state1_ready, phaseIdx=pair)
+                    tle.gpu.barrier_wait(state1_ready)
                 state_m = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)))
                 state_s = tl.load(tle.gpu.local_ptr(s_state1_s, (state_idx,)))
                 state_l = tl.load(tle.gpu.local_ptr(s_state1_l, (state_idx,)))
@@ -1882,7 +1908,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                 )
 
             # WG1 publishes this only after its remote P0/V0 wait0.
-            tle.gpu.barrier_wait(slot0_empty, phaseIdx=pair)
+            tle.gpu.barrier_wait(slot0_empty)
             qk = next_qk
             ks = next_ks
 
@@ -1953,7 +1979,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
 
             # Tail generation follows the same last-write publication rule.
             if not MERGE_STATE_V:
-                tle.gpu.barrier_arrive(state0_ready, phaseIdx=pair)
+                tle.gpu.barrier_arrive(state0_ready)
 
             # Invalid probability columns are already exact FP8 zero after
             # the masked softmax above, so their V values cannot contribute
@@ -2016,7 +2042,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     tl.trans(kc_tile),
                 )
 
-            tle.gpu.barrier_arrive(v0_ready, phaseIdx=pair)
+            tle.gpu.barrier_arrive(v0_ready)
 
             acc_left *= beta[:, None]
             acc_left = tle.gpu.wgmma(s_p_a, s_vt0_a, acc_left, trans_b=True)
@@ -2024,15 +2050,15 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
 
             odd_page = page + 1
             if odd_page < num_pages:
-                tle.gpu.barrier_wait(v1_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v1_ready)
                 beta1 = tl.load(tle.gpu.local_ptr(s_beta_b_row, (state_idx,)))
                 acc_left *= beta1[:, None]
                 acc_left = tle.gpu.wgmma(s_p_b, s_vt0_b, acc_left, trans_b=True)
                 acc_left = tle.gpu.wgmma_wait(0, acc_left)
-                tle.gpu.barrier_arrive(slot1_empty, phaseIdx=pair)
+                tle.gpu.barrier_arrive(slot1_empty)
 
                 if not MERGE_STATE_V:
-                    tle.gpu.barrier_wait(state1_ready, phaseIdx=pair)
+                    tle.gpu.barrier_wait(state1_ready)
                 state_m = tl.load(tle.gpu.local_ptr(s_state1_m_row, (state_idx,)))
                 state_s = tl.load(tle.gpu.local_ptr(s_state1_s, (state_idx,)))
                 state_l = tl.load(tle.gpu.local_ptr(s_state1_l, (state_idx,)))
@@ -2040,7 +2066,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     tl.load(tle.gpu.local_ptr(s_state1_valid, (state_idx,))) != 0
                 )
 
-            tle.gpu.barrier_wait(slot0_empty, phaseIdx=pair)
+            tle.gpu.barrier_wait(slot0_empty)
 
         # CUDA-aligned programmatic dependency trigger.  Only the B>=4
         # coarse-combine specialization receives ENABLE_PDL=True.
@@ -2175,8 +2201,12 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
         PAGE_GRAIN_TAIL_ZERO: tl.constexpr,
         MERGE_STATE_V: tl.constexpr,
         USE_TMA_OUTPUT: tl.constexpr,
+        KNOWN_NUM_PAGES: tl.constexpr,
     ):
         """WG1: odd-page math and the right output half."""
+        if KNOWN_NUM_PAGES > 0:
+            # This is a host-certified logical page count, not a token mask.
+            tl.assume(num_pages == KNOWN_NUM_PAGES)
         s_state1_m_row = s_state1_m.slot(0)
         s_beta_a_row = s_beta_a.slot(0)
         s_beta_b_row = s_beta_b.slot(0)
@@ -2327,7 +2357,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=0)
             prime_valid = PAGE_SIZE + offs_t < split_cache_seqlen
             ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
-            ks = tl.where(prime_valid, ks_raw, 0.0)
+            ks = ks_raw if FULL_TAIL else tl.where(prime_valid, ks_raw, 0.0)
 
         full_pairs = tl.maximum(num_pages // 2 - 1, 0)
         for pair in tl.range(full_pairs, disable_licm=True):
@@ -2366,9 +2396,9 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     x if FULL_TAIL else tl.where(valid_row, x, _TLE_NEG_INF),
                     axis=1,
                 )
-                tle.gpu.barrier_wait(v0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v0_ready)
             else:
-                tle.gpu.barrier_wait(state0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(state0_ready)
             state_m = tl.load(tle.gpu.local_ptr(s_state0_m, (state_idx,)))
             state_s = tl.load(tle.gpu.local_ptr(s_state0_s, (state_idx,)))
             state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
@@ -2455,7 +2485,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                 # CUDA scale/state hand-off rather than delaying the consumer
                 # behind unrelated work.
                 if not MERGE_STATE_V:
-                    tle.gpu.barrier_arrive(state1_ready, phaseIdx=pair)
+                    tle.gpu.barrier_arrive(state1_ready)
 
                 # full_pairs excludes the residual/tail pair.  The steady odd
                 # page is therefore complete and can use CUDA's single
@@ -2468,17 +2498,17 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     _cuda_vtranspose_fp8_64x128(s_kc_b2, s_vt1_b, 0, FULL_TAIL)
                     _cuda_vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
 
-                tle.gpu.barrier_arrive(v1_ready, phaseIdx=pair)
+                tle.gpu.barrier_arrive(v1_ready)
 
             # CUDA remote-P wait point for the current even page.
             if not MERGE_STATE_V:
-                tle.gpu.barrier_wait(v0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v0_ready)
             beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
             acc_right *= beta0[:, None]
             acc_right = tle.gpu.wgmma(s_p_a, s_vt1_a, acc_right, trans_b=True)
-            acc_right = tle.gpu.wgmma_wait(0, acc_right)
 
-            # After remote-P wait0, issue p+2 content2/3/rope/scale.
+            # These K/RoPE/scale reads have retired; PV uses distinct P/V
+            # buffers. Issue p+2 transfers now, then drain PV before release.
             next_even_page = even_page + 2
             if True:
                 next_even_phys = tl.load(block_table + next_even_page * stride_bt_pg)
@@ -2511,7 +2541,8 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     [next_even_phys, 0],
                     barrier=k_scale_full[0],
                 )
-            tle.gpu.barrier_arrive(slot0_empty, phaseIdx=pair)
+            acc_right = tle.gpu.wgmma_wait(0, acc_right)
+            tle.gpu.barrier_arrive(slot0_empty)
 
             next_qk = tl.zeros((BH, BK), dtype=tl.float32)
             next_ks = tl.zeros((BK,), dtype=tl.float32)
@@ -2561,7 +2592,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     next_qk = tle.gpu.wgmma(s_qr, s_kr_b, next_qk, trans_b=True)
                     next_qk = tle.gpu.wgmma_wait(0, next_qk)
 
-                tle.gpu.barrier_wait(slot1_empty, phaseIdx=pair)
+                tle.gpu.barrier_wait(slot1_empty)
 
                 if True:
                     # Keep the scale copy after slot release to preserve its storage lifetime.
@@ -2578,7 +2609,11 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=next_generation)
                     next_valid = next_odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
                     next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
-                    next_ks = tl.where(next_valid, next_ks_raw, 0.0)
+                    next_ks = (
+                        next_ks_raw
+                        if FULL_TAIL
+                        else tl.where(next_valid, next_ks_raw, 0.0)
+                    )
 
             qk = next_qk
             ks = next_ks
@@ -2592,9 +2627,9 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             odd_page = even_page + 1
 
             if MERGE_STATE_V:
-                tle.gpu.barrier_wait(v0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v0_ready)
             else:
-                tle.gpu.barrier_wait(state0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(state0_ready)
             state_m = tl.load(tle.gpu.local_ptr(s_state0_m, (state_idx,)))
             state_s = tl.load(tle.gpu.local_ptr(s_state0_s, (state_idx,)))
             state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
@@ -2668,7 +2703,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
 
                 # Tail generation follows the same last-write publication rule.
                 if not MERGE_STATE_V:
-                    tle.gpu.barrier_arrive(state1_ready, phaseIdx=pair)
+                    tle.gpu.barrier_arrive(state1_ready)
 
                 # As on the even-page owner, invalid P columns are exact zero,
                 # so a masked V transpose is unnecessary for PV correctness.
@@ -2731,10 +2766,10 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                         tle.gpu.local_ptr(s_vt1_b, (vt_c1_rows, vt_cols_d128)),
                         tl.trans(kc_tile),
                     )
-                tle.gpu.barrier_arrive(v1_ready, phaseIdx=pair)
+                tle.gpu.barrier_arrive(v1_ready)
 
             if not MERGE_STATE_V:
-                tle.gpu.barrier_wait(v0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v0_ready)
             beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
             acc_right *= beta0[:, None]
             acc_right = tle.gpu.wgmma(s_p_a, s_vt1_a, acc_right, trans_b=True)
@@ -2772,20 +2807,20 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     [next_even_phys, 0],
                     barrier=k_scale_full[0],
                 )
-            tle.gpu.barrier_arrive(slot0_empty, phaseIdx=pair)
+            tle.gpu.barrier_arrive(slot0_empty)
 
             if odd_page < num_pages:
                 acc_right *= beta1[:, None]
                 acc_right = tle.gpu.wgmma(s_p_b, s_vt1_b, acc_right, trans_b=True)
                 acc_right = tle.gpu.wgmma_wait(0, acc_right)
-                tle.gpu.barrier_wait(slot1_empty, phaseIdx=pair)
+                tle.gpu.barrier_wait(slot1_empty)
 
             if next_even_page < num_pages:
                 final_pair = pair + 1
                 if MERGE_STATE_V:
-                    tle.gpu.barrier_wait(v0_ready, phaseIdx=final_pair)
+                    tle.gpu.barrier_wait(v0_ready)
                 else:
-                    tle.gpu.barrier_wait(state0_ready, phaseIdx=final_pair)
+                    tle.gpu.barrier_wait(state0_ready)
                 state_m = tl.load(tle.gpu.local_ptr(s_state0_m, (state_idx,)))
                 state_s = tl.load(tle.gpu.local_ptr(s_state0_s, (state_idx,)))
                 state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
@@ -2793,12 +2828,12 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     tl.load(tle.gpu.local_ptr(s_state0_valid, (state_idx,))) != 0
                 )
                 if not MERGE_STATE_V:
-                    tle.gpu.barrier_wait(v0_ready, phaseIdx=final_pair)
+                    tle.gpu.barrier_wait(v0_ready)
                 beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
                 acc_right *= beta0[:, None]
                 acc_right = tle.gpu.wgmma(s_p_a, s_vt1_a, acc_right, trans_b=True)
                 acc_right = tle.gpu.wgmma_wait(0, acc_right)
-                tle.gpu.barrier_arrive(slot0_empty, phaseIdx=final_pair)
+                tle.gpu.barrier_arrive(slot0_empty)
 
         offs_d = tl.arange(0, DP)
         l_div = tl.where(state_l > 0.0, state_l, 1.0)
@@ -2922,7 +2957,9 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             split_num_pages_ptr + global_split64 * stride_split_num_pages
         )
         split_num_pages = (
-            FIXED_NUM_PAGES if FIXED_NUM_PAGES > 0 else split_num_pages_runtime
+            FIXED_NUM_PAGES
+            if USE_TMA_OUTPUT and FIXED_NUM_PAGES > 0 and FIXED_NUM_PAGES <= 10
+            else split_num_pages_runtime
         )
         page_end = page_begin + split_num_pages
         full_cache_seqlen = tl.load(cache_seqlens + batch_idx64 * stride_seqlen)
@@ -2995,23 +3032,22 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
         k_rope_full = tle.gpu.alloc_barriers(2, expect_bytes=K_ROPE_BYTES)
         k_scale_full = tle.gpu.alloc_barriers(2, expect_bytes=K_SCALE_BYTES)
 
-        # Cross-WG control uses all eight logical phaseful mbarrier slots in
-        # one power-of-two eight-slot allocation.  Each
-        # slot has one unique writer WG, so one elected arrival completes each
-        # pair generation; the opposing WG waits on the same pair phase.  This
-        # keeps the storage live across warp_specialize and avoids aliasing it
-        # with the capture mailbox used to enter the worker partition.
+        # Cross-WG handoffs use named barriers: 128 producer arrivals plus
+        # 128 consumer waiters complete each handshake. Per-WG tail-zero
+        # synchronization retains its separate phaseful mbarriers.
+        initialization_done = tle.gpu.alloc_barrier(arrive_count=1)
         control_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=1)
-        state0_ready = control_barriers[0]
-        state1_ready = control_barriers[1]
+        handoff_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=256)
+        state0_ready = handoff_barriers[0]
+        state1_ready = handoff_barriers[1]
         # P is stored before V repack.  Publishing v*_ready after the repack
         # therefore certifies both P and V visibility to the remote PV owner.
-        p0_ready = control_barriers[2]
-        p1_ready = control_barriers[3]
-        v0_ready = control_barriers[2]
-        v1_ready = control_barriers[3]
-        slot0_empty = control_barriers[4]
-        slot1_empty = control_barriers[5]
+        p0_ready = handoff_barriers[2]
+        p1_ready = handoff_barriers[3]
+        v0_ready = handoff_barriers[2]
+        v1_ready = handoff_barriers[3]
+        slot0_empty = handoff_barriers[4]
+        slot1_empty = handoff_barriers[5]
 
         # CUDA fill_oob_V publishes shared zeros before the LDSM transpose.
         # Reuse one previously idle control mbarrier per compute warp-group;
@@ -3021,6 +3057,10 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
 
         row0 = (batch_idx * HQ + h_base).to(tl.int32)
 
+        # Named objects still initialize temporary shared storage. Join the
+        # default WG before warp-specialize captures can reuse those bytes.
+        tle.gpu.barrier_arrive(initialization_done, phaseIdx=0)
+        tle.gpu.barrier_wait(initialization_done, phaseIdx=0)
         tle.gpu.warp_specialize(
             [
                 (
@@ -3097,6 +3137,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                         False,
                         USE_TMA_OUTPUT,
                         DIRECT_LSE,
+                        FIXED_NUM_PAGES,
                     ),
                 ),
                 (
@@ -3169,6 +3210,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                         PAGE_GRAIN_TAIL_ZERO,
                         MERGE_STATE_V,
                         USE_TMA_OUTPUT,
+                        FIXED_NUM_PAGES,
                     ),
                 ),
             ],
@@ -3255,7 +3297,9 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             split_num_pages_ptr + global_split64 * stride_split_num_pages
         )
         split_num_pages = (
-            FIXED_NUM_PAGES if FIXED_NUM_PAGES > 0 else split_num_pages_runtime
+            FIXED_NUM_PAGES
+            if USE_TMA_OUTPUT and FIXED_NUM_PAGES > 0 and FIXED_NUM_PAGES <= 10
+            else split_num_pages_runtime
         )
         page_end = page_begin + split_num_pages
         full_cache_seqlen = tl.load(cache_seqlens + batch_idx64 * stride_seqlen)
@@ -3328,27 +3372,28 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
         k_rope_full = tle.gpu.alloc_barriers(2, expect_bytes=K_ROPE_BYTES)
         k_scale_full = tle.gpu.alloc_barriers(2, expect_bytes=K_SCALE_BYTES)
 
-        # Cross-WG control uses all eight logical phaseful mbarrier slots in
-        # one power-of-two eight-slot allocation.  Each
-        # slot has one unique writer WG, so one elected arrival completes each
-        # pair generation; the opposing WG waits on the same pair phase.  This
-        # keeps the storage live across warp_specialize and avoids aliasing it
-        # with the capture mailbox used to enter the worker partition.
+        # Cross-WG handoffs use named barriers; per-WG tail-zero operations
+        # retain phaseful mbarriers. Both compute partitions have 128 threads.
+        initialization_done = tle.gpu.alloc_barrier(arrive_count=1)
         control_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=1)
-        state0_ready = control_barriers[0]
-        state1_ready = control_barriers[1]
-        p0_ready = control_barriers[2]
-        p1_ready = control_barriers[3]
-        v0_ready = control_barriers[2]
-        v1_ready = control_barriers[3]
-        slot0_empty = control_barriers[4]
-        slot1_empty = control_barriers[5]
+        handoff_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=256)
+        state0_ready = handoff_barriers[0]
+        state1_ready = handoff_barriers[1]
+        p0_ready = handoff_barriers[2]
+        p1_ready = handoff_barriers[3]
+        v0_ready = handoff_barriers[2]
+        v1_ready = handoff_barriers[3]
+        slot0_empty = handoff_barriers[4]
+        slot1_empty = handoff_barriers[5]
 
         tail0_zero_ready = control_barriers[6]
         tail1_zero_ready = control_barriers[7]
 
         row0 = (batch_idx * HQ + h_base).to(tl.int32)
 
+        # Retire temporary initialization before capture-mailbox reuse.
+        tle.gpu.barrier_arrive(initialization_done, phaseIdx=0)
+        tle.gpu.barrier_wait(initialization_done, phaseIdx=0)
         tle.gpu.warp_specialize(
             [
                 (
@@ -3425,6 +3470,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                         True,
                         USE_TMA_OUTPUT,
                         DIRECT_LSE,
+                        FIXED_NUM_PAGES,
                     ),
                 ),
                 (
@@ -3497,6 +3543,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                         PAGE_GRAIN_TAIL_ZERO,
                         MERGE_STATE_V,
                         USE_TMA_OUTPUT,
+                        FIXED_NUM_PAGES,
                     ),
                 ),
             ],
@@ -3571,8 +3618,12 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
         FULL_TAIL: tl.constexpr,
         MERGE_STATE_V: tl.constexpr,
         USE_TMA_OUTPUT: tl.constexpr,
+        KNOWN_NUM_PAGES: tl.constexpr,
     ):
         """WG1: odd-page math and the right output half."""
+        if KNOWN_NUM_PAGES > 0:
+            # This is a host-certified logical page count, not a token mask.
+            tl.assume(num_pages == KNOWN_NUM_PAGES)
         s_state1_m_row = s_state1_m.slot(0)
         s_beta_a_row = s_beta_a.slot(0)
         s_beta_b_row = s_beta_b.slot(0)
@@ -3723,7 +3774,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=0)
             prime_valid = PAGE_SIZE + offs_t < split_cache_seqlen
             ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
-            ks = tl.where(prime_valid, ks_raw, 0.0)
+            ks = ks_raw if FULL_TAIL else tl.where(prime_valid, ks_raw, 0.0)
 
         full_pairs = tl.maximum(num_pages // 2 - 1, 0)
         for pair in tl.range(full_pairs, disable_licm=True):
@@ -3739,9 +3790,9 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             _cuda_vtranspose_fp8_64x128(s_kc_b3, s_vt1_b, DP // 2, FULL_TAIL)
 
             if MERGE_STATE_V:
-                tle.gpu.barrier_wait(v0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v0_ready)
             else:
-                tle.gpu.barrier_wait(state0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(state0_ready)
             state_m = tl.load(tle.gpu.local_ptr(s_state0_m, (state_idx,)))
             state_s = tl.load(tle.gpu.local_ptr(s_state0_s, (state_idx,)))
             state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
@@ -3824,13 +3875,13 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                 # CUDA scale/state hand-off rather than delaying the consumer
                 # behind unrelated work.
                 if not MERGE_STATE_V:
-                    tle.gpu.barrier_arrive(state1_ready, phaseIdx=pair)
+                    tle.gpu.barrier_arrive(state1_ready)
 
-                tle.gpu.barrier_arrive(v1_ready, phaseIdx=pair)
+                tle.gpu.barrier_arrive(v1_ready)
 
             # CUDA remote-P wait point for the current even page.
             if not MERGE_STATE_V:
-                tle.gpu.barrier_wait(v0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v0_ready)
             beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
             acc_right *= beta0[:, None]
             acc_right = tle.gpu.wgmma(s_p_a, s_vt1_a, acc_right, trans_b=True)
@@ -3869,7 +3920,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     [next_even_phys, 0],
                     barrier=k_scale_full[0],
                 )
-            tle.gpu.barrier_arrive(slot0_empty, phaseIdx=pair)
+            tle.gpu.barrier_arrive(slot0_empty)
 
             next_qk = tl.zeros((BH, BK), dtype=tl.float32)
             next_ks = tl.zeros((BK,), dtype=tl.float32)
@@ -3919,7 +3970,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     next_qk = tle.gpu.wgmma(s_qr, s_kr_b, next_qk, trans_b=True)
                     next_qk = tle.gpu.wgmma_wait(0, next_qk)
 
-                tle.gpu.barrier_wait(slot1_empty, phaseIdx=pair)
+                tle.gpu.barrier_wait(slot1_empty)
 
                 if True:
                     # Keep the scale copy after slot release to preserve its storage lifetime.
@@ -3936,7 +3987,11 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     tle.gpu.barrier_wait(k_scale_full[1], phaseIdx=next_generation)
                     next_valid = next_odd_page * PAGE_SIZE + offs_t < split_cache_seqlen
                     next_ks_raw = tl.load(tle.gpu.local_ptr(s_beta_b_row, (offs_t,)))
-                    next_ks = tl.where(next_valid, next_ks_raw, 0.0)
+                    next_ks = (
+                        next_ks_raw
+                        if FULL_TAIL
+                        else tl.where(next_valid, next_ks_raw, 0.0)
+                    )
 
             qk = next_qk
             ks = next_ks
@@ -3950,9 +4005,9 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             odd_page = even_page + 1
 
             if MERGE_STATE_V:
-                tle.gpu.barrier_wait(v0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v0_ready)
             else:
-                tle.gpu.barrier_wait(state0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(state0_ready)
             state_m = tl.load(tle.gpu.local_ptr(s_state0_m, (state_idx,)))
             state_s = tl.load(tle.gpu.local_ptr(s_state0_s, (state_idx,)))
             state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
@@ -4026,7 +4081,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
 
                 # Tail generation follows the same last-write publication rule.
                 if not MERGE_STATE_V:
-                    tle.gpu.barrier_arrive(state1_ready, phaseIdx=pair)
+                    tle.gpu.barrier_arrive(state1_ready)
 
                 if FULL_TAIL or (odd_page + 1) * PAGE_SIZE <= split_cache_seqlen:
                     _cuda_vtranspose_fp8_64x128(s_kc_b0, s_vt0_b, 0, FULL_TAIL)
@@ -4066,10 +4121,10 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                         tle.gpu.local_ptr(s_vt1_b, (vt_c1_rows, vt_cols_d128)),
                         tl.trans(kc_tile),
                     )
-                tle.gpu.barrier_arrive(v1_ready, phaseIdx=pair)
+                tle.gpu.barrier_arrive(v1_ready)
 
             if not MERGE_STATE_V:
-                tle.gpu.barrier_wait(v0_ready, phaseIdx=pair)
+                tle.gpu.barrier_wait(v0_ready)
             beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
             acc_right *= beta0[:, None]
             acc_right = tle.gpu.wgmma(s_p_a, s_vt1_a, acc_right, trans_b=True)
@@ -4107,20 +4162,20 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     [next_even_phys, 0],
                     barrier=k_scale_full[0],
                 )
-            tle.gpu.barrier_arrive(slot0_empty, phaseIdx=pair)
+            tle.gpu.barrier_arrive(slot0_empty)
 
             if odd_page < num_pages:
                 acc_right *= beta1[:, None]
                 acc_right = tle.gpu.wgmma(s_p_b, s_vt1_b, acc_right, trans_b=True)
                 acc_right = tle.gpu.wgmma_wait(0, acc_right)
-                tle.gpu.barrier_wait(slot1_empty, phaseIdx=pair)
+                tle.gpu.barrier_wait(slot1_empty)
 
             if next_even_page < num_pages:
                 final_pair = pair + 1
                 if MERGE_STATE_V:
-                    tle.gpu.barrier_wait(v0_ready, phaseIdx=final_pair)
+                    tle.gpu.barrier_wait(v0_ready)
                 else:
-                    tle.gpu.barrier_wait(state0_ready, phaseIdx=final_pair)
+                    tle.gpu.barrier_wait(state0_ready)
                 state_m = tl.load(tle.gpu.local_ptr(s_state0_m, (state_idx,)))
                 state_s = tl.load(tle.gpu.local_ptr(s_state0_s, (state_idx,)))
                 state_l = tl.load(tle.gpu.local_ptr(s_state0_l, (state_idx,)))
@@ -4128,12 +4183,12 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                     tl.load(tle.gpu.local_ptr(s_state0_valid, (state_idx,))) != 0
                 )
                 if not MERGE_STATE_V:
-                    tle.gpu.barrier_wait(v0_ready, phaseIdx=final_pair)
+                    tle.gpu.barrier_wait(v0_ready)
                 beta0 = tl.load(tle.gpu.local_ptr(s_beta_a_row, (state_idx,)))
                 acc_right *= beta0[:, None]
                 acc_right = tle.gpu.wgmma(s_p_a, s_vt1_a, acc_right, trans_b=True)
                 acc_right = tle.gpu.wgmma_wait(0, acc_right)
-                tle.gpu.barrier_arrive(slot0_empty, phaseIdx=final_pair)
+                tle.gpu.barrier_arrive(slot0_empty)
 
         offs_d = tl.arange(0, DP)
         l_div = tl.where(state_l > 0.0, state_l, 1.0)
@@ -4257,7 +4312,9 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
             split_num_pages_ptr + global_split64 * stride_split_num_pages
         )
         split_num_pages = (
-            FIXED_NUM_PAGES if FIXED_NUM_PAGES > 0 else split_num_pages_runtime
+            FIXED_NUM_PAGES
+            if USE_TMA_OUTPUT and FIXED_NUM_PAGES > 0 and FIXED_NUM_PAGES <= 10
+            else split_num_pages_runtime
         )
         page_end = page_begin + split_num_pages
         full_cache_seqlen = tl.load(cache_seqlens + batch_idx64 * stride_seqlen)
@@ -4330,29 +4387,30 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
         k_rope_full = tle.gpu.alloc_barriers(2, expect_bytes=K_ROPE_BYTES)
         k_scale_full = tle.gpu.alloc_barriers(2, expect_bytes=K_SCALE_BYTES)
 
-        # Cross-WG control uses all eight logical phaseful mbarrier slots in
-        # one power-of-two eight-slot allocation.  Each
-        # slot has one unique writer WG, so one elected arrival completes each
-        # pair generation; the opposing WG waits on the same pair phase.  This
-        # keeps the storage live across warp_specialize and avoids aliasing it
-        # with the capture mailbox used to enter the worker partition.
+        # Cross-WG handoffs use named barriers; per-WG tail-zero operations
+        # retain phaseful mbarriers. Both compute partitions have 128 threads.
+        initialization_done = tle.gpu.alloc_barrier(arrive_count=1)
         control_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=1)
-        state0_ready = control_barriers[0]
-        state1_ready = control_barriers[1]
+        handoff_barriers = tle.gpu.alloc_barriers(num_barriers=8, arrive_count=256)
+        state0_ready = handoff_barriers[0]
+        state1_ready = handoff_barriers[1]
         # P is stored before V repack.  Publishing v*_ready after the repack
         # therefore certifies both P and V visibility to the remote PV owner.
-        p0_ready = control_barriers[2]
-        p1_ready = control_barriers[3]
-        v0_ready = control_barriers[2]
-        v1_ready = control_barriers[3]
-        slot0_empty = control_barriers[4]
-        slot1_empty = control_barriers[5]
+        p0_ready = handoff_barriers[2]
+        p1_ready = handoff_barriers[3]
+        v0_ready = handoff_barriers[2]
+        v1_ready = handoff_barriers[3]
+        slot0_empty = handoff_barriers[4]
+        slot1_empty = handoff_barriers[5]
 
         tail0_zero_ready = control_barriers[6]
         tail1_zero_ready = control_barriers[7]
 
         row0 = (batch_idx * HQ + h_base).to(tl.int32)
 
+        # Retire temporary initialization before capture-mailbox reuse.
+        tle.gpu.barrier_arrive(initialization_done, phaseIdx=0)
+        tle.gpu.barrier_wait(initialization_done, phaseIdx=0)
         tle.gpu.warp_specialize(
             [
                 (
@@ -4429,6 +4487,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                         False,
                         USE_TMA_OUTPUT,
                         DIRECT_LSE,
+                        FIXED_NUM_PAGES,
                     ),
                 ),
                 (
@@ -4499,6 +4558,7 @@ if HAS_TLE:  # pragma: no cover - H800 + FlagTree TLE only
                         FULL_TAIL,
                         MERGE_STATE_V,
                         USE_TMA_OUTPUT,
+                        FIXED_NUM_PAGES,
                     ),
                 ),
             ],
@@ -5410,11 +5470,9 @@ class _FlashMLAFp8PreparedHandle:
     def _use_direct_lse_v2(self) -> bool:
         # A direct-single route has exactly one partial CTA for each output
         # row/head block, so its WG0 LSE store has no cross-split reduction.
-        # Write natural-log LSE directly and remove the separate conversion
-        # kernel for the short one-pair route.
-        return (
-            self._direct_single_output and int(self._meta.max_pages_per_split) <= 2
-        ) or self._use_fixed_ten_page_v1()
+        # Every direct-output route can write natural-log LSE here and omit
+        # the separate conversion kernel.
+        return self._direct_single_output
 
     def _partial_launch_args(self, target_out, target_lse):
         h_q = self._h_q
@@ -5489,7 +5547,20 @@ class _FlashMLAFp8PreparedHandle:
             (
                 10
                 if self._use_fixed_ten_page_v1()
-                else (2 if self._use_fixed_two_page_v1() else 0)
+                else (
+                    2
+                    if self._use_fixed_two_page_v1()
+                    else (
+                        int(self._meta.adaptive_fixed_pages)
+                        if self._use_full_tail_specialization()
+                        and all(
+                            (length // PAGE_SIZE) % int(self._meta.adaptive_fixed_pages)
+                            == 0
+                            for length in self._max_cache_seqlens
+                        )
+                        else 0
+                    )
+                )
             ),
             self._use_direct_lse_v2(),
         )
