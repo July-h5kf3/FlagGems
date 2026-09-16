@@ -1621,6 +1621,17 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '3.0'
+- id: batch_norm_backward_reduce
+  description: Triton kernel implementation for batch normalization backward reduce stage.
+  for:
+  - native_batch_norm_backward_reduce
+  labels:
+  - aten
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: batch_norm_impl_index
   description: Applies Batch Normalization and returns the normalized output along
     with saved statistics, a reserve tensor, and the backend implementation index.
@@ -4232,6 +4243,18 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: embedding_bag_sparse_backward
+  description: |
+    Computes the sparse (COO) gradient for the backward pass of embedding_bag.
+  for:
+    - _embedding_bag_sparse_backward
+  labels:
+    - aten
+    - KernelGen
+  kind:
+    - NeuralNetwork
+  stages:
+    - alpha: '5.4'
 - id: embedding_dense_backward
   description: Calculates the gradient of the weight matrix for a dense embedding
     layer during backpropagation.
@@ -6034,6 +6057,18 @@ ops:
   - Math
   stages:
   - stable: '5.3'
+- id: greater_
+  description: The in-place version of `greater()`.
+  for:
+  - greater_.Tensor
+  - greater_.Scalar
+  labels:
+  - aten
+  - KernelGen
+  kind:
+  - Math
+  stages:
+  - alpha: '5.4'
 - id: greater_equal_
   description: The in-place version of `greater_equal()`, which is an alias for `ge()`.
   for:
@@ -11892,6 +11927,36 @@ ops:
   - Math
   stages:
   - alpha: '5.4'
+- id: rnn_tanh
+  description: Pure Triton implementation for the rnn_tanh input overload.
+  for:
+  - rnn_tanh.input
+  labels:
+  - aten
+  - NoCPU
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.4'
+  name:
+  - rnn_tanh
+  source:
+  - aten
+- id: rnn_tanh_data
+  description: Pure Triton implementation for the rnn_tanh data overload.
+  for:
+  - rnn_tanh.data
+  labels:
+  - aten
+  - NoCPU
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.4'
+  name:
+  - rnn_tanh
+  source:
+  - aten
 - id: roll
   description: 'Roll the tensor input along the given dimension(s). Elements that
     are shifted beyond the last position
@@ -15227,6 +15292,28 @@ ops:
   - aten
   kind:
   - Reduction
+  stages:
+  - beta: '5.4'
+- id: unsafe_index_put
+  description: 'Puts values from the tensor `values` into the tensor `input` using
+    the indices specified
+
+    in `indices` (which is a tuple of Tensors), matching `aten._unsafe_index_put`.
+    The
+
+    unsafe variant skips autograd history recording and assumes the caller passes
+    valid
+
+    indices; it shares the semantics of `index_put`, including the `accumulate`
+    flag.
+
+    '
+  for:
+  - _unsafe_index_put
+  labels:
+  - aten
+  kind:
+  - Tensor
   stages:
   - beta: '5.4'
 - id: unsafe_masked_index
