@@ -275,6 +275,7 @@ def test_rms_norm_w8a16_fp8_mthreads_shapes(
         # fp16 before the weight multiply. At magnitudes beyond ~2 a pure
         # atol cannot cover that, so fp16 checks use relative headroom too
         # (observed worst case: abs 0.0078 at |ref| ~ 5).
-        torch.testing.assert_close(result, ref.to(dtype), atol=2e-3, rtol=2e-3)
+        res = utils.to_cpu(result, ref)
+        torch.testing.assert_close(res, ref.to(dtype), atol=2e-3, rtol=2e-3)
     else:
         utils.gems_assert_close(result, ref, dtype, atol=2e-3)
