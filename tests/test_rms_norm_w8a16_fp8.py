@@ -269,5 +269,11 @@ def test_rms_norm_w8a16_fp8_mthreads_shapes(
     ).reshape(shape)
     assert result.shape == inp.shape
     assert result.dtype == dtype
-    # float16 accumulates one or two ulps against the float32 reference.
-    utils.gems_assert_close(result, ref, dtype, atol=2e-3)
+    if flag_gems.vendor_name == "metax" and dtype == torch.float16:
+        # MetaX rounds the normalized activation to fp16 before the weight
+        # multiply, so fp16 results sit within ~2 ulp of the reference; at
+        # magnitudes beyond ~2 that needs relative headroom too.
+        torch.testing.assert_close(result, ref.to(dtype), atol=2e-3, rtol=2e-3)
+    else:
+        # float16 accumulates one or two ulps against the float32 reference.
+        utils.gems_assert_close(result, ref, dtype, atol=2e-3)

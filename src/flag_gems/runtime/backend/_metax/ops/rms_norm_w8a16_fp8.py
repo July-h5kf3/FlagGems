@@ -341,9 +341,15 @@ def _get_dequant_weight(x, weight_q, weight_scale, group_size):
         _LAST_DEQUANT_WEIGHT = entry
         return entry[4]
 
+    # Pad a trailing partial group so the broadcast dequant still applies the
+    # last scale to the remaining elements, then trim it back off.
+    flat_weight = weight_q.float().reshape(-1)
+    pad = (-flat_weight.numel()) % group_size
+    if pad:
+        flat_weight = torch.nn.functional.pad(flat_weight, (0, pad))
     dequant_weight = (
-        (weight_q.float().reshape(-1, group_size) * weight_scale.float().reshape(-1, 1))
-        .reshape(-1)
+        (flat_weight.reshape(-1, group_size) * weight_scale.float().reshape(-1, 1))
+        .reshape(-1)[: weight_q.numel()]
         .to(x.dtype)
     )
     weight_ref = weakref.ref(
@@ -489,19 +495,16 @@ def rms_norm_w8a16_fp8(
     dim = x.ndim - len(normalized_shape)
     M = math.prod(x.shape[:dim])
     N = math.prod(normalized_shape)
-    if N % group_size != 0:
-        raise ValueError(
-            f"normalized_shape product {N} must be divisible by group_size={group_size}"
-        )
+    num_groups = -(-N // group_size)
     if _FP8_DTYPE is None or weight_q.dtype != _FP8_DTYPE:
         raise TypeError(
             f"MetaX W8A16 RMSNorm expects float8_e4m3fn weight, got {weight_q.dtype}"
         )
     if weight_q.numel() != N:
         raise ValueError(f"weight_q numel {weight_q.numel()} != {N} elements")
-    if weight_scale.numel() != N // group_size:
+    if weight_scale.numel() != num_groups:
         raise ValueError(
-            f"weight_scale numel {weight_scale.numel()} != {N // group_size} groups"
+            f"weight_scale numel {weight_scale.numel()} != {num_groups} groups"
         )
     if not x.is_contiguous():
         x = x.contiguous()
