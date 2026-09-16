@@ -232,8 +232,9 @@ def test_rms_norm_w8a16_fp8(shape):
     ],
 )
 @pytest.mark.skipif(
-    flag_gems.vendor_name != "mthreads" or not _cuda_fp8_e4m3fn_available(),
-    reason="MThreads W8A16 kernel shape and stride coverage",
+    flag_gems.vendor_name not in ("mthreads", "metax", "thead")
+    or not _cuda_fp8_e4m3fn_available(),
+    reason="MThreads/MetaX/THead W8A16 kernel shape and stride coverage",
 )
 def test_rms_norm_w8a16_fp8_mthreads_shapes(
     dtype, shape, normalized_shape, group_size, strided
@@ -268,4 +269,5 @@ def test_rms_norm_w8a16_fp8_mthreads_shapes(
     ).reshape(shape)
     assert result.shape == inp.shape
     assert result.dtype == dtype
-    utils.gems_assert_close(result, ref, dtype)
+    # float16 accumulates one or two ulps against the float32 reference.
+    utils.gems_assert_close(result, ref, dtype, atol=2e-3)
