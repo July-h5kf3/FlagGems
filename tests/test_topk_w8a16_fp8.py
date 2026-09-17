@@ -448,7 +448,9 @@ def test_topk_fp8_all_finite_encodings_ascend(dtype, max_code, largest):
         [torch.arange(max_code + 1), torch.arange(max_code + 1) + 128]
     ).to(torch.uint8)
     q = codes.view(dtype).reshape(1, -1)
-    _run_ascend(q, torch.ones((1, 1), dtype=torch.bfloat16), q.shape[-1], q.shape[-1], largest)
+    _run_ascend(
+        q, torch.ones((1, 1), dtype=torch.bfloat16), q.shape[-1], q.shape[-1], largest
+    )
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")

@@ -101,9 +101,7 @@ def _merge_stage(
 def _sort(v, ids, B: tl.constexpr, K: tl.constexpr):
     PREFIX: tl.constexpr = B >= 128 and triton.next_power_of_2(K) <= 32
     KEEP: tl.constexpr = triton.next_power_of_2(K) if K >= 8 else 8
-    pairs = al.custom(
-        "sort32", v, ids, B // 32, out=tl.full((2 * B,), 0, tl.float32)
-    )
+    pairs = al.custom("sort32", v, ids, B // 32, out=tl.full((2 * B,), 0, tl.float32))
     if PREFIX:
         pairs = _prefix_view(pairs, B // 32, 64, 2 * KEEP)
     for stage in tl.static_range(0, 6):
