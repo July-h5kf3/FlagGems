@@ -33,7 +33,8 @@ def _prepare():
     global al
     from triton.language.extra.cann import extension as al
 
-    # Primitive implementations and bitcode are provided by FlagTree #1156.
+    # compare_scalar comes from FlagTree #1156; gather_mask_custom_pattern
+    # sort32 and mrgsort are from the merged #1159 on the triton_v3.5.x base.
     import_module("triton.experimental.tle.language.dsa.ascend.custom_ops")
 
 
@@ -75,10 +76,19 @@ def _merge_stage(
     LANES: tl.constexpr = 4 if RUNS >= 4 else 2
     LENGTH: tl.constexpr = KEEP if PREFIX else 32 * (4**STAGE)
     merged = al.custom(
-        "merge_sort4",
+        "mrgsort",
         pairs,
+        0,
         LENGTH,
-        LANES,
+        2 * LENGTH if LANES == 4 else 0,
+        3 * LENGTH if LANES == 4 else 0,
+        LENGTH,
+        LENGTH,
+        LENGTH if LANES == 4 else 0,
+        LENGTH if LANES == 4 else 0,
+        False,
+        15 if LANES == 4 else 3,
+        RUNS // LANES,
         out=tl.full((2 * RUNS * LENGTH,), 0, tl.float32),
     )
     if PREFIX:
@@ -91,7 +101,9 @@ def _merge_stage(
 def _sort(v, ids, B: tl.constexpr, K: tl.constexpr):
     PREFIX: tl.constexpr = B >= 128 and triton.next_power_of_2(K) <= 32
     KEEP: tl.constexpr = triton.next_power_of_2(K) if K >= 8 else 8
-    pairs = al.custom("sort32", v, ids, out=tl.full((2 * B,), 0, tl.float32))
+    pairs = al.custom(
+        "sort32", v, ids, B // 32, out=tl.full((2 * B,), 0, tl.float32)
+    )
     if PREFIX:
         pairs = _prefix_view(pairs, B // 32, 64, 2 * KEEP)
     for stage in tl.static_range(0, 6):
@@ -223,33 +235,46 @@ def _compact(key, values, threshold, mode: tl.constexpr, B: tl.constexpr):
         "compare_scalar",
         key,
         threshold.to(tl.float32),
-        2 - mode,
+        4 - 3 * mode,
+        B,
         out=dsa.to_tensor(dsa.alloc((B // 16,), tl.uint16, dsa.ascend.UB)),
     )
     vals, count = al.custom(
-        "gather_mask",
+        "gather_mask_custom_pattern",
         values,
         mask,
+        True,
+        B,
+        1,
+        1,
+        8,
+        1,
         out=[
             dsa.to_tensor(dsa.alloc((B,), tl.float16, dsa.ascend.UB)),
-            dsa.to_tensor(dsa.alloc((1,), tl.int32, dsa.ascend.UB)),
+            dsa.to_tensor(dsa.alloc((1,), tl.int64, dsa.ascend.UB)),
         ],
     )
-    return vals, tl.max(count, 0)
+    return vals, tl.max(count, 0).to(tl.int32)
 
 
 @triton.jit
 def _gather_only(values, mask, B: tl.constexpr):
     vals, count = al.custom(
-        "gather_mask",
+        "gather_mask_custom_pattern",
         values,
         mask,
+        True,
+        B,
+        1,
+        1,
+        8,
+        1,
         out=[
             dsa.to_tensor(dsa.alloc((B,), tl.float16, dsa.ascend.UB)),
-            dsa.to_tensor(dsa.alloc((1,), tl.int32, dsa.ascend.UB)),
+            dsa.to_tensor(dsa.alloc((1,), tl.int64, dsa.ascend.UB)),
         ],
     )
-    return vals, tl.max(count, 0)
+    return vals, tl.max(count, 0).to(tl.int32)
 
 
 @libentry()
@@ -324,13 +349,15 @@ def _row_select(
                 key,
                 lo.to(tl.float32),
                 1,
+                N,
                 out=dsa.to_tensor(dsa.alloc((N // 16,), tl.uint16, dsa.ascend.UB)),
             )
             eq = al.custom(
                 "compare_scalar",
                 key,
                 lo.to(tl.float32),
-                0,
+                2,
+                N,
                 out=dsa.to_tensor(dsa.alloc((N // 16,), tl.uint16, dsa.ascend.UB)),
             )
             values, above = _gather_only(key, gt, N)
