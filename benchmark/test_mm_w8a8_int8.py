@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """W8A8 timings use upstream BLAS shapes, including duplicate core entries.
 
-W8A8_BASELINE=flagtree compares the unchanged MetaX BF16 mm compiled by
-FlagTree; the default is torch.mm BF16. W8A8_SCOPE=full includes fresh
-quantization, while the default prequantized scope matches PR #5972.
+Default scope is prequantized: same INT8 tensors/scales, native INT8 baseline,
+preallocated outputs, no quantization or layout preparation timed. Three paired
+rounds alternate implementation order. W8A8_SCOPE=full/activation are explicit
+legacy diagnostic scopes and are not part of the default performance result.
+W8A8_BASELINE selects torch/flagtree BF16 only in the full diagnostic scope.
+W8A8_COMPARE_GEMM=1 adds same-input native/public GEMM timings in activation scope.
 W8A8_PACK_WEIGHT=1 with activation scope also measures an explicit packed-weight
 path and its one-time preparation cost. W8A8_SINGLE_SHARED=1 selects the
 experimental 128x128 packing and requires the corresponding FlagTree compiler.
@@ -12,6 +15,7 @@ W8A8_SCOPE=activation shares prequantized weights and compares activation
 quantization plus GEMM against the native vLLM-MetaX mctlassEx path. Set
 W8A8_NATIVE_LIBRARY to the vendor _C library providing INT8 quantization.
 """
+
 import hashlib
 import importlib
 import importlib.metadata
@@ -43,6 +47,142 @@ def selected_mm_input_fn(*args, **kwargs):
 
 
 class MmW8A8Int8Benchmark(BlasBenchmark):
+    def prequantized_latencies(self, a, b):
+        """Prepare once, then time both implementations on identical INT8 tensors."""
+        import mctlassEx
+
+        backend = importlib.import_module(flag_gems.mm_w8a8_int8.__module__)
+        if not hasattr(self, "native_handle"):
+            self.native_handle = mctlassEx.mctlassExHandleWrapper()
+            files = list(Path(mctlassEx.__file__).parent.glob("*.so"))
+            print(
+                "W8A8_NATIVE_ENV "
+                + json.dumps(
+                    {
+                        "entry": "mctlassExHandleWrapper.mctlass_w8a8_scaled_mm_azp",
+                        "version": importlib.metadata.version("mctlassEx"),
+                        "library_sha256": {
+                            str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                            for p in files
+                        },
+                    }
+                ),
+                flush=True,
+            )
+        aq, bq, sa, sb = backend._prepare_mm_w8a8_int8_inputs(a, b)
+        m, k = aq.shape
+        n = bq.shape[1]
+        aq = aq.contiguous()
+        bq = bq.t().contiguous().t()
+        sa, sb = sa.reshape(m, 1).contiguous(), sb.reshape(n, 1).contiguous()
+        native_sb = sb.t()
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+        native_out = torch.empty_like(out)
+
+        def gems_call():
+            return flag_gems.mm_w8a8_int8_out(aq, bq, sa, sb, out=out)
+
+        def native_call():
+            self.native_handle.mctlass_w8a8_scaled_mm_azp(
+                aq,
+                bq,
+                native_out,
+                sa,
+                native_sb,
+                None,
+                None,
+                None,
+                torch.cuda.current_stream().cuda_stream,
+            )
+            return native_out
+
+        rows, cols = [0, m // 2, m - 1], [0, n // 2, n - 1]
+        ref = (
+            (aq[rows].cpu().long() @ bq[:, cols].cpu().long()).float()
+            * sa[rows].cpu()
+            * sb[cols].cpu().t()
+        ).bfloat16()
+
+        def validate(call):
+            result = call()
+            torch.testing.assert_close(result[rows][:, cols].cpu(), ref, rtol=0, atol=0)
+
+        validate(gems_call)
+        native_error = None
+        if n % 16 or k % 16:
+            native_error = "Native requires 16-aligned K/N; no fallback timed"
+        else:
+            validate(native_call)
+        calls = {"flaggems_int8_gemm": gems_call}
+        if native_error is None:
+            calls["vllm_metax_int8_gemm"] = native_call
+        for call in calls.values():
+            for _ in range(2):
+                call()
+        torch.cuda.synchronize()
+        # Ensure native launches enter the capture stream, rather than timing
+        # an empty graph while work runs on a previously saved stream.
+        saved_aq = aq.clone()
+        for call in calls.values():
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured_out = call()
+            aq.zero_()
+            graph.replay()
+            torch.testing.assert_close(
+                captured_out[rows][:, cols].cpu(), torch.zeros_like(ref), rtol=0, atol=0
+            )
+            aq.copy_(saved_aq)
+            graph.replay()
+            torch.testing.assert_close(
+                captured_out[rows][:, cols].cpu(), ref, rtol=0, atol=0
+            )
+        del saved_aq, graph, captured_out
+        rounds = {name: [] for name in calls}
+        for round_index in range(3):
+            order = list(calls)
+            if round_index % 2:
+                order.reverse()
+            for name in order:
+                rounds[name].append(
+                    triton.testing.do_bench_cudagraph(
+                        calls[name], rep=Config.repetition, return_mode="median"
+                    )
+                )
+        common = dict(
+            shape=[m, n, k],
+            a_stride=list(a.stride()),
+            b_stride=list(b.stride()),
+            quantized_a_stride=list(aq.stride()),
+            quantized_b_stride=list(bq.stride()),
+            scale_a_shape=list(sa.shape),
+            scale_b_shape=list(sb.shape),
+            dtype=str(out.dtype),
+            scope="prequantized",
+            bias=False,
+            timing="torch.cuda.CUDAGraph + events",
+            rep_ms=Config.repetition,
+            order="3 rounds alternating FlagGems/native order",
+            preparation_timed=False,
+            output_preallocated=True,
+        )
+        for name in ("flaggems_int8_gemm", "vllm_metax_int8_gemm"):
+            record = dict(common, op=name, status="ok", rounds_ms=rounds.get(name))
+            if name not in rounds:
+                record.update(status="unavailable", error=native_error)
+            print("W8A8_RECORD " + json.dumps(record), flush=True)
+            if os.environ.get("W8A8_RECORD_FILE"):
+                with open(os.environ["W8A8_RECORD_FILE"], "a") as f:
+                    f.write(json.dumps(record) + "\n")
+        return (
+            statistics.median(rounds["flaggems_int8_gemm"]),
+            (
+                statistics.median(rounds["vllm_metax_int8_gemm"])
+                if native_error is None
+                else float("nan")
+            ),
+        )
+
     def activation_latency(self, op, a, b):
         backend = importlib.import_module(flag_gems.mm_w8a8_int8.__module__)
         common = dict(
@@ -88,7 +228,8 @@ class MmW8A8Int8Benchmark(BlasBenchmark):
         out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
 
         def gems_call():
-            return backend._mm_w8a8_int8_prepared_weight_out(a, bq, sb, out=out)
+            aq, sa = backend._prepare_mm_w8a8_int8_activation(a)
+            return flag_gems.mm_w8a8_int8_out(aq, bq, sa, sb, out=out)
 
         rows = [0, m // 2, m - 1]
         cols = [0, n // 2, n - 1]
@@ -163,7 +304,10 @@ class MmW8A8Int8Benchmark(BlasBenchmark):
         try:
             if n % 16 or k % 16:
                 raise ValueError(
-                    "Native comparison requires 16-aligned K and N; the vendor legacy wrapper uses Triton otherwise. N=1 caused an illegal access in an isolated run; no fallback is timed."
+                    "Native comparison requires 16-aligned K and N; "
+                    "the vendor legacy wrapper uses Triton otherwise. "
+                    "N=1 caused an illegal access in an isolated run; "
+                    "no fallback is timed."
                 )
             native_call()
             torch.cuda.synchronize()
@@ -187,10 +331,46 @@ class MmW8A8Int8Benchmark(BlasBenchmark):
             if "illegal memory access" in str(error):
                 raise
             record("vllm_metax_int8", error=str(error))
+        if os.environ.get("W8A8_COMPARE_GEMM") == "1":
+
+            def gems_gemm():
+                return flag_gems.mm_w8a8_int8_out(aq, bq, sa, sb, out=out)
+
+            validate(gems_gemm(), aq, sa)
+            record("flaggems_int8_gemm", gems_gemm, scope="prequantized")
+
+            def same_input_native_gemm():
+                self.native_handle.mctlass_w8a8_scaled_mm_azp(
+                    aq,
+                    bq,
+                    native_out,
+                    sa.reshape(-1, 1),
+                    sb.reshape(1, -1),
+                    None,
+                    None,
+                    None,
+                    torch.cuda.current_stream().cuda_stream,
+                )
+                return native_out
+
+            try:
+                if n % 16 or k % 16:
+                    raise ValueError(
+                        "Native INT8 requires 16-aligned K and N; no fallback timed"
+                    )
+                validate(same_input_native_gemm(), aq, sa)
+                record(
+                    "vllm_metax_int8_gemm", same_input_native_gemm, scope="prequantized"
+                )
+            except (RuntimeError, AssertionError, ValueError) as error:
+                if "illegal memory access" in str(error):
+                    raise
+                record("vllm_metax_int8_gemm", error=str(error), scope="prequantized")
         if os.environ.get("W8A8_PACK_WEIGHT") == "1":
             single_shared = os.environ.get("W8A8_SINGLE_SHARED") == "1"
             packed_name = (
-                "flaggems_int8_single_shared_packed" if single_shared
+                "flaggems_int8_single_shared_packed"
+                if single_shared
                 else "flaggems_int8_packed"
             )
             weight = backend._pack_mm_w8a8_int8_weight(
@@ -199,6 +379,7 @@ class MmW8A8Int8Benchmark(BlasBenchmark):
 
             def packed_call():
                 return backend._mm_w8a8_int8_packed_weight_out(a, weight, out=out)
+
             validate(packed_call(), aq, sa)
             record("flaggems_int8", gems_call)
 
@@ -206,38 +387,63 @@ class MmW8A8Int8Benchmark(BlasBenchmark):
                 return backend._mm_w8a8_int8_packed_prequantized_out(
                     aq, sa, weight, out=out
                 )
+
             validate(packed_gemm(), aq, sa)
             record(
                 "flaggems_int8_gemm",
-                lambda: backend._mm_w8a8_int8_prequantized_out(aq, bq, sa, sb, out=out),
+                lambda: flag_gems.mm_w8a8_int8_out(aq, bq, sa, sb, out=out),
                 scope="prequantized",
             )
-            record(
-                packed_name + "_gemm", packed_gemm, scope="prequantized"
-            )
+            record(packed_name + "_gemm", packed_gemm, scope="prequantized")
             if n % 16 == 0 and k % 16 == 0 and n > 1:
+
                 def native_gemm():
                     self.native_handle.mctlass_w8a8_scaled_mm_azp(
-                        aq, bq, native_out, sa.reshape(-1, 1), sb.reshape(1, -1),
-                        None, None, None, torch.cuda.current_stream().cuda_stream,
+                        aq,
+                        bq,
+                        native_out,
+                        sa.reshape(-1, 1),
+                        sb.reshape(1, -1),
+                        None,
+                        None,
+                        None,
+                        torch.cuda.current_stream().cuda_stream,
                     )
                     return native_out
+
                 validate(native_gemm(), aq, sa)
                 record("vllm_metax_int8_gemm", native_gemm, scope="prequantized")
 
             record(
-                packed_name + "_weight_prepare" if single_shared else "flaggems_int8_weight_prepare",
-                lambda: backend._pack_mm_w8a8_int8_weight(bq, sb, single_shared=single_shared),
+                (
+                    packed_name + "_weight_prepare"
+                    if single_shared
+                    else "flaggems_int8_weight_prepare"
+                ),
+                lambda: backend._pack_mm_w8a8_int8_weight(
+                    bq, sb, single_shared=single_shared
+                ),
                 scope="weight_prepare",
             )
             return record(
-                packed_name, packed_call,
+                packed_name,
+                packed_call,
                 extra_tiled_bytes=0 if weight.tiled is None else weight.tiled.numel(),
             )
         return record("flaggems_int8", gems_call)
 
     def get_latency(self, op, *args, **kwargs):
         a, b = args
+        if os.environ.get("W8A8_SCOPE", "prequantized") == "prequantized":
+            # The public framework requests baseline then implementation latency.
+            # Measure the pair together, retain only its two timing values.
+            if op is self.torch_op:
+                ours, native = self.prequantized_latencies(a, b)
+                self._paired_gemm_latency = ours
+                return native
+            latency = self._paired_gemm_latency
+            del self._paired_gemm_latency
+            return latency
         if os.environ.get("W8A8_SCOPE") == "activation":
             return self.activation_latency(op, a, b)
         backend = importlib.import_module(flag_gems.mm_w8a8_int8.__module__)
@@ -255,13 +461,13 @@ class MmW8A8Int8Benchmark(BlasBenchmark):
                 else (lambda: torch.mm(a, b))
             )
         elif scope == "full":
-            call = lambda: flag_gems.mm_w8a8_int8(a, b)
+            call = lambda: backend._mm_w8a8_int8_floating(a, b)
         else:
             prepared = backend._prepare_mm_w8a8_int8_inputs(a, b)
             out = torch.empty(
                 (a.shape[0], b.shape[1]), device=a.device, dtype=torch.bfloat16
             )
-            call = lambda: backend._mm_w8a8_int8_prequantized_out(*prepared, out=out)
+            call = lambda: flag_gems.mm_w8a8_int8_out(*prepared, out=out)
         if op is not self.torch_op:
             # Sample independent CPU INT64 references for every workload,
             # outside both warmup and timing; full API tests live in tests/.
