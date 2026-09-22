@@ -178,6 +178,8 @@ def _pick_split(m, n, k):
 
 
 def _pick_tiles(m, n, k):
+    if 1024 <= k <= 4096 and ((m >= 4096 and n >= 1024) or (m == 256 and n >= 16384)):
+        return (256, 128, 64, 8, 2, "basic", True)
     if m <= 16:
         return (16, 64, 128 if k >= 1024 else 64, 4, 2, "basic", True)
     if m >= 1024 and n >= 1024:
@@ -657,6 +659,87 @@ def mm_w8a8_int8_out(a, b, *, out):
     return _mm_w8a8_int8_prequantized_out(*_prepare_mm_w8a8_int8_inputs(a, b), out=out)
 
 
+@triton.jit
+def _activation_code(x, peak, LOW_PRECISION: tl.constexpr):
+    if LOW_PRECISION:
+        fast = (peak > 1.0e-10) & (peak < 1.0e30)
+    else:
+        fast = False
+    if fast:
+        normalized = x * tl.div_rn(127.0, peak)
+        # In this range, adding 1.5 * 2**23 rounds FP32 to an even integer.
+        rounded = (normalized + 12582912.0) - 12582912.0
+        # BF16/FP16 products below are exact in FP32. Correct reciprocal
+        # error at exact half-integer boundaries without per-element div.
+        distance = x * 254.0 - peak * (rounded * 2.0)
+        odd = (rounded.to(tl.int32) & 1) != 0
+        rounded = tl.where(
+            odd & (tl.abs(distance) == peak),
+            rounded + tl.where(distance > 0, 1.0, -1.0),
+            rounded,
+        )
+    else:
+        # Preserve the original division and rounding for FP32 and extreme peaks.
+        normalized = tl.div_rn(x, peak) * 127.0
+        lower = tl.floor(normalized)
+        frac = normalized - lower
+        odd = (lower.to(tl.int32) & 1) != 0
+        rounded = lower + tl.where((frac > 0.5) | ((frac == 0.5) & odd), 1.0, 0.0)
+        rounded = tl.minimum(tl.maximum(rounded, -127.0), 127.0)
+
+    return rounded.to(tl.int8)
+
+
+@libentry()
+@triton.jit
+def _activation_rows_kernel(X, Q, SCALE, K: tl.constexpr, BK: tl.constexpr):
+    row = tl.program_id(0)
+    ks = tl.arange(0, BK)
+    x = tl.load(X + row.to(tl.int64) * K + ks, ks < K, other=0).to(tl.float32)
+    peak = tl.maximum(tl.max(tl.abs(x), 0), 1.0e-10)
+    code = _activation_code(
+        x, peak, X.dtype.element_ty == tl.bfloat16 or X.dtype.element_ty == tl.float16
+    )
+    tl.store(Q + row.to(tl.int64) * K + ks, code, ks < K)
+    tl.store(SCALE + row, peak * (1.0 / 127.0))
+
+
+@libentry()
+@triton.jit
+def _activation_peaks_kernel(
+    X, PEAKS, K: tl.constexpr, BK: tl.constexpr, SPLITS: tl.constexpr
+):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    ks = chunk * BK + tl.arange(0, BK)
+    x = tl.load(X + row.to(tl.int64) * K + ks, ks < K, other=0).to(tl.float32)
+    tl.store(PEAKS + row.to(tl.int64) * SPLITS + chunk, tl.max(tl.abs(x), 0))
+
+
+@libentry()
+@triton.jit
+def _activation_chunks_kernel(
+    X, PEAKS, Q, SCALE, K: tl.constexpr, BK: tl.constexpr, SPLITS: tl.constexpr
+):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    sp = tl.arange(0, triton.next_power_of_2(SPLITS))
+    peak = tl.maximum(
+        tl.max(
+            tl.load(PEAKS + row.to(tl.int64) * SPLITS + sp, sp < SPLITS, other=0), 0
+        ),
+        1.0e-10,
+    )
+    ks = chunk * BK + tl.arange(0, BK)
+    x = tl.load(X + row.to(tl.int64) * K + ks, ks < K, other=0).to(tl.float32)
+    code = _activation_code(
+        x, peak, X.dtype.element_ty == tl.bfloat16 or X.dtype.element_ty == tl.float16
+    )
+    tl.store(Q + row.to(tl.int64) * K + ks, code, ks < K)
+    if chunk == 0:
+        tl.store(SCALE + row, peak * (1.0 / 127.0))
+
+
 def _prepare_mm_w8a8_int8_activation(a):
     """Quantize current activations when INT8 weights are already available."""
     if a.ndim != 2 or a.dtype not in _SUPPORTED_FLOAT or a.device.type != "cuda":
@@ -670,20 +753,40 @@ def _prepare_mm_w8a8_int8_activation(a):
         return q, scale
     with torch_device_fn.device(a.device):
         if k <= 16384:
-            _quantize_rows_kernel[(m,)](
+            _activation_rows_kernel[(m,)](
                 a,
                 q,
                 scale,
-                m,
                 k,
-                k,
-                1,
-                1,
                 triton.next_power_of_2(k),
                 num_warps=4,
                 enable_fp_fusion=False,
             )
+        elif k <= 1048576:
+            bk = 4096
+            splits = triton.cdiv(k, bk)
+            peaks = torch.empty((m, splits), device=a.device, dtype=torch.float32)
+            _activation_peaks_kernel[(m, splits)](
+                a,
+                peaks,
+                k,
+                bk,
+                splits,
+                num_warps=4,
+            )
+            _activation_chunks_kernel[(m, splits)](
+                a,
+                peaks,
+                q,
+                scale,
+                k,
+                bk,
+                splits,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
         else:
+            # Bound the partial-peak reduction size for unusually long rows.
             peak = a.float().abs().amax(dim=1).clamp_min(1e-10)
             torch.mul(peak, 1.0 / 127.0, out=scale)
             _quantize_mm_input_kernel[(triton.cdiv(a.numel(), 1024),)](
@@ -700,3 +803,67 @@ def _prepare_mm_w8a8_int8_activation(a):
                 enable_fp_fusion=False,
             )
     return q, scale
+
+
+@libentry()
+@triton.jit
+def _activation_gemv_kernel(
+    A, B, SB, OUT, N: tl.constexpr, K: tl.constexpr, BK: tl.constexpr
+):
+    cols = tl.program_id(0) * 4 + tl.arange(0, 4)
+    ks = tl.arange(0, BK)
+    a = tl.load(A + ks, ks < K, other=0).to(tl.float32)
+    peak = tl.maximum(tl.max(tl.abs(a), 0), 1.0e-10)
+    aq = _activation_code(a, peak, True).to(tl.int32)
+    b = tl.load(
+        B + cols[:, None] * K + ks[None, :],
+        (cols[:, None] < N) & (ks[None, :] < K),
+        other=0,
+    ).to(tl.int32)
+    value = tl.sum(aq[None, :] * b, 1).to(tl.float32)
+    sb = tl.load(SB + cols, cols < N, other=0)
+    tl.store(OUT + cols, value * (peak * (1.0 / 127.0)) * sb, cols < N)
+
+
+def _mm_w8a8_int8_prepared_weight_out(a, bq, scale_b, *, out):
+    """Dynamic activations and caller-owned, prequantized constant weights."""
+    if a.ndim == 2 and bq.ndim == 2:
+        m, k = a.shape
+        n = bq.shape[1]
+        fused = (
+            m == 1
+            and 0 < n <= 1024
+            and 0 < k <= 4096
+            and a.dtype in (torch.bfloat16, torch.float16)
+            and a.stride() == (k, 1)
+            and bq.stride() == (1, k)
+        )
+        if fused:
+            if (
+                bq.shape[0] != k
+                or bq.dtype != torch.int8
+                or a.device.type != "cuda"
+                or any(x.device != a.device for x in (bq, scale_b, out))
+                or scale_b.dtype != torch.float32
+                or not scale_b.is_contiguous()
+                or scale_b.shape not in ((n,), (1, n))
+                or out.shape != (m, n)
+                or out.dtype not in _SUPPORTED_FLOAT
+                or not out.is_contiguous()
+            ):
+                raise ValueError("invalid prequantized weight, scale or output")
+            with torch_device_fn.device(a.device):
+                _activation_gemv_kernel[(triton.cdiv(n, 4),)](
+                    a,
+                    bq,
+                    scale_b,
+                    out,
+                    n,
+                    k,
+                    triton.next_power_of_2(k),
+                    num_warps=4,
+                    enable_fp_fusion=False,
+                )
+            return out
+    aq, scale_a = _prepare_mm_w8a8_int8_activation(a)
+    return _mm_w8a8_int8_prequantized_out(aq, bq, scale_a, scale_b, out=out)

@@ -85,8 +85,7 @@ class MmW8A8Int8Benchmark(BlasBenchmark):
         out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
 
         def gems_call():
-            aq, sa = backend._prepare_mm_w8a8_int8_activation(a)
-            return backend._mm_w8a8_int8_prequantized_out(aq, bq, sa, sb, out=out)
+            return backend._mm_w8a8_int8_prepared_weight_out(a, bq, sb, out=out)
 
         rows = [0, m // 2, m - 1]
         cols = [0, n // 2, n - 1]

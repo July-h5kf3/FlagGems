@@ -393,15 +393,15 @@ def test_mm_w8a8_int8_strided_quantization(k):
 
 
 @pytest.mark.parametrize("k", [128, 4096, 18944])
-def test_mm_w8a8_int8_prepared_weight_replay(k):
-    a = torch.randn((4, k), device=flag_gems.device, dtype=torch.bfloat16)
+@pytest.mark.parametrize("m", [1, 4])
+def test_mm_w8a8_int8_prepared_weight_replay(k, m):
+    a = torch.randn((m, k), device=flag_gems.device, dtype=torch.bfloat16)
     b = torch.randn((k, 64), device=a.device, dtype=a.dtype)
     _, bq, _, sb = _backend._prepare_mm_w8a8_int8_inputs(a, b)
-    out = torch.empty((4, 64), device=a.device, dtype=a.dtype)
+    out = torch.empty((m, 64), device=a.device, dtype=a.dtype)
 
     def call():
-        aq, sa = _backend._prepare_mm_w8a8_int8_activation(a)
-        return _mm_w8a8_int8_prequantized_out(aq, bq, sa, sb, out=out)
+        return _backend._mm_w8a8_int8_prepared_weight_out(a, bq, sb, out=out)
 
     for _ in range(2):
         call()
@@ -414,3 +414,56 @@ def test_mm_w8a8_int8_prepared_weight_replay(k):
         torch.testing.assert_close(
             out.cpu(), _floating_int8_reference(a, b, a.dtype), rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize(
+    "dtype,bits,exponents",
+    [
+        (torch.bfloat16, 7, [-20, 0, 20]),
+        (torch.float16, 10, [-8, 0, 8]),
+    ],
+)
+def test_mm_w8a8_activation_mantissa_boundaries(dtype, bits, exponents):
+    mantissa = 1 + torch.arange(1 << bits, dtype=torch.float32) / (1 << bits)
+    base = (mantissa[None, :] * (2.0 ** -torch.arange(9).float())[:, None]).flatten()
+    base = torch.cat((base, -base))
+    for exponent in exponents:
+        peaks = mantissa * (2.0**exponent)
+        a = (base[None, :] * (2.0**exponent)).expand(len(peaks), -1)
+        a = torch.minimum(torch.maximum(a, -peaks[:, None]), peaks[:, None]).to(dtype)
+        aq, scale = _backend._prepare_mm_w8a8_int8_activation(a.to(flag_gems.device))
+        peak = a.float().abs().amax(1).clamp_min(1e-10)
+        expected = (
+            torch.round(a.float() / peak[:, None] * 127).clamp(-127, 127).to(torch.int8)
+        )
+        torch.testing.assert_close(aq.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(scale.cpu(), peak * (1.0 / 127), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("k", [4096, 18944])
+def test_mm_w8a8_activation_extreme_peaks(dtype, k):
+    # Include clamped peaks, signed values, and FP32/BF16 fallback ranges.
+    factors = [0.0, 1e-20, 1e-10, 1.0, 1000.0]
+    if dtype != torch.float16:
+        factors += [1e30, 1e35]
+    a = torch.linspace(-1, 1, k)[None, :] * torch.tensor(factors)[:, None]
+    a = a.to(dtype)
+    aq, scale = _backend._prepare_mm_w8a8_int8_activation(a.to(flag_gems.device))
+    peak = a.float().abs().amax(1).clamp_min(1e-10)
+    expected = (
+        torch.round(a.float() / peak[:, None] * 127).clamp(-127, 127).to(torch.int8)
+    )
+    torch.testing.assert_close(aq.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(scale.cpu(), peak * (1.0 / 127), rtol=0, atol=0)
+
+
+def test_mm_w8a8_activation_long_row_fallback():
+    a = torch.tensor([-1.0, 0.0, 1.0], device=flag_gems.device, dtype=torch.bfloat16)[
+        :, None
+    ].repeat(1, 1048577)
+    aq, scale = _backend._prepare_mm_w8a8_int8_activation(a)
+    expected = torch.tensor([-127, 0, 127], device=a.device, dtype=torch.int8)[:, None]
+    assert torch.all(aq == expected)
+    peak = torch.tensor([1.0, 1e-10, 1.0], device=a.device)
+    torch.testing.assert_close(scale, peak * (1.0 / 127), rtol=0, atol=0)
