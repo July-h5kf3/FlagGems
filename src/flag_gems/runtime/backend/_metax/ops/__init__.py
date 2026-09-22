@@ -43,6 +43,7 @@ from .matmul_bf16 import matmul_bf16
 from .matmul_int8 import matmul_int8
 from .min import min, min_dim
 from .mm import mm, mm_out
+from .mm_w8a8_int8 import mm_w8a8_int8, mm_w8a8_int8_out
 from .mvlgamma_ import mvlgamma_
 from .nansum import nansum, nansum_out
 from .new_ones import new_ones
@@ -134,6 +135,8 @@ __all__ = [
     "masked_scatter_impl",
     "matmul_bf16",
     "matmul_int8",
+    "mm_w8a8_int8",
+    "mm_w8a8_int8_out",
     "masked_fill",
     "masked_fill_",
     "masked_scatter_backward",
