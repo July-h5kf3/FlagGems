@@ -502,13 +502,18 @@ def test_mm_w8a8_profiled_tiles_edges(shape, out_dtype):
     ((64, 2048, 1024), torch.float32),
     ((37, 269, 77), torch.bfloat16),
 ])
-def test_mm_w8a8_packed_weight(shape, dtype):
+@pytest.mark.parametrize("single_shared", [False, True])
+def test_mm_w8a8_packed_weight(shape, dtype, single_shared):
+    if single_shared:
+        from triton.backends.metax.compiler import MACAOptions
+        if "single_shared_async" not in MACAOptions.__dataclass_fields__:
+            pytest.skip("requires the experimental FlagTree direct-copy pipeline")
     m, n, k = shape
     aq = torch.randint(-128, 128, (m, k), device=flag_gems.device, dtype=torch.int8)
     bq = torch.randint(-128, 128, (n, k), device=aq.device, dtype=torch.int8).t()
     sa = torch.rand(m, device=aq.device) * 0.001
     sb = torch.rand(n, device=aq.device) * 0.001
-    weight = _backend._pack_mm_w8a8_int8_weight(bq, sb)
+    weight = _backend._pack_mm_w8a8_int8_weight(bq, sb, single_shared=single_shared)
     if (n, k) == (4608, 3584):
         assert weight.tiled is None
     expected = torch.empty((m, n), device=aq.device, dtype=dtype)
@@ -526,11 +531,16 @@ def test_mm_w8a8_packed_weight(shape, dtype):
 
 
 @pytest.mark.skipif(flag_gems.vendor_name != "metax", reason="MetaX weight layout")
-def test_mm_w8a8_packed_graph_updates():
+@pytest.mark.parametrize("single_shared", [False, True])
+def test_mm_w8a8_packed_graph_updates(single_shared):
+    if single_shared:
+        from triton.backends.metax.compiler import MACAOptions
+        if "single_shared_async" not in MACAOptions.__dataclass_fields__:
+            pytest.skip("requires the experimental FlagTree direct-copy pipeline")
     a = torch.randn((4096, 1024), device=flag_gems.device, dtype=torch.bfloat16)
     bq = torch.randint(-127, 128, (2048, 1024), device=a.device, dtype=torch.int8).t()
     sb = torch.full((2048,), 0.001, device=a.device)
-    weight = _backend._pack_mm_w8a8_int8_weight(bq, sb)
+    weight = _backend._pack_mm_w8a8_int8_weight(bq, sb, single_shared=single_shared)
     out = torch.empty((4096, 2048), device=a.device, dtype=torch.bfloat16)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -557,3 +567,17 @@ def test_mm_w8a8_packed_weight_rejects_invalid():
         _backend._pack_mm_w8a8_int8_weight(b.float(), scale)
     with pytest.raises(ValueError):
         _backend._pack_mm_w8a8_int8_weight(b, scale[:128])
+
+
+@pytest.mark.skipif(flag_gems.vendor_name != "metax", reason="MetaX compiler option")
+def test_mm_w8a8_packed_single_shared_requires_compiler(monkeypatch):
+    from triton.backends.metax.compiler import MACAOptions
+    fields = dict(MACAOptions.__dataclass_fields__)
+    fields.pop("single_shared_async", None)
+    monkeypatch.setattr(MACAOptions, "__dataclass_fields__", fields)
+    b = torch.zeros((128, 256), device=flag_gems.device, dtype=torch.int8)
+    scale = torch.ones(256, device=b.device)
+    with pytest.raises(RuntimeError, match="single_shared_async"):
+        _backend._pack_mm_w8a8_int8_weight(b, scale, single_shared=True)
+    with pytest.raises(TypeError, match="must be bool"):
+        _backend._pack_mm_w8a8_int8_weight(b, scale, single_shared=1)

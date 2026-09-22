@@ -68,7 +68,11 @@ def _mm_w8a8_kernel(
     USE_TLE: tl.constexpr,
     SPLIT_K: tl.constexpr = 1,
     PACKED_B: tl.constexpr = False,
+    SINGLE_SHARED: tl.constexpr = False,
 ):
+    if SINGLE_SHARED:
+        tl.static_assert(PACKED_B and SPLIT_K == 1 and K % 128 == 0)
+        tl.static_assert(BM == 128 and BN == 128 and BK == 128)
     pm, pn = _grouped_pids(tl.program_id(0), M, N, BM, BN, 8)
     rm = pm * BM + tl.arange(0, BM)
     rn = pn * BN + tl.arange(0, BN)
@@ -88,7 +92,11 @@ def _mm_w8a8_kernel(
         bn = bn.to(tl.int64)
     pa = A + am[:, None] * K + start + rk[None, :]
     if PACKED_B:
-        tl.static_assert(BN == 256 and BK == 64 and SPLIT_K == 1)
+        if SINGLE_SHARED:
+            tl.static_assert(BM == 128 and BN == 128 and BK == 128)
+            tl.static_assert(SPLIT_K == 1 and K % BK == 0)
+        else:
+            tl.static_assert(BN == 256 and BK == 64 and SPLIT_K == 1)
         pb = (
             B
             + (bn[None, :] // BN) * triton.cdiv(K, BK) * BN * BK
@@ -101,7 +109,10 @@ def _mm_w8a8_kernel(
     if CHUNK > 131071:
         wide = tl.full((BM, BN), 0, tl.int64)
     for i in range(tl.cdiv(CHUNK, BK)):
-        if USE_TLE:
+        if SINGLE_SHARED:
+            a = tle_async.load(pa, is_async=True)
+            b = tle_async.load(pb, is_async=True)
+        elif USE_TLE:
             a = tle_async.load(
                 pa, start + i * BK + rk[None, :] < K, other=0, is_async=True
             )
@@ -937,14 +948,24 @@ class _PackedMMW8A8Weight:
     standard: torch.Tensor
     scale: torch.Tensor
     tiled: torch.Tensor | None
+    single_shared: bool = False
 
 
-def _pack_mm_w8a8_int8_weight(bq, scale_b):
+def _pack_mm_w8a8_int8_weight(bq, scale_b, *, single_shared=False):
     """Prepare static weights once, outside repeated activation/GEMM calls.
 
     The tiled path uses an additional INT8 copy. Preparing a new object is
     required when weights or scales change; no input content is cached.
+    single_shared opts into a 128x128 weight layout and the experimental
+    FlagTree direct-copy pipeline. It is not enabled by default.
     """
+    if type(single_shared) is not bool:
+        raise TypeError("single_shared must be bool")
+    if single_shared:
+        from triton.backends.metax.compiler import MACAOptions
+
+        if "single_shared_async" not in MACAOptions.__dataclass_fields__:
+            raise RuntimeError("single_shared requires a FlagTree build with single_shared_async")
     if not isinstance(bq, torch.Tensor) or not isinstance(scale_b, torch.Tensor):
         raise TypeError("weight and scale must be tensors")
     if bq.ndim != 2 or bq.dtype != torch.int8 or bq.device.type != "cuda":
@@ -960,19 +981,20 @@ def _pack_mm_w8a8_int8_weight(bq, scale_b):
     standard = bq.t().clone(memory_format=torch.contiguous_format).t()
     scale = scale_b.reshape(-1).clone()
     tiled = None
+    bn, bk = (128, 128) if single_shared else (256, 64)
     # This N/K pair did not show a stable packing benefit in paired runs.
     if (
         n >= 2048 and 1024 <= k <= 32768
-        and n % 256 == 0 and k % 64 == 0
+        and n % bn == 0 and k % bk == 0
         and (n, k) != (4608, 3584)
     ):
         tiled = (
             standard.t()
-            .reshape(n // 256, 256, k // 64, 64)
+            .reshape(n // bn, bn, k // bk, bk)
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-    return _PackedMMW8A8Weight(standard, scale, tiled)
+    return _PackedMMW8A8Weight(standard, scale, tiled, single_shared)
 
 
 def _mm_w8a8_int8_packed_prequantized_out(aq, scale_a, weight, *, out):
@@ -1000,6 +1022,18 @@ def _mm_w8a8_int8_packed_prequantized_out(aq, scale_a, weight, *, out):
         or weight.tiled.numel() != n * k
     ):
         raise ValueError("invalid tiled INT8 weight storage")
+    if weight.single_shared:
+        if weight.tiled.shape != (n // 128, k // 128, 128, 128) or k % 128:
+            raise ValueError("invalid single-shared weight layout")
+        with torch_device_fn.device(aq.device):
+            _mm_w8a8_kernel[(triton.cdiv(m, 128) * triton.cdiv(n, 128),)](
+                aq, weight.tiled, scale_a, weight.scale, out, m, n, k,
+                128, 128, 128, True, 1, PACKED_B=True, SINGLE_SHARED=True,
+                num_warps=4, num_stages=2, pipeline="basic", pipeline_load_num=2,
+                single_shared_pipeline=True, single_shared_async=True,
+                enable_fp_fusion=False,
+            )
+        return out
     with torch_device_fn.device(aq.device):
         _mm_w8a8_kernel[(triton.cdiv(m, 256) * triton.cdiv(n, 256),)](
             aq, weight.tiled, scale_a, weight.scale, out, m, n, k,
