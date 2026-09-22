@@ -178,7 +178,7 @@ def _pick_split(m, n, k):
 
 
 def _pick_tiles(m, n, k):
-    if 1024 <= k <= 4096 and ((m >= 4096 and n >= 1024) or (m == 256 and n >= 16384)):
+    if 1024 <= k <= 4096 and ((m >= 4096 and n >= 1024) or (m == 256 and n >= 32768)):
         return (256, 128, 64, 8, 2, "basic", True)
     if m <= 16:
         return (16, 64, 128 if k >= 1024 else 64, 4, 2, "basic", True)
