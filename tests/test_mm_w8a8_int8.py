@@ -467,3 +467,25 @@ def test_mm_w8a8_activation_long_row_fallback():
     assert torch.all(aq == expected)
     peak = torch.tensor([1.0, 1e-10, 1.0], device=a.device)
     torch.testing.assert_close(scale, peak * (1.0 / 127), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "shape", [(4101, 4103, 1025), (193, 512, 1024), (4, 6145, 4096)]
+)
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_mm_w8a8_profiled_tiles_edges(shape, out_dtype):
+    m, n, k = shape
+    a = torch.randint(-127, 128, (m, k), device=flag_gems.device, dtype=torch.int8)
+    b = torch.randint(-127, 128, (n, k), device=a.device, dtype=torch.int8).t()
+    sa = torch.rand(m, device=a.device) * 0.001
+    sb = torch.rand(n, device=a.device) * 0.001
+    out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+    _backend._mm_w8a8_int8_prequantized_out(a, b, sa, sb, out=out)
+    rows = sorted(set([0, min(127, m - 1), min(128, m - 1), min(255, m - 1), m - 1]))
+    cols = sorted(set([0, min(127, n - 1), min(255, n - 1), min(256, n - 1), n - 1]))
+    ref = (
+        (a[rows].cpu().long() @ b[:, cols].cpu().long()).float()
+        * sa[rows].cpu()[:, None]
+        * sb[cols].cpu()[None, :]
+    ).to(out_dtype)
+    torch.testing.assert_close(out[rows][:, cols].cpu(), ref, rtol=0, atol=0)

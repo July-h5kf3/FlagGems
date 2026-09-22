@@ -125,11 +125,31 @@ def _mm_w8a8_kernel(
         sa = tl.load(SA + rm, rm < M, other=0)
         sb = tl.load(SB + rn, rn < N, other=0)
         value = value * sa[:, None] * sb[None, :]
-        tl.store(
-            C + rm[:, None].to(tl.int64) * N + rn[None, :],
-            value,
-            (rm[:, None] < M) & (rn[None, :] < N),
-        )
+        if BM == 256 and BN == 256:
+            # Convert and store half a tile at a time: converting the full
+            # BF16/FP16 tile's MMA layout needs 128 KiB of shared memory.
+            value = value.to(C.dtype.element_ty)
+            top, bottom = tl.split(
+                tl.permute(tl.reshape(value, (2, BM // 2, BN)), (1, 2, 0))
+            )
+            rr = pm * BM + tl.arange(0, BM // 2)
+            tl.store(
+                C + rr[:, None].to(tl.int64) * N + rn[None, :],
+                top,
+                (rr[:, None] < M) & (rn[None, :] < N),
+            )
+            rr += BM // 2
+            tl.store(
+                C + rr[:, None].to(tl.int64) * N + rn[None, :],
+                bottom,
+                (rr[:, None] < M) & (rn[None, :] < N),
+            )
+        else:
+            tl.store(
+                C + rm[:, None].to(tl.int64) * N + rn[None, :],
+                value,
+                (rm[:, None] < M) & (rn[None, :] < N),
+            )
 
 
 @libentry()
@@ -161,6 +181,11 @@ def _reduce_split_kernel(
 
 
 def _pick_split(m, n, k):
+    if n == 512 and 1024 <= k <= 4096:
+        if 64 <= m <= 128:
+            return 4
+        if 128 < m <= 256:
+            return 2
     if 64 <= m <= 128 and k >= 1024 and (1024 <= n < 2048 or n > 8192 or k > 4096):
         return 8 if n <= 8192 else 1
     if 128 < m <= 256 and n >= 1024 and k >= 1024:
@@ -172,12 +197,29 @@ def _pick_split(m, n, k):
         blocks = triton.cdiv(m, bm) * triton.cdiv(n, bn)
         if blocks < 104:
             return min(
-                16, triton.next_power_of_2(triton.cdiv(208, blocks)), max(1, k // 256)
+                16,
+                triton.next_power_of_2(
+                    triton.cdiv(
+                        (
+                            104
+                            if m <= 16 and k <= 4096 and blocks >= 3 * 104 // 4
+                            else 208
+                        ),
+                        blocks,
+                    )
+                ),
+                max(1, k // 256),
             )
     return 1
 
 
 def _pick_tiles(m, n, k):
+    if 128 < m <= 256 and n == 512 and 1024 <= k <= 4096 and k % 128 == 0:
+        return (64, 64, 128, 4, 2, "cpasync-mixed", True)
+    if (m >= 4096 and n >= 2048 and 1024 <= k <= 32768) or (
+        m == 256 and n >= 65536 and 1024 <= k <= 4096
+    ):
+        return (256, 256, 64, 8, 2, "basic", True)
     if 1024 <= k <= 4096 and ((m >= 4096 and n >= 1024) or (m == 256 and n >= 32768)):
         return (256, 128, 64, 8, 2, "basic", True)
     if m <= 16:
@@ -330,6 +372,9 @@ def _validate_mm_inputs(a, b, scale_a, scale_b):
 
 def _launch(a_q, a_scale, b_q, b_scale, out, m, n, k):
     bm, bn, bk, warps, stages, pipeline, use_tle = _pick_tiles(m, n, k)
+    # FP32 output requires more layout-conversion storage per element.
+    if bm == 256 and out.dtype == torch.float32:
+        bm, bn, bk = 128, 128, 128
     splits = _pick_split(m, n, k)
     if splits > 1:
         # Every integer partial must stay below the signed INT32 limit.
