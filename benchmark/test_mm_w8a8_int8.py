@@ -5,6 +5,8 @@
 W8A8_BASELINE=flagtree compares the unchanged MetaX BF16 mm compiled by
 FlagTree; the default is torch.mm BF16. W8A8_SCOPE=full includes fresh
 quantization, while the default prequantized scope matches PR #5972.
+W8A8_PACK_WEIGHT=1 with activation scope also measures an explicit packed-weight
+path and its one-time preparation cost.
 W8A8_SCOPE=activation shares prequantized weights and compares activation
 quantization plus GEMM against the native vLLM-MetaX mctlassEx path. Set
 W8A8_NATIVE_LIBRARY to the vendor _C library providing INT8 quantization.
@@ -184,6 +186,46 @@ class MmW8A8Int8Benchmark(BlasBenchmark):
             if "illegal memory access" in str(error):
                 raise
             record("vllm_metax_int8", error=str(error))
+        if os.environ.get("W8A8_PACK_WEIGHT") == "1":
+            weight = backend._pack_mm_w8a8_int8_weight(bq, sb)
+
+            def packed_call():
+                return backend._mm_w8a8_int8_packed_weight_out(a, weight, out=out)
+            validate(packed_call(), aq, sa)
+            record("flaggems_int8", gems_call)
+
+            def packed_gemm():
+                return backend._mm_w8a8_int8_packed_prequantized_out(
+                    aq, sa, weight, out=out
+                )
+            validate(packed_gemm(), aq, sa)
+            record(
+                "flaggems_int8_gemm",
+                lambda: backend._mm_w8a8_int8_prequantized_out(aq, bq, sa, sb, out=out),
+                scope="prequantized",
+            )
+            record(
+                "flaggems_int8_packed_gemm", packed_gemm, scope="prequantized"
+            )
+            if n % 16 == 0 and k % 16 == 0 and n > 1:
+                def native_gemm():
+                    self.native_handle.mctlass_w8a8_scaled_mm_azp(
+                        aq, bq, native_out, sa.reshape(-1, 1), sb.reshape(1, -1),
+                        None, None, None, torch.cuda.current_stream().cuda_stream,
+                    )
+                    return native_out
+                validate(native_gemm(), aq, sa)
+                record("vllm_metax_int8_gemm", native_gemm, scope="prequantized")
+
+            record(
+                "flaggems_int8_weight_prepare",
+                lambda: backend._pack_mm_w8a8_int8_weight(bq, sb),
+                scope="weight_prepare",
+            )
+            return record(
+                "flaggems_int8_packed", packed_call,
+                extra_tiled_bytes=0 if weight.tiled is None else weight.tiled.numel(),
+            )
         return record("flaggems_int8", gems_call)
 
     def get_latency(self, op, *args, **kwargs):

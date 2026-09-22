@@ -24,6 +24,7 @@ and TLE asynchronous load annotations.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import torch
 import triton
@@ -66,6 +67,7 @@ def _mm_w8a8_kernel(
     BK: tl.constexpr,
     USE_TLE: tl.constexpr,
     SPLIT_K: tl.constexpr = 1,
+    PACKED_B: tl.constexpr = False,
 ):
     pm, pn = _grouped_pids(tl.program_id(0), M, N, BM, BN, 8)
     rm = pm * BM + tl.arange(0, BM)
@@ -85,7 +87,16 @@ def _mm_w8a8_kernel(
     if N * K > 2147483647:
         bn = bn.to(tl.int64)
     pa = A + am[:, None] * K + start + rk[None, :]
-    pb = B + bn[None, :] * K + start + rk[:, None]
+    if PACKED_B:
+        tl.static_assert(BN == 256 and BK == 64 and SPLIT_K == 1)
+        pb = (
+            B
+            + (bn[None, :] // BN) * triton.cdiv(K, BK) * BN * BK
+            + (bn[None, :] % BN) * BK
+            + rk[:, None]
+        )
+    else:
+        pb = B + bn[None, :] * K + start + rk[:, None]
     acc = tl.full((BM, BN), 0, tl.int32)
     if CHUNK > 131071:
         wide = tl.full((BM, BN), 0, tl.int64)
@@ -107,7 +118,7 @@ def _mm_w8a8_kernel(
                 wide += acc.to(tl.int64)
                 acc = tl.full((BM, BN), 0, tl.int32)
         pa += BK
-        pb += BK
+        pb += BN * BK if PACKED_B else BK
     if CHUNK > 131071:
         value = (wide + acc.to(tl.int64)).to(tl.float32)
     else:
@@ -917,3 +928,88 @@ def _mm_w8a8_int8_prepared_weight_out(a, bq, scale_b, *, out):
             return out
     aq, scale_a = _prepare_mm_w8a8_int8_activation(a)
     return _mm_w8a8_int8_prequantized_out(aq, bq, scale_a, scale_b, out=out)
+
+
+@dataclass(frozen=True)
+class _PackedMMW8A8Weight:
+    """Explicit snapshot of static INT8 weights; retains a standard fallback."""
+
+    standard: torch.Tensor
+    scale: torch.Tensor
+    tiled: torch.Tensor | None
+
+
+def _pack_mm_w8a8_int8_weight(bq, scale_b):
+    """Prepare static weights once, outside repeated activation/GEMM calls.
+
+    The tiled path uses an additional INT8 copy. Preparing a new object is
+    required when weights or scales change; no input content is cached.
+    """
+    if not isinstance(bq, torch.Tensor) or not isinstance(scale_b, torch.Tensor):
+        raise TypeError("weight and scale must be tensors")
+    if bq.ndim != 2 or bq.dtype != torch.int8 or bq.device.type != "cuda":
+        raise ValueError("expected MetaX INT8 weight [K,N]")
+    k, n = bq.shape
+    if (
+        scale_b.device != bq.device
+        or scale_b.dtype != torch.float32
+        or scale_b.shape not in ((n,), (1, n))
+        or not scale_b.is_contiguous()
+    ):
+        raise ValueError("expected contiguous FP32 weight scale [N] or [1,N]")
+    standard = bq.t().clone(memory_format=torch.contiguous_format).t()
+    scale = scale_b.reshape(-1).clone()
+    tiled = None
+    # This N/K pair did not show a stable packing benefit in paired runs.
+    if (
+        n >= 2048 and 1024 <= k <= 32768
+        and n % 256 == 0 and k % 64 == 0
+        and (n, k) != (4608, 3584)
+    ):
+        tiled = (
+            standard.t()
+            .reshape(n // 256, 256, k // 64, 64)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+    return _PackedMMW8A8Weight(standard, scale, tiled)
+
+
+def _mm_w8a8_int8_packed_prequantized_out(aq, scale_a, weight, *, out):
+    """Use prequantized activations with an explicitly prepared weight snapshot."""
+    if not isinstance(weight, _PackedMMW8A8Weight):
+        raise TypeError("weight must be prepared by _pack_mm_w8a8_int8_weight")
+    m, n, k = _validate_mm_inputs(aq, weight.standard, scale_a, weight.scale)
+    if out.shape != (m, n) or out.device != aq.device or not out.is_contiguous():
+        raise ValueError("out must be contiguous [M,N] on the input device")
+    if out.dtype not in _SUPPORTED_FLOAT:
+        raise TypeError("out must be BF16, FP16 or FP32")
+    use_tiled = (
+        weight.tiled is not None
+        and m >= 4096
+        and aq.is_contiguous()
+        and out.dtype == torch.bfloat16
+        and _pick_tiles(m, n, k)[:3] == (256, 256, 64)
+    )
+    if not use_tiled:
+        return _run_mm(aq, weight.standard, scale_a, weight.scale, out, m, n, k)
+    if (
+        weight.tiled.device != aq.device
+        or weight.tiled.dtype != torch.int8
+        or not weight.tiled.is_contiguous()
+        or weight.tiled.numel() != n * k
+    ):
+        raise ValueError("invalid tiled INT8 weight storage")
+    with torch_device_fn.device(aq.device):
+        _mm_w8a8_kernel[(triton.cdiv(m, 256) * triton.cdiv(n, 256),)](
+            aq, weight.tiled, scale_a, weight.scale, out, m, n, k,
+            256, 256, 64, True, 1, PACKED_B=True,
+            num_warps=8, num_stages=2, pipeline="basic", enable_fp_fusion=False,
+        )
+    return out
+
+
+def _mm_w8a8_int8_packed_weight_out(a, weight, *, out):
+    """Quantize current activations on every call, including graph replay."""
+    aq, scale_a = _prepare_mm_w8a8_int8_activation(a)
+    return _mm_w8a8_int8_packed_prequantized_out(aq, scale_a, weight, out=out)

@@ -490,3 +490,70 @@ def test_mm_w8a8_profiled_tiles_edges(shape, out_dtype):
         * sb[cols].cpu()[None, :]
     ).to(out_dtype)
     torch.testing.assert_close(out[rows][:, cols].cpu(), ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(flag_gems.vendor_name != "metax", reason="MetaX weight layout")
+@pytest.mark.parametrize("shape,dtype", [
+    ((4096, 2048, 1024), torch.bfloat16),
+    ((4101, 2048, 1024), torch.bfloat16),
+    ((4096, 4608, 3584), torch.bfloat16),
+    ((64, 2048, 1024), torch.bfloat16),
+    ((64, 2048, 1024), torch.float16),
+    ((64, 2048, 1024), torch.float32),
+    ((37, 269, 77), torch.bfloat16),
+])
+def test_mm_w8a8_packed_weight(shape, dtype):
+    m, n, k = shape
+    aq = torch.randint(-128, 128, (m, k), device=flag_gems.device, dtype=torch.int8)
+    bq = torch.randint(-128, 128, (n, k), device=aq.device, dtype=torch.int8).t()
+    sa = torch.rand(m, device=aq.device) * 0.001
+    sb = torch.rand(n, device=aq.device) * 0.001
+    weight = _backend._pack_mm_w8a8_int8_weight(bq, sb)
+    if (n, k) == (4608, 3584):
+        assert weight.tiled is None
+    expected = torch.empty((m, n), device=aq.device, dtype=dtype)
+    _backend._mm_w8a8_int8_prequantized_out(aq, bq, sa, sb, out=expected)
+    # Preparation owns a snapshot: later source changes cannot corrupt it.
+    bq.zero_()
+    sb.zero_()
+    out = torch.empty_like(expected)
+    _backend._mm_w8a8_int8_packed_prequantized_out(aq, sa, weight, out=out)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    rr, cc = [0, m - 1], [0, n - 1]
+    ref = ((aq[rr].cpu().long() @ weight.standard[:, cc].cpu().long()).float()
+           * sa[rr].cpu()[:, None] * weight.scale[cc].cpu()[None, :]).to(dtype)
+    torch.testing.assert_close(out[rr][:, cc].cpu(), ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(flag_gems.vendor_name != "metax", reason="MetaX weight layout")
+def test_mm_w8a8_packed_graph_updates():
+    a = torch.randn((4096, 1024), device=flag_gems.device, dtype=torch.bfloat16)
+    bq = torch.randint(-127, 128, (2048, 1024), device=a.device, dtype=torch.int8).t()
+    sb = torch.full((2048,), 0.001, device=a.device)
+    weight = _backend._pack_mm_w8a8_int8_weight(bq, sb)
+    out = torch.empty((4096, 2048), device=a.device, dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            _backend._mm_w8a8_int8_packed_weight_out(a, weight, out=out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _backend._mm_w8a8_int8_packed_weight_out(a, weight, out=out)
+    expected = torch.empty_like(out)
+    for value in (0.0, 0.5):
+        a.fill_(value)
+        graph.replay()
+        _backend._mm_w8a8_int8_prepared_weight_out(a, bq, sb, out=expected)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(flag_gems.vendor_name != "metax", reason="MetaX weight layout")
+def test_mm_w8a8_packed_weight_rejects_invalid():
+    b = torch.zeros((128, 256), device=flag_gems.device, dtype=torch.int8)
+    scale = torch.ones(256, device=b.device)
+    with pytest.raises(ValueError):
+        _backend._pack_mm_w8a8_int8_weight(b.float(), scale)
+    with pytest.raises(ValueError):
+        _backend._pack_mm_w8a8_int8_weight(b, scale[:128])
