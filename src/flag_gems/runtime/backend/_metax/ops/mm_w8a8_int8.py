@@ -214,6 +214,10 @@ def _pick_split(m, n, k):
 
 
 def _pick_tiles(m, n, k):
+    # On C550's 104 SMs, this range fits one wave of 256x256 tiles
+    # while 128x128 tiles need at least three waves.
+    if m == 256 and 104 * 128 < n <= 104 * 256 and 1024 <= k <= 4096:
+        return (256, 256, 64, 8, 2, "basic", True)
     if 128 < m <= 256 and n == 512 and 1024 <= k <= 4096 and k % 128 == 0:
         return (64, 64, 128, 4, 2, "cpasync-mixed", True)
     if (m >= 4096 and n >= 2048 and 1024 <= k <= 32768) or (

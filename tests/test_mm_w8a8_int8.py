@@ -470,7 +470,8 @@ def test_mm_w8a8_activation_long_row_fallback():
 
 
 @pytest.mark.parametrize(
-    "shape", [(4101, 4103, 1025), (193, 512, 1024), (4, 6145, 4096)]
+    "shape",
+    [(4101, 4103, 1025), (193, 512, 1024), (4, 6145, 4096), (256, 13569, 1025)],
 )
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_mm_w8a8_profiled_tiles_edges(shape, out_dtype):
