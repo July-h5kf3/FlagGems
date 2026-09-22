@@ -390,3 +390,27 @@ def test_mm_w8a8_int8_strided_quantization(k):
     torch.testing.assert_close(
         actual.cpu(), _floating_int8_reference(a, b, a.dtype), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("k", [128, 4096, 18944])
+def test_mm_w8a8_int8_prepared_weight_replay(k):
+    a = torch.randn((4, k), device=flag_gems.device, dtype=torch.bfloat16)
+    b = torch.randn((k, 64), device=a.device, dtype=a.dtype)
+    _, bq, _, sb = _backend._prepare_mm_w8a8_int8_inputs(a, b)
+    out = torch.empty((4, 64), device=a.device, dtype=a.dtype)
+
+    def call():
+        aq, sa = _backend._prepare_mm_w8a8_int8_activation(a)
+        return _mm_w8a8_int8_prequantized_out(aq, bq, sa, sb, out=out)
+
+    for _ in range(2):
+        call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for _ in range(2):
+        a.normal_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.cpu(), _floating_int8_reference(a, b, a.dtype), rtol=0, atol=0
+        )

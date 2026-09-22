@@ -655,3 +655,48 @@ def mm_w8a8_int8_out(a, b, *, out):
     """Write floating-input INT8 GEMM into a contiguous caller-owned output."""
     logger.debug("GEMS MM_W8A8_INT8_OUT")
     return _mm_w8a8_int8_prequantized_out(*_prepare_mm_w8a8_int8_inputs(a, b), out=out)
+
+
+def _prepare_mm_w8a8_int8_activation(a):
+    """Quantize current activations when INT8 weights are already available."""
+    if a.ndim != 2 or a.dtype not in _SUPPORTED_FLOAT or a.device.type != "cuda":
+        raise ValueError("expected a floating MetaX activation matrix")
+    a = a.contiguous()
+    m, k = a.shape
+    q = torch.empty_like(a, dtype=torch.int8)
+    scale = torch.empty(m, device=a.device, dtype=torch.float32)
+    if m == 0 or k == 0:
+        scale.fill_(1)
+        return q, scale
+    with torch_device_fn.device(a.device):
+        if k <= 16384:
+            _quantize_rows_kernel[(m,)](
+                a,
+                q,
+                scale,
+                m,
+                k,
+                k,
+                1,
+                1,
+                triton.next_power_of_2(k),
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
+        else:
+            peak = a.float().abs().amax(dim=1).clamp_min(1e-10)
+            torch.mul(peak, 1.0 / 127.0, out=scale)
+            _quantize_mm_input_kernel[(triton.cdiv(a.numel(), 1024),)](
+                a,
+                peak,
+                q,
+                m,
+                k,
+                k,
+                1,
+                True,
+                False,
+                BLOCK=1024,
+                enable_fp_fusion=False,
+            )
+    return q, scale
