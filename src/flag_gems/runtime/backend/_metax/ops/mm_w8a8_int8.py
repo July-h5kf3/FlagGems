@@ -752,7 +752,8 @@ def _prepare_mm_w8a8_int8_activation(a):
         scale.fill_(1)
         return q, scale
     with torch_device_fn.device(a.device):
-        if k <= 16384:
+        # Bound per-thread live values to avoid spilling a 16K row.
+        if k <= 8192:
             _activation_rows_kernel[(m,)](
                 a,
                 q,

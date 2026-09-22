@@ -392,7 +392,7 @@ def test_mm_w8a8_int8_strided_quantization(k):
     )
 
 
-@pytest.mark.parametrize("k", [128, 4096, 18944])
+@pytest.mark.parametrize("k", [128, 4096, 14336, 18944])
 @pytest.mark.parametrize("m", [1, 4])
 def test_mm_w8a8_int8_prepared_weight_replay(k, m):
     a = torch.randn((m, k), device=flag_gems.device, dtype=torch.bfloat16)
@@ -441,7 +441,7 @@ def test_mm_w8a8_activation_mantissa_boundaries(dtype, bits, exponents):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("k", [4096, 18944])
+@pytest.mark.parametrize("k", [4096, 8192, 8193, 14336, 16384, 18944])
 def test_mm_w8a8_activation_extreme_peaks(dtype, k):
     # Include clamped peaks, signed values, and FP32/BF16 fallback ranges.
     factors = [0.0, 1e-20, 1e-10, 1.0, 1000.0]
