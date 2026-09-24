@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from importlib import import_module
+
 import pytest
 import torch
 
@@ -393,7 +395,26 @@ def _run_ascend(q, s, k, group_size, largest):
     _check_ascend(q, s, k, group_size, largest, *result)
 
 
+def _ascend_custom_ops_available():
+    # ascend-cann900 CI pins flagtree==0.6.1+ascend3.5, which has no
+    # dsa.ascend.custom_ops. Those primitives ship in a later FlagTree.
+    if flag_gems.device != "npu":
+        return False
+    try:
+        import_module("triton.experimental.tle.language.dsa.ascend.custom_ops")
+    except ModuleNotFoundError:
+        return False
+    return True
+
+
+_requires_ascend_custom_ops = pytest.mark.skipif(
+    flag_gems.device == "npu" and not _ascend_custom_ops_available(),
+    reason="FlagTree build has no Ascend custom_ops",
+)
+
+
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@_requires_ascend_custom_ops
 @pytest.mark.topk_w8a16_fp8
 @pytest.mark.parametrize("shape,k", CASES)
 @pytest.mark.parametrize("largest", [True, False])
@@ -408,6 +429,7 @@ def test_topk_fp8_ascend(shape, k, largest, row_scale):
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@_requires_ascend_custom_ops
 @pytest.mark.topk_w8a16_fp8
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("largest", [True, False])
@@ -431,6 +453,7 @@ def test_topk_fp8_edges_ascend(dtype, largest, kind):
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@_requires_ascend_custom_ops
 @pytest.mark.topk_w8a16_fp8
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("largest", [True, False])
@@ -446,6 +469,7 @@ def test_topk_fp8_maximum_row_ascend(dtype, largest):
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@_requires_ascend_custom_ops
 @pytest.mark.topk_w8a16_fp8
 @pytest.mark.parametrize(
     "dtype,max_code", [(torch.float8_e4m3fn, 126), (torch.float8_e5m2, 123)]
@@ -462,6 +486,7 @@ def test_topk_fp8_all_finite_encodings_ascend(dtype, max_code, largest):
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@_requires_ascend_custom_ops
 @pytest.mark.topk_w8a16_fp8
 def test_topk_fp8_graph_replay_changed_inputs_ascend():
     torch.manual_seed(811)
@@ -488,6 +513,7 @@ def test_topk_fp8_graph_replay_changed_inputs_ascend():
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@_requires_ascend_custom_ops
 @pytest.mark.topk_w8a16_fp8
 def test_topk_fp8_large_cutoff_ties_and_zero_scale_ascend():
     q = torch.ones((64, 4096)).to(torch.float8_e4m3fn)
@@ -497,6 +523,7 @@ def test_topk_fp8_large_cutoff_ties_and_zero_scale_ascend():
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@_requires_ascend_custom_ops
 @pytest.mark.topk_w8a16_fp8
 def test_topk_fp8_unaligned_storage_and_current_stream_ascend():
     torch.manual_seed(953)
