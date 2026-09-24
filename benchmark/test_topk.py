@@ -120,6 +120,7 @@ def test_topk():
         # DSA topk has no dim/largest args and is called directly (base.py
         # skips use_gems when gems_op is given); torch.topk(x, k) defaults to
         # last-dim largest=True on both sides.
+        pytest.importorskip("triton.experimental.tle.language.dsa.ascend.custom_ops")
         bench = TopKAscendBenchmark(
             op_name="topk",
             input_fn=_ascend_input_fn,
@@ -219,6 +220,7 @@ class TopKFp8Benchmark(base.Benchmark):
 def test_topk_w8a16_fp8_npugraph(monkeypatch):
     if flag_gems.device != "npu":
         pytest.skip("Ascend only")
+    pytest.importorskip("triton.experimental.tle.language.dsa.ascend.custom_ops")
     # This dedicated test always uses actual NPU Graph. Keep its report label
     # local so other benchmarks and their global CLI modes are unchanged.
     monkeypatch.setattr(Config, "mode", _TopKGraphMode.NPUGRAPH)
