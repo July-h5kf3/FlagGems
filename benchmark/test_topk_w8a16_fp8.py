@@ -184,7 +184,8 @@ class AscendGraphMode(Enum):
 
 @pytest.mark.topk_w8a16_fp8
 @pytest.mark.skipif(
-    flag_gems.vendor_name not in ("ascend", "thead", "hygon", "mthreads", "nvidia"),
+    flag_gems.vendor_name
+    not in ("ascend", "thead", "hygon", "mthreads", "nvidia", "metax"),
     reason="topk_w8a16_fp8 requires an implemented backend",
 )
 @pytest.mark.skipif(not _fp8_available(), reason="required FP8 format is unavailable")
