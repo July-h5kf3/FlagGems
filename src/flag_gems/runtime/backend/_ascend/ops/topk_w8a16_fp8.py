@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import operator
 from functools import lru_cache
 from importlib import import_module
 
@@ -379,30 +381,61 @@ def _row_select(
             tl.store(Indices + row * K + above + kk, equal_ids, above + kk < K)
 
 
-def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=128):
+def topk_w8a16_fp8(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    k: int,
+    dim: int = -1,
+    largest: bool = True,
+    sorted: bool = True,
+    group_size: int = 128,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Last-dimension TopK of finite FP8 values and row/group scales.
 
-    Values are selected in FP32 and returned as BF16 with int64 indices.
+    Values are selected in FP32 and returned in out_dtype with int64 indices.
     """
-    assert dim in (-1, x.ndim - 1)
-    assert x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    assert x.is_contiguous() and x_scale.is_contiguous()
-    assert x_scale.device == x.device and x_scale.dtype in (
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
+    if not isinstance(x_fp8, torch.Tensor) or not isinstance(x_scale, torch.Tensor):
+        raise TypeError("x_fp8 and x_scale must be tensors")
+    if x_fp8.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise TypeError("x_fp8 must have dtype float8_e4m3fn or float8_e5m2")
+    if out_dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("out_dtype must be float16 or bfloat16")
+    if x_scale.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("x_scale must be float16, bfloat16 or float32")
+    if x_fp8.device.type != "npu" or x_scale.device != x_fp8.device:
+        raise ValueError("inputs must be on the same Ascend NPU device")
+    if x_fp8.ndim == 0:
+        raise ValueError("x_fp8 must have at least one dimension")
+    dim, k, group_size = (
+        operator.index(dim),
+        operator.index(k),
+        operator.index(group_size),
     )
-    n = x.shape[-1]
-    m = x.numel() // n
+    if dim not in (-1, x_fp8.ndim - 1):
+        raise ValueError("only the last dimension is supported")
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
+    n = x_fp8.shape[-1]
+    if not 0 <= k <= n:
+        raise ValueError("k must satisfy 0 <= k <= N")
+    if n >= 2147483647:
+        raise ValueError("N must be smaller than 2**31-1")
+    m = math.prod(x_fp8.shape[:-1])
     ng = triton.cdiv(n, group_size)
-    assert 0 <= k <= n and x_scale.numel() == m * ng
-    out = torch.empty(x.shape[:-1] + (k,), dtype=torch.bfloat16, device=x.device)
+    if x_scale.shape != x_fp8.shape[:-1] + (ng,):
+        raise ValueError(
+            "x_scale shape must match the leading dimensions and ceil(N/group_size)"
+        )
+    out = torch.empty(x_fp8.shape[:-1] + (k,), dtype=out_dtype, device=x_fp8.device)
     indices = torch.empty_like(out, dtype=torch.int64)
     if k == 0 or m == 0:
         return out, indices
-    with torch_device_fn.device(x.device):
+    with torch_device_fn.device(x_fp8.device):
         _prepare()
-        e5 = x.dtype == torch.float8_e5m2
+        e5 = x_fp8.dtype == torch.float8_e5m2
+        x = x_fp8.contiguous()
+        scales = x_scale.contiguous()
         q = x.view(torch.uint8)
         cores = min(CORE_NUM, m)
         if (
@@ -417,7 +450,7 @@ def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=
             _row_select[(cores,)](
                 q,
                 _indices(n, x.device),
-                x_scale,
+                scales,
                 values,
                 ids,
                 n,
@@ -430,7 +463,7 @@ def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=
             _row_finish[(cores,)](
                 values,
                 ids,
-                x_scale,
+                scales,
                 out,
                 indices,
                 k,
@@ -442,10 +475,16 @@ def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=
                 multibuffer=False,
             )
         else:
-            block = min(2048, max(32, triton.next_power_of_2(n)))
+            block = min(
+                4096,
+                max(
+                    32, min(2048, triton.next_power_of_2(n)), triton.next_power_of_2(k)
+                ),
+            )
             parts = triton.cdiv(n, block)
             merged = triton.next_power_of_2(parts * k)
-            assert k <= block and merged <= 4096
+            if k > block or merged > 4096:
+                raise ValueError("K and N exceed the supported Ascend sort capacity")
             values = (
                 out
                 if parts == 1
@@ -459,7 +498,7 @@ def topk_w8a16_fp8(x, x_scale, k, dim=-1, largest=True, sorted=True, group_size=
             grid = min(CORE_NUM, m * parts)
             _stage1[(grid,)](
                 q,
-                x_scale,
+                scales,
                 values,
                 ids,
                 n,

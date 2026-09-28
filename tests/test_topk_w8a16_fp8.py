@@ -193,23 +193,35 @@ def _cpu_dequant(q, scale, group_size, out_dtype):
 
 
 def _check_topk(
-    q, scale, k, group_size=128, out_dtype=torch.bfloat16, largest=True, sorted=True
+    q,
+    scale,
+    k,
+    group_size=128,
+    out_dtype=torch.bfloat16,
+    largest=True,
+    sorted=True,
+    result=None,
 ):
-    ref = _cpu_dequant(q, scale, group_size, out_dtype)
-    values, indices = flag_gems.topk_w8a16_fp8(
-        q,
-        scale,
-        k,
-        group_size=group_size,
-        out_dtype=out_dtype,
-        largest=largest,
-        sorted=sorted,
-    )
-    expected = torch.topk(ref, k, largest=largest, sorted=True).values
+    # Ascend selects FP32 values before converting its output to A16.
+    reference_dtype = torch.float32 if flag_gems.device == "npu" else out_dtype
+    ref = _cpu_dequant(q, scale, group_size, reference_dtype)
+    if result is None:
+        values, indices = flag_gems.topk_w8a16_fp8(
+            q,
+            scale,
+            k,
+            group_size=group_size,
+            out_dtype=out_dtype,
+            largest=largest,
+            sorted=sorted,
+        )
+    else:
+        values, indices = result
+    expected = torch.topk(ref, k, largest=largest, sorted=True).values.to(out_dtype)
     torch.testing.assert_close(values.cpu(), expected, rtol=0, atol=0, equal_nan=True)
     assert indices.dtype == torch.int64
     torch.testing.assert_close(
-        torch.gather(ref, -1, indices.cpu()),
+        torch.gather(ref, -1, indices.cpu()).to(out_dtype),
         values.cpu(),
         rtol=0,
         atol=0,
@@ -254,7 +266,10 @@ def test_topk_fp8_all_encodings(fp8_dtype, largest, k):
     _check_topk(q, scale, k, largest=largest)
 
 
-@E4M3_ONLY
+@pytest.mark.skipif(
+    flag_gems.vendor_name not in ("ascend", "hygon", "mthreads"),
+    reason="E4M3FN empty inputs require Ascend, Hygon or Moore Threads",
+)
 @pytest.mark.topk_w8a16_fp8
 @pytest.mark.parametrize("shape,k", [((0, 128), 3), ((3, 0), 0), ((2, 128), 0)])
 def test_topk_fp8_empty(shape, k):
@@ -307,10 +322,20 @@ def test_topk_fp8_strides_graph_and_ties():
             )
 
 
-@E4M3_ONLY
+@pytest.mark.skipif(
+    flag_gems.vendor_name not in ("ascend", "hygon", "mthreads"),
+    reason="E4M3FN validation requires Ascend, Hygon or Moore Threads",
+)
 @pytest.mark.topk_w8a16_fp8
 def test_topk_fp8_validation():
-    q = torch.zeros((2, 128), device=flag_gems.device).to(torch.float8_e4m3fn)
+    if flag_gems.device == "npu":
+        q = torch.zeros((2, 128), device="npu", dtype=torch.uint8).view(
+            torch.float8_e4m3fn
+        )
+        e5 = q.view(torch.float8_e5m2)
+    else:
+        q = torch.zeros((2, 128), device=flag_gems.device).to(torch.float8_e4m3fn)
+        e5 = q.float().to(torch.float8_e5m2)
     s = torch.ones((2, 1), device=q.device)
     for kwargs in (
         {"k": -1},
@@ -322,10 +347,15 @@ def test_topk_fp8_validation():
             flag_gems.topk_w8a16_fp8(q, s, **kwargs)
     with pytest.raises(ValueError):
         flag_gems.topk_w8a16_fp8(q, s.expand(2, 2), 1)
+    with pytest.raises(ValueError):
+        flag_gems.topk_w8a16_fp8(q, s.reshape(1, 2), 1)
     with pytest.raises(TypeError):
-        flag_gems.topk_w8a16_fp8(q.float(), s, 1)
-    with pytest.raises(TypeError, match="float8_e4m3fn"):
-        flag_gems.topk_w8a16_fp8(q.float().to(torch.float8_e5m2), s, 1)
+        flag_gems.topk_w8a16_fp8(torch.zeros((2, 128), device=q.device), s, 1)
+    if flag_gems.device == "npu":
+        flag_gems.topk_w8a16_fp8(e5, s, 1)
+    else:
+        with pytest.raises(TypeError, match="float8_e4m3fn"):
+            flag_gems.topk_w8a16_fp8(e5, s, 1)
     with pytest.raises(TypeError):
         flag_gems.topk_w8a16_fp8(q, s, 1, out_dtype=torch.float32)
     with pytest.raises(ValueError):
@@ -371,26 +401,8 @@ CASES = [
 ]
 
 
-def _check_ascend(q, s, k, group_size, largest, values, indices):
-    n = q.shape[-1]
-    ref = q.float() * s.float().repeat_interleave(group_size, -1)[..., :n]
-    values, indices = values.cpu(), indices.cpu()
-    torch.testing.assert_close(
-        values, torch.topk(ref, k, largest=largest).values.bfloat16(), rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        values, torch.gather(ref, -1, indices).bfloat16(), rtol=0, atol=0
-    )
-    assert indices.dtype == torch.int64
-    ordered = torch.sort(indices).values
-    assert (ordered[..., 1:] != ordered[..., :-1]).all()
-
-
 def _run_ascend(q, s, k, group_size, largest):
-    result = flag_gems.topk_w8a16_fp8(
-        q.npu(), s.npu(), k, group_size=group_size, largest=largest
-    )
-    _check_ascend(q, s, k, group_size, largest, *result)
+    _check_topk(q.npu(), s.npu(), k, group_size=group_size, largest=largest)
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
@@ -484,7 +496,7 @@ def test_topk_fp8_graph_replay_changed_inputs_ascend():
             s.copy_(s_cpu.npu())
         graph.replay()
         torch.npu.synchronize()
-        _check_ascend(q_cpu, s_cpu, 64, 4096, True, values, indices)
+        _check_topk(q_cpu, s_cpu, 64, 4096, largest=True, result=(values, indices))
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
@@ -514,5 +526,37 @@ def test_topk_fp8_unaligned_storage_and_current_stream_ascend():
         with torch.npu.stream(stream):
             values, indices = flag_gems.topk_w8a16_fp8(q, s, 64, group_size=4096)
         stream.synchronize()
-        _check_ascend(q_cpu, s_cpu, 64, 4096, True, values, indices)
+        _check_topk(q_cpu, s_cpu, 64, 4096, largest=True, result=(values, indices))
         q_cpu = (-torch.randn(q_cpu.shape)).to(torch.float8_e4m3fn)
+
+
+@pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@pytest.mark.topk_w8a16_fp8
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_topk_fp8_large_k_ascend(dtype):
+    q = torch.arange(4096, dtype=torch.int32).remainder(120).to(torch.uint8)
+    _run_ascend(
+        q.view(dtype).reshape(1, 4096),
+        torch.ones((1, 1), dtype=torch.bfloat16),
+        4096,
+        4096,
+        True,
+    )
+
+
+@pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@pytest.mark.topk_w8a16_fp8
+def test_topk_fp8_over_sort_capacity_ascend():
+    q = torch.zeros((1, 8192), dtype=torch.uint8).view(torch.float8_e4m3fn).npu()
+    s = torch.ones((1, 1), dtype=torch.bfloat16, device=q.device)
+    with pytest.raises(ValueError, match="sort capacity"):
+        flag_gems.topk_w8a16_fp8(q, s, 4096, group_size=8192)
+
+
+@pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
+@pytest.mark.topk_w8a16_fp8
+def test_topk_fp8_output_dtype_and_strides_ascend():
+    raw = torch.arange(4 * 256, device="npu", dtype=torch.int32).remainder(120).byte()
+    q = raw.reshape(4, 256)[::2, ::2].view(torch.float8_e4m3fn)
+    s = torch.ones((4, 4), device="npu", dtype=torch.float16)[::2, ::2]
+    _check_topk(q, s, 17, out_dtype=torch.float16, sorted=False)
