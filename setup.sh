@@ -40,8 +40,9 @@ export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-120}"
 # triton.Config). We check both: every recorded file exists, and the package
 # imports with its real API surface.
 verify_triton_install() {
-  python - <<'PY'
+  BACKEND="${BACKEND}" COMPILER="${COMPILER}" FLAGTREE_PKGS="${FLAGTREE_PKGS}" python - <<'PY'
 import importlib.metadata as md
+import os
 import site
 import sys
 
@@ -85,6 +86,13 @@ import triton
 if triton.__file__ is None or not hasattr(triton, "Config"):
     print(f"triton import incomplete (__file__={triton.__file__})")
     sys.exit(1)
+
+if os.environ["BACKEND"] == "ascend-cann900" and os.environ["COMPILER"] == "flagtree":
+    expected = os.environ["FLAGTREE_PKGS"].split("==", 1)[1]
+    if dist.metadata["Name"].lower() != "flagtree" or dist.version != expected:
+        print(f"expected FlagTree {expected}, found {dist.metadata['Name']} {dist.version}")
+        sys.exit(1)
+    import triton.experimental.tle.language.dsa.ascend.custom_ops  # noqa: F401
 
 print("triton install verified OK")
 PY
@@ -255,6 +263,11 @@ if [ "${ENABLE_CPP:-0}" = "1" ]; then
   ok
 fi
 
+# ── Install test dependencies ─────────────────────────────────
+printf "Installing test dependencies ..."
+uv pip install -q ".[test]" --index "${MIRROR}" || fail
+ok
+
 # ── Compiler selection ───────────────────────────────────────
 # COMPILER controls which Triton-compatible compiler to use:
 #   COMPILER=flagtree → use FlagTree (error if unavailable)
@@ -328,11 +341,6 @@ if [ -n "${TRITON_POST_INSTALL}" ] && [ "${COMPILER}" = "triton" ]; then
     ok
   done
 fi
-
-# ── Install test dependencies ─────────────────────────────────
-printf "Installing test dependencies ..."
-uv pip install -q ".[test]" --index "${MIRROR}" || fail
-ok
 
 # ── Write env into .venv/bin/activate ────────────────────────
 # So that `source .venv/bin/activate` sets up the full environment.
