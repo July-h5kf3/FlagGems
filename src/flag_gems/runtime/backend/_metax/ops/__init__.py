@@ -53,6 +53,7 @@ from .linalg_solve_triangular import (
     linalg_solve_triangular_out,
 )
 from .linalg_svdvals import linalg_svdvals
+from .linear import linear
 from .log_normal_ import log_normal_
 from .log_sigmoid_forward import log_sigmoid_forward
 from .log_softmax import log_softmax, log_softmax_backward
@@ -199,6 +200,7 @@ __all__ = [
     "linalg_solve_triangular",
     "linalg_solve_triangular_out",
     "linalg_svdvals",
+    "linear",
     "log_normal_",
     "log_sigmoid_forward",
     "log_softmax",
