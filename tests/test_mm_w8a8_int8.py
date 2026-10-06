@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 
 import flag_gems
+from flag_gems.runtime import torch_device_fn
 
 from .accuracy_utils import gems_assert_equal
 
@@ -66,10 +69,13 @@ def test_mm_w8a8_int8(shape, dtype):
     torch.testing.assert_close(out, y, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
+@pytest.mark.skipif(
+    flag_gems.vendor_name not in ("thead", "ascend"), reason="INT8 strided matrices"
+)
 @pytest.mark.parametrize("layout", ["row_major", "sliced", "broadcast"])
 @pytest.mark.mm_w8a8_int8
 def test_mm_w8a8_int8_strides(layout):
+    torch.manual_seed(0)
     m, n, k = 17, 35, 67
     a = torch.randint(-10, 11, (m, k), device=flag_gems.device, dtype=torch.int8)
     b = torch.randint(-10, 11, (k, n), device=a.device, dtype=torch.int8)
@@ -215,9 +221,12 @@ def test_scaled_bias(shape, out_dtype, scales):
     torch.testing.assert_close(out, y, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
+@pytest.mark.skipif(
+    flag_gems.vendor_name not in ("thead", "ascend"), reason="INT8 default output dtype"
+)
 @pytest.mark.parametrize("shape", [(2, 3, 0), (0, 3, 8), (2, 0, 8), (0, 0, 0)])
 def test_scaled_empty_bias(shape):
+    torch.manual_seed(0)
     m, n, k = shape
     a = torch.empty(m, k, device=flag_gems.device, dtype=torch.int8)
     b = torch.empty(k, n, device=a.device, dtype=torch.int8)
@@ -322,11 +331,14 @@ def test_scaled_validation(invalid):
         flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias)
 
 
-@pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
+@pytest.mark.skipif(
+    flag_gems.vendor_name not in ("thead", "ascend"), reason="INT8 default output dtype"
+)
 @pytest.mark.parametrize(
     "shape", [(1, 17, 32), (3, 35, 128), (17, 35, 67), (3, 17, 33001)]
 )
 def test_tensor_scales_without_bias(shape):
+    torch.manual_seed(0)
     m, n, k = shape
     a = torch.randint(-128, 128, (m, k), device=flag_gems.device, dtype=torch.int8)
     b = torch.randint(-128, 128, (n, k), device=a.device, dtype=torch.int8).t()
@@ -350,6 +362,7 @@ def test_scaled_unaligned_weight():
 
 
 def inputs(m, n, k, scalar=False, layout=False):
+    torch.manual_seed(0)
     a = torch.randint(-128, 128, (m, k), device=flag_gems.device, dtype=torch.int8)
     b = torch.randint(-128, 128, (n, k), device=flag_gems.device, dtype=torch.int8).t()
     if layout:
@@ -368,7 +381,7 @@ def reference(a, b, sa, sb, bias=None, dtype=torch.float32):
     return value.to(dtype)
 
 
-_PREQUANTIZED = ("hygon", "metax")
+_PREQUANTIZED = ("hygon", "metax", "ascend")
 
 
 @pytest.mark.skipif(
@@ -415,7 +428,9 @@ def test_prequantized(shape, dtype, scalar, bias_on, layout):
     gems_assert_equal(out.cpu(), expected)
 
 
-@pytest.mark.skipif(flag_gems.vendor_name != "hygon", reason="hygon only")
+@pytest.mark.skipif(
+    flag_gems.vendor_name not in ("hygon", "ascend"), reason="INT8 long-K accumulation"
+)
 @pytest.mark.parametrize("code", [-128, 127])
 def test_long_k_overflow(code):
     a, b, sa, sb = inputs(2, 3, 262145)
@@ -425,6 +440,17 @@ def test_long_k_overflow(code):
     sb.fill_(1)
     y = flag_gems.mm_w8a8_int8(a, b, sa, sb, torch.float32)
     gems_assert_equal(y.cpu(), reference(a, b, sa, sb))
+
+
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend long-K reduction")
+def test_long_k_cancellation():
+    a = torch.full((1, 131072), 127, device=flag_gems.device, dtype=torch.int8)
+    b = torch.full((131072, 1), -127, device=a.device, dtype=torch.int8)
+    b[:65536].fill_(127)
+    b[0, 0] = 126
+    scale = torch.ones(1, device=a.device)
+    y = flag_gems.mm_w8a8_int8(a, b, scale, scale, torch.float32)
+    gems_assert_equal(y.cpu(), reference(a, b, scale, scale))
 
 
 @pytest.mark.skipif(
@@ -443,15 +469,41 @@ def test_mixed_scales(a_scalar, b_scalar):
 @pytest.mark.skipif(
     flag_gems.vendor_name not in _PREQUANTIZED, reason="prequantized W8A8 INT8 only"
 )
-def test_graph_updates():
-    a, b, sa, sb = inputs(17, 13, 31)
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (17, 13, 31),
+        pytest.param(
+            (1, 16, 16),
+            marks=pytest.mark.skipif(
+                flag_gems.vendor_name != "ascend", reason="Ascend tiny kernel"
+            ),
+        ),
+        pytest.param(
+            (2048, 2048, 2048),
+            marks=pytest.mark.skipif(
+                flag_gems.vendor_name != "ascend", reason="Ascend mixed kernel"
+            ),
+        ),
+    ],
+)
+def test_graph_updates(shape):
+    m, n, k = shape
+    a, b, sa, sb = inputs(m, n, k)
     dtype = torch.bfloat16 if flag_gems.vendor_name == "metax" else torch.float32
-    bias = torch.randn(13, device=flag_gems.device, dtype=dtype)
-    out = torch.empty((17, 13), device=flag_gems.device, dtype=dtype)
+    bias = torch.randn(n, device=flag_gems.device, dtype=dtype)
+    initial = flag_gems.mm_w8a8_int8(a, b, sa, sb, dtype, bias)
+    _assert_reference(a, b, sa, sb, initial, bias)
+    out = torch.empty((m, n), device=flag_gems.device, dtype=dtype)
     for _ in range(3):
-        flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+        assert flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias) is out
+    graph_type = (
+        torch_device_fn.NPUGraph
+        if flag_gems.vendor_name == "ascend"
+        else torch_device_fn.CUDAGraph
+    )
+    graph = graph_type()
+    with torch_device_fn.graph(graph):
         flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias)
     a.fill_(-128)
     b.fill_(127)
@@ -459,7 +511,10 @@ def test_graph_updates():
     sb.mul_(3)
     bias.add_(1)
     graph.replay()
-    gems_assert_equal(out.cpu(), reference(a, b, sa, sb, bias, dtype))
+    if m * n * k > 1000000:
+        _assert_reference(a, b, sa, sb, out, bias)
+    else:
+        gems_assert_equal(out.cpu(), reference(a, b, sa, sb, bias, dtype))
 
 
 @pytest.mark.skipif(
@@ -482,11 +537,19 @@ def test_graph_updates():
         "out_shape",
         "out_stride",
         "alias",
+        pytest.param(
+            "overlap",
+            marks=pytest.mark.skipif(
+                flag_gems.vendor_name != "ascend", reason="Ascend strided output"
+            ),
+        ),
     ],
 )
 def test_invalid(bad):
     if flag_gems.vendor_name == "metax" and bad in ("scale_stride", "alias"):
         pytest.skip("MetaX copies strided scales and does not reject aliased out")
+    if flag_gems.vendor_name == "ascend" and bad in ("scale_stride", "out_stride"):
+        pytest.skip("Ascend accepts strided scales and 2D output")
     a, b, sa, sb = inputs(3, 5, 7)
     bias = None
     out_dtype = torch.bfloat16 if flag_gems.vendor_name == "metax" else torch.float32
@@ -519,5 +582,56 @@ def test_invalid(bad):
         out = torch.empty((5, 3), device=flag_gems.device).t()
     elif bad == "alias":
         sb = out[0]
+    elif bad == "overlap":
+        out = torch.empty(7, device=a.device, dtype=out_dtype).as_strided(
+            (3, 5), (1, 1)
+        )
     with pytest.raises((ValueError, TypeError)):
         flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias)
+
+
+@pytest.mark.skipif(
+    flag_gems.vendor_name not in ("metax", "ascend"), reason="batched scaled INT8 MM"
+)
+@pytest.mark.parametrize(
+    "shape,n",
+    [
+        ((2, 3, 7), 5),
+        ((7,), 5),
+        ((0, 3, 7), 5),
+        ((2, 0, 7), 5),
+        ((2, 3, 0), 5),
+        ((2, 3, 7), 0),
+    ],
+)
+@pytest.mark.parametrize("scalar", [False, True])
+def test_batched_prequantized(shape, n, scalar):
+    m, k = math.prod(shape[:-1]), shape[-1]
+    a, b, sa, sb = inputs(m, n, k, scalar=scalar)
+    a = a.reshape(shape)
+    bias = torch.randn(n, device=a.device, dtype=torch.bfloat16)
+    y = flag_gems.mm_w8a8_int8(a, b, sa, sb, torch.bfloat16, bias)
+    assert y.shape == (*shape[:-1], n)
+    _assert_reference(a.reshape(m, k), b, sa, sb, y.reshape(m, n), bias)
+    out = torch.empty_like(y)
+    assert flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias) is out
+    torch.testing.assert_close(out, y, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    flag_gems.vendor_name not in ("metax", "ascend"), reason="strided INT8 scales"
+)
+def test_strided_scales_bias_and_output():
+    m, n, k = 17, 35, 67
+    a, b, _, _ = inputs(m, n, k)
+    sa = torch.rand(m * 2, device=a.device)[::2]
+    sb = torch.rand(n * 2, device=a.device)[::2]
+    bias = torch.randn(n * 2, device=a.device, dtype=torch.bfloat16)[::2]
+    y = flag_gems.mm_w8a8_int8(a, b, sa, sb, torch.bfloat16, bias)
+    _assert_reference(a, b, sa, sb, y, bias)
+    if flag_gems.vendor_name == "ascend":
+        out = torch.empty((m * 2, n * 2), device=a.device, dtype=y.dtype)[1::2, 1::2]
+    else:
+        out = torch.empty_like(y)
+    assert flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias) is out
+    torch.testing.assert_close(out, y, rtol=0, atol=0)

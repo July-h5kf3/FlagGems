@@ -12,24 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ascend W8A8 mm (same symbol as Hopper ``mm_w8a8_fp8``).
-
-Public API matches NVIDIA PR #3821: BF16/FP16 inputs are quantized, then
-``C = (A_q @ B_q) * a_scale[:, None] * b_scale[None, :]``.
-
-Ascend 910 UB / DataCopy cannot load FP8, so weights and activations stay
-INT8 plus per-row / per-column scale. Tiny matrices use one Vector kernel;
-large matrices fuse INT8 Cube matmul and FP32 scaling in a mixed kernel.
-Other shapes use an INT32 workspace and a tiled Vector output pass. All paths
-apply both scales and cast to the requested output dtype.
-"""
+"""Ascend matrix multiplication of prequantized INT8 inputs and FP32 scales."""
 
 from __future__ import annotations
 
 import logging
+import math
 import os
-from collections import OrderedDict
-from typing import Optional
 
 import torch
 import triton
@@ -41,11 +30,6 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-_INT8_MAX = 127.0
-_B_CACHE: OrderedDict = OrderedDict()
-_B_PACKED_CACHE: OrderedDict = OrderedDict()
-_B_CACHE_MAX = 64
-_MM_W8A8_OUTPUT_DTYPE = os.environ.get("FLAGGEMS_MM_W8A8_OUTPUT_DTYPE", "bf16").lower()
 _FIXPIPE_M_MAJOR = os.environ.get("FLAGGEMS_MM_W8A8_M_MAJOR", "1") == "1"
 
 
@@ -186,7 +170,7 @@ def _mm_w8a8_mixed_kernel(
 
 @libentry()
 @triton.jit
-def mm_w8a8_fp8_int32_kernel(
+def mm_w8a8_int8_int32_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -282,34 +266,6 @@ def mm_w8a8_fp8_int32_kernel(
 
 
 @libentry()
-@triton.jit(do_not_specialize=["M", "N"])
-def _row_scale_cast_kernel(
-    c_ptr,
-    a_scale_ptr,
-    b_scale_ptr,
-    o_ptr,
-    M,
-    N,
-    stride_cm,
-    stride_om,
-    BLOCK_N: tl.constexpr,
-):
-    row = ext.program_id(0)
-    nprog = ext.num_programs(0)
-    offs = tl.arange(0, BLOCK_N)
-    for r in range(row, M, nprog):
-        a_scale = tl.load(a_scale_ptr + r)
-        for n0 in range(0, N, BLOCK_N):
-            n_idx = n0 + offs
-            mask = n_idx < N
-            c = tl.load(c_ptr + r * stride_cm + n_idx, mask=mask, other=0).to(
-                tl.float32
-            )
-            b_scale = tl.load(b_scale_ptr + n_idx, mask=mask, other=0).to(tl.float32)
-            tl.store(o_ptr + r * stride_om + n_idx, c * a_scale * b_scale, mask=mask)
-
-
-@libentry()
 @triton.jit
 def _scale_int32_static_kernel(
     C, SA, SB, OUT, N: tl.constexpr, NP: tl.constexpr, R: tl.constexpr, X: tl.constexpr
@@ -388,147 +344,6 @@ def _scale_int32_tiles_kernel(
         )
 
 
-def _vector_grid(n: int) -> int:
-    return max(1, min(n, 40 * 8))
-
-
-@libentry()
-@triton.jit
-def _quantize_rows_kernel(
-    X,
-    Q,
-    S,
-    M: tl.constexpr,
-    K: tl.constexpr,
-    S0: tl.constexpr,
-    S1: tl.constexpr,
-    R: tl.constexpr,
-    BK: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    for r0 in range(pid * R, M, ext.num_programs(0) * R):
-        r = r0 + tl.arange(0, R)
-        s = tl.load(S + r, r < M, other=1.0)
-        for c0 in range(0, K, BK):
-            kk = c0 + tl.arange(0, BK)
-            x = tl.load(
-                X + r[:, None] * S0 + kk[None, :] * S1,
-                (r[:, None] < M) & (kk[None, :] < K),
-                other=0,
-            ).to(tl.float32)
-            z = x / s[:, None]
-            f = tl.floor(z)
-            fi = f.to(tl.int32)
-            d = z - f
-            yi = fi + ((d > 0.5) | ((d == 0.5) & ((fi & 1) != 0))).to(tl.int32)
-            q = tl.minimum(127, tl.maximum(-128, yi)).to(tl.int8)
-            tl.store(
-                Q + r[:, None] * K + kk[None, :],
-                q,
-                (r[:, None] < M) & (kk[None, :] < K),
-            )
-
-
-@libentry()
-@triton.jit
-def _row_amax_kernel(
-    X,
-    S,
-    M: tl.constexpr,
-    K: tl.constexpr,
-    S0: tl.constexpr,
-    S1: tl.constexpr,
-    R: tl.constexpr,
-    BK: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    for r0 in range(pid * R, M, ext.num_programs(0) * R):
-        r = r0 + tl.arange(0, R)
-        kk = tl.arange(0, BK)
-        x = tl.load(
-            X + r[:, None] * S0 + kk[None, :] * S1,
-            (r[:, None] < M) & (kk[None, :] < K),
-            other=0,
-        ).to(tl.float32)
-        amax = tl.maximum(tl.max(tl.abs(x), 1), 1.0e-10)
-        tl.store(S + r, amax, r < M)
-
-
-def _quantize_int8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    m, k = x.shape
-    if k == 0 or k > 4096 or m == 0:
-        xf = x.float()
-        scale = xf.abs().amax(dim=1).clamp_min(1e-10) / _INT8_MAX
-        q = (xf / scale[:, None]).round().clamp(-128, 127).to(torch.int8)
-        return q.contiguous(), scale.contiguous()
-    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
-    amax = torch.empty((m,), dtype=torch.float32, device=x.device)
-    rr = 4 if k <= 2048 else 1
-    _row_amax_kernel[(min(40, triton.cdiv(m, rr)),)](
-        x, amax, m, k, *x.stride(), rr, triton.next_power_of_2(k)
-    )
-    # Native division preserves scale rounding at quantization half-integers.
-    # Fusing this division changed some INT8 values by one on this runtime.
-    s = amax / _INT8_MAX
-    r = 4
-    _quantize_rows_kernel[(min(40, triton.cdiv(m, r)),)](
-        x, q, s, m, k, *x.stride(), r, min(256, triton.next_power_of_2(k))
-    )
-    return q, s
-
-
-def _quantize_int8_cols(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    xf = x.float()
-    scale = xf.abs().amax(dim=0).clamp_min(1e-10) / _INT8_MAX
-    q = (xf / scale[None, :]).round().clamp(-128, 127).to(torch.int8)
-    return q.contiguous(), scale.contiguous()
-
-
-def _b_cache_key(b: torch.Tensor) -> tuple:
-    return (
-        b.device,
-        b.data_ptr(),
-        tuple(b.shape),
-        tuple(b.stride()),
-        b.dtype,
-        b._version,
-    )
-
-
-def _get_cached_b(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # Inference tensors have no version counter. Recompute rather than return
-    # stale weights when they are mutated in an inference_mode region.
-    try:
-        key = _b_cache_key(b)
-    except RuntimeError:
-        q, scale = _quantize_int8_cols(b)
-        return q, scale
-    cached = _B_CACHE.get(key)
-    if cached is not None:
-        _B_CACHE.move_to_end(key)
-        return cached[1:]
-    q, scale = _quantize_int8_cols(b)
-    item = (q, scale)
-    # Keep the original storage alive so allocator address reuse cannot alias.
-    _B_CACHE[key] = (b, *item)
-    if len(_B_CACHE) > _B_CACHE_MAX:
-        _B_CACHE.popitem(last=False)
-    return item
-
-
-def clear_mm_w8a8_fp8_caches() -> None:
-    _B_CACHE.clear()
-    _B_PACKED_CACHE.clear()
-
-
-def get_mm_w8a8_fp8_cache_stats() -> dict:
-    return {
-        "b_int8": len(_B_CACHE),
-        "b_packed": len(_B_PACKED_CACHE),
-        "cache_max_entries": _B_CACHE_MAX,
-    }
-
-
 def _cube_core_count() -> int:
     """910B has 20 AIC. Mix SIMD ``get_block_idx`` only covers one wave."""
     env = os.environ.get("FLAGGEMS_CUBE_CORES")
@@ -593,71 +408,31 @@ def _pick_fixpipe_tiles(M: int, N: int, K: int) -> tuple[int, int, int]:
     return 128, 256, 256
 
 
-def _resolve_out_dtype(
-    a: torch.Tensor, out_dtype: Optional[torch.dtype]
-) -> torch.dtype:
-    if out_dtype is not None:
-        return out_dtype
-    if _MM_W8A8_OUTPUT_DTYPE == "fp16":
-        return torch.float16
-    if a.dtype in (torch.float16, torch.bfloat16):
-        return a.dtype
-    return torch.bfloat16
-
-
 def _align_up(x: int, align: int) -> int:
     return (x + align - 1) // align * align
 
 
 def _pad_fixpipe_inputs(a_q, b_q, a_s, b_s, M, N, K, block_m, block_n, block_k):
-    """Pad A/B and pack B into contiguous (N-tile, K-tile, BK, BN) storage."""
+    """Prepare current inputs; every copy remains visible to graph replay."""
     m_pad = _align_up(M, max(16, block_m))
     n_pad = _align_up(N, max(32, block_n))
     k_pad = _align_up(K, max(32, block_k))
     if (m_pad, k_pad) == (M, K):
-        a_pad, a_s_pad = a_q, a_s
+        a_pad = a_q.contiguous()
     else:
         a_pad = a_q.new_zeros((m_pad, k_pad))
         a_pad[:M, :K] = a_q
-        a_s_pad = a_s.new_zeros((m_pad,))
-        a_s_pad[:M] = a_s
-
-    if n_pad == N:
-        b_s_pad = b_s
+    if (n_pad, k_pad) == (N, K):
+        b_pad = b_q
     else:
-        b_s_pad = b_s.new_zeros((n_pad,))
-        b_s_pad[:N] = b_s
-
-    packed_key = (
-        b_q.data_ptr(),
-        tuple(b_q.shape),
-        tuple(b_q.stride()),
-        b_q.dtype,
-        k_pad,
-        n_pad,
-        block_k,
-        block_n,
+        b_pad = b_q.new_zeros((k_pad, n_pad))
+        b_pad[:K, :N] = b_q
+    b_tiles = (
+        b_pad.reshape(k_pad // block_k, block_k, n_pad // block_n, block_n)
+        .permute(2, 0, 1, 3)
+        .contiguous()
     )
-    packed = _B_PACKED_CACHE.get(packed_key)
-    if packed is None:
-        if (n_pad, k_pad) == (N, K):
-            b_pad = b_q
-        else:
-            b_pad = b_q.new_zeros((k_pad, n_pad))
-            b_pad[:K, :N] = b_q
-        b_tiles = (
-            b_pad.reshape(k_pad // block_k, block_k, n_pad // block_n, block_n)
-            .permute(2, 0, 1, 3)
-            .contiguous()
-        )
-        # Keep the source tensor alive so a recycled data_ptr cannot hit this entry.
-        _B_PACKED_CACHE[packed_key] = (b_q, b_tiles)
-        if len(_B_PACKED_CACHE) > _B_CACHE_MAX:
-            _B_PACKED_CACHE.popitem(last=False)
-    else:
-        _B_PACKED_CACHE.move_to_end(packed_key)
-        b_tiles = packed[1]
-    return a_pad, b_tiles, a_s_pad, b_s_pad, m_pad, n_pad, k_pad
+    return a_pad, b_tiles, a_s, b_s, m_pad, n_pad, k_pad
 
 
 def _pick_int32_tiles(M: int, N: int, K: int) -> tuple[int, int, int]:
@@ -732,21 +507,12 @@ def _pick_int32_tiles(M: int, N: int, K: int) -> tuple[int, int, int]:
 def _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K):
     """Prepare a callable that executes only matmul and output scaling.
 
-    Quantization, padding, weight layout conversion and explicit allocations
-    finish before the returned callable is invoked. The public API and kernel
-    benchmark share this dispatch. Captured tensors remain alive in the closure.
+    Padding and layout copies are part of the public call and graph capture.
+    Captured tensors remain alive in the returned closure.
     """
     if M <= 8 and N in (16, 32, 64) and K in (16, 32, 64):
-        key = ("tiny_transpose", b_q.data_ptr(), tuple(b_q.shape), b_q.dtype)
-        cached = _B_PACKED_CACHE.get(key)
-        if cached is None:
-            b_t = b_q.t().contiguous()
-            _B_PACKED_CACHE[key] = (b_q, b_t)
-            if len(_B_PACKED_CACHE) > _B_CACHE_MAX:
-                _B_PACKED_CACHE.popitem(last=False)
-        else:
-            _B_PACKED_CACHE.move_to_end(key)
-            b_t = cached[1]
+        a_q = a_q.contiguous()
+        b_t = b_q.t().contiguous()
         bn, bk = triton.next_power_of_2(N), triton.next_power_of_2(K)
         grid = M * triton.cdiv(N, bn)
 
@@ -881,7 +647,7 @@ def _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K):
     grid_v = min(40, triton.cdiv(M, rows) * triton.cdiv(N, cols))
 
     def call():
-        mm_w8a8_fp8_int32_kernel[(grid,)](
+        mm_w8a8_int8_int32_kernel[(grid,)](
             a_q,
             b_q,
             acc,
@@ -938,33 +704,276 @@ def _launch(a_q, b_q, a_s, b_s, out, M, N, K):
     return out
 
 
-def mm_w8a8_fp8(a, b, *, out_dtype: Optional[torch.dtype] = None):
-    logger.debug("GEMS_ASCEND MM_W8A8_FP8")
-    if a.stride(0) > 1 and a.stride(1) > 1:
-        a = a.contiguous()
-    if b.stride(0) > 1 and b.stride(1) > 1:
-        b = b.contiguous()
-    assert a.shape[1] == b.shape[0], "incompatible dimensions"
-    M, K = a.shape
-    _, N = b.shape
-    a_q, a_s = _quantize_int8_rows(a)
-    b_q, b_s = _get_cached_b(b)
-    out = torch.empty((M, N), device=a.device, dtype=_resolve_out_dtype(a, out_dtype))
-    with torch_device_fn.device(a.device):
-        return _launch(a_q, b_q, a_s, b_s, out, M, N, K)
+@libentry()
+@triton.jit
+def finish_mm_kernel(
+    PARTIAL,
+    SA,
+    SB,
+    BIAS,
+    OUT,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    PM: tl.constexpr,
+    PN: tl.constexpr,
+    OM: tl.constexpr,
+    ON: tl.constexpr,
+    PARTS: tl.constexpr,
+    APPLY_SCALES: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = ext.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < M * N
+    rows = offsets // N
+    columns = offsets % N
+    if PARTIAL.dtype.element_ty == tl.int32:
+        # With K < 2**31, both radix-2**24 limbs convert exactly to FP32.
+        high = tl.full((BLOCK,), 0, tl.int32)
+        low = tl.full((BLOCK,), 0, tl.int32)
+        for part in range(PARTS):
+            partial = tl.load(
+                PARTIAL + part * (PM * PN) + rows * PN + columns, valid, other=0
+            )
+            low += partial & 0xFFFFFF
+            high += (partial >> 24) + (low >> 24)
+            low = low & 0xFFFFFF
+        value = high.to(tl.float32) * 16777216.0 + low.to(tl.float32)
+    else:
+        value = tl.full((BLOCK,), 0, tl.float32)
+        for part in range(PARTS):
+            value += tl.load(
+                PARTIAL + part * (PM * PN) + rows * PN + columns, valid, other=0
+            )
+    if APPLY_SCALES:
+        scale_a = tl.load(SA + rows, valid, other=0)
+        scale_b = tl.load(SB + columns, valid, other=0)
+        value = value * scale_a * scale_b
+    if HAS_BIAS:
+        value += tl.load(BIAS + columns, valid, other=0).to(tl.float32)
+    tl.store(OUT + rows * OM + columns * ON, value, valid)
 
 
-def mm_w8a8_fp8_out(a, b, *, out):
-    logger.debug("GEMS_ASCEND MM_W8A8_FP8_OUT")
-    if a.stride(0) > 1 and a.stride(1) > 1:
-        a = a.contiguous()
-    if b.stride(0) > 1 and b.stride(1) > 1:
-        b = b.contiguous()
-    assert a.shape[1] == b.shape[0], "incompatible dimensions"
-    M, K = a.shape
-    _, N = b.shape
-    assert out.shape == (M, N), "incompatible output shape"
-    a_q, a_s = _quantize_int8_rows(a)
-    b_q, b_s = _get_cached_b(b)
+def scaled_mm_arguments(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, tuple[int, ...]
+]:
+    if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+        raise TypeError("A and B must be prequantized INT8 tensors")
+    if a.dtype != torch.int8 or b.dtype != torch.int8:
+        raise TypeError("A and B must be prequantized INT8 tensors")
+    if a.ndim < 1 or b.ndim != 2 or a.shape[-1] != b.shape[0]:
+        raise ValueError("expected A[...,K] and B[K,N]")
+    if a.device.type != "npu" or a.device != b.device:
+        raise ValueError("A and B must be on the same NPU")
+    if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("out_dtype must be FP16, BF16 or FP32")
+    k, n = b.shape
+    if k >= 2**31:
+        raise ValueError("K must be smaller than 2**31")
+    m = math.prod(a.shape[:-1])
+
+    def _normalize(scale, size, name):
+        if not isinstance(scale, torch.Tensor):
+            raise TypeError(f"{name} must be a tensor")
+        if scale.dtype != torch.float32 or scale.device != a.device:
+            raise ValueError(f"{name} must be FP32 on the input device")
+        if scale.numel() not in (1, size):
+            raise ValueError(f"{name} must be scalar or contain {size} values")
+        flat = scale.reshape(-1)
+        if flat.numel() == 1:
+            return flat.expand(size).contiguous()
+        return flat.contiguous()
+
+    sa = _normalize(scale_a, m, "scale_a")
+    sb = _normalize(scale_b, n, "scale_b")
+    if bias is not None:
+        if not isinstance(bias, torch.Tensor):
+            raise TypeError("bias must be a tensor")
+        if bias.device != a.device or bias.dtype != out_dtype or bias.numel() != n:
+            raise ValueError(
+                "bias must contain N values of the output dtype on the input device"
+            )
+        bias = bias.reshape(-1).contiguous()
+    return a.reshape(m, k), sa, sb, bias, (*a.shape[:-1], n)
+
+
+def scaled_mm_execute(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sa: torch.Tensor,
+    sb: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    if m == 0 or n == 0:
+        return out
+    flat_out = out if out.ndim == 2 else out.view(m, n)
+    partial_m, partial_n = m, n
     with torch_device_fn.device(a.device):
-        return _launch(a_q, b_q, a_s, b_s, out, M, N, K)
+        if k == 0:
+            partials, parts, apply_scales = flat_out, 0, True
+        elif k > 65536:
+            # Each INT32 partial stays below 2**31 even for all -128 inputs.
+            parts = triton.cdiv(k, 65536)
+            bm, bn, bk = _pick_int32_tiles(m, n, 65536)
+            partial_m = _align_up(m, max(16, bm))
+            partial_n = _align_up(n, max(32, bn))
+            cores = min(
+                _cube_core_count(),
+                triton.cdiv(partial_m, bm) * triton.cdiv(partial_n, bn),
+            )
+            partials = torch.empty(
+                (parts, partial_m, partial_n), device=a.device, dtype=torch.int32
+            )
+            for part in range(parts):
+                start = part * 65536
+                stop = min(start + 65536, k)
+                a_part, b_part, _, _, _, _, padded_k = _pad_fixpipe_inputs(
+                    a[:, start:stop],
+                    b[start:stop],
+                    sa,
+                    sb,
+                    m,
+                    n,
+                    stop - start,
+                    bm,
+                    bn,
+                    bk,
+                )
+                mm_w8a8_int8_int32_kernel[(cores,)](
+                    a_part,
+                    b_part,
+                    partials[part],
+                    partial_m,
+                    partial_n,
+                    padded_k,
+                    cores,
+                    BLOCK_M=bm,
+                    BLOCK_N=bn,
+                    BLOCK_K=bk,
+                    M_MAJOR=_FIXPIPE_M_MAJOR,
+                    GROUP_M=0,
+                    num_warps=1,
+                    num_stages=2,
+                    optimize_dynamic_offset=True,
+                    unit_flag=False,
+                    limit_auto_multi_buffer_of_local_buffer="no-l0c",
+                )
+            apply_scales = True
+        elif bias is None:
+            _launch(a, b, sa, sb, flat_out, m, n, k)
+            return out
+        else:
+            # Keep FP32 through bias addition; rounding before bias changes results.
+            partials = torch.empty((m, n), device=a.device, dtype=torch.float32)
+            _launch(a, b, sa, sb, partials, m, n, k)
+            parts, apply_scales = 1, False
+        if k > 65536 and bias is not None:
+            # Materialize scaled FP32 before bias, as in the short-K path.
+            scaled = torch.empty((m, n), device=a.device, dtype=torch.float32)
+            finish_mm_kernel[(triton.cdiv(m * n, 512),)](
+                partials,
+                sa,
+                sb,
+                None,
+                scaled,
+                m,
+                n,
+                partial_m,
+                partial_n,
+                n,
+                1,
+                parts,
+                True,
+                False,
+                512,
+                enable_fp_fusion=False,
+            )
+            partials, parts, apply_scales = scaled, 1, False
+            partial_m, partial_n = m, n
+        finish_mm_kernel[(triton.cdiv(m * n, 512),)](
+            partials,
+            sa,
+            sb,
+            bias,
+            flat_out,
+            m,
+            n,
+            partial_m,
+            partial_n,
+            *flat_out.stride(),
+            parts,
+            apply_scales,
+            bias is not None,
+            512,
+            enable_fp_fusion=False,
+        )
+    return out
+
+
+def mm_w8a8_int8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute INT8 A[...,K] @ B[K,N], FP32 scales and optional output bias."""
+    logger.debug("GEMS_ASCEND MM_W8A8_INT8")
+    a2d, sa, sb, bias, shape = scaled_mm_arguments(
+        a, b, scale_a, scale_b, out_dtype, bias
+    )
+    out = torch.empty(shape, device=a.device, dtype=out_dtype)
+    return scaled_mm_execute(a2d, b, sa, sb, bias, out)
+
+
+def mm_w8a8_int8_out(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Write prequantized INT8 matmul into caller-owned output without aliasing."""
+    logger.debug("GEMS_ASCEND MM_W8A8_INT8_OUT")
+    if not isinstance(out, torch.Tensor):
+        raise TypeError("out must be a tensor")
+    a2d, sa, sb, normalized_bias, shape = scaled_mm_arguments(
+        a, b, scale_a, scale_b, out.dtype, bias
+    )
+    if out.shape != shape or out.device != a.device:
+        raise ValueError("out must have the result shape on the input device")
+    if out.ndim != 2 and not out.is_contiguous():
+        raise ValueError("batched output must be contiguous")
+    if out.ndim == 2 and out.numel():
+        rows, columns = out.shape
+        stride_m, stride_n = out.stride()
+        divisor = math.gcd(stride_m, stride_n)
+        if (
+            (stride_m == 0 and rows > 1)
+            or (stride_n == 0 and columns > 1)
+            or (
+                divisor and rows > stride_n // divisor and columns > stride_m // divisor
+            )
+        ):
+            raise ValueError("out elements must not overlap")
+    if out.numel() and any(
+        tensor is not None
+        and tensor.numel()
+        and out.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
+        for tensor in (a, b, scale_a, scale_b, bias)
+    ):
+        raise ValueError("out must not alias inputs, scales or bias")
+    return scaled_mm_execute(a2d, b, sa, sb, normalized_bias, out)
