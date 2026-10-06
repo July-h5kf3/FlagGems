@@ -21,8 +21,7 @@ Ascend 910 UB / DataCopy cannot load FP8, so weights and activations stay
 INT8 plus per-row / per-column scale. Tiny matrices use one Vector kernel;
 large matrices fuse INT8 Cube matmul and FP32 scaling in a mixed kernel.
 Other shapes use an INT32 workspace and a tiled Vector output pass. All paths
-apply both scales and cast to the requested output dtype. The older CommonIR
-AIC-only implementation is retained for comparison.
+apply both scales and cast to the requested output dtype.
 """
 
 from __future__ import annotations
@@ -35,19 +34,10 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-import triton.language.extra.cann.extension as al
 
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
-
-from .ascendc.compile_fixpipe import (
-    ensure_bitcode,
-    install_cann90_custom_op_compat,
-    makefile_compile,
-    source_path,
-)
-from .ascendc.compile_fixpipe import symbol as _fixpipe_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -55,184 +45,8 @@ _INT8_MAX = 127.0
 _B_CACHE: OrderedDict = OrderedDict()
 _B_PACKED_CACHE: OrderedDict = OrderedDict()
 _B_CACHE_MAX = 64
-_C_WORKSPACE: dict[tuple, torch.Tensor] = {}
 _MM_W8A8_OUTPUT_DTYPE = os.environ.get("FLAGGEMS_MM_W8A8_OUTPUT_DTYPE", "bf16").lower()
 _FIXPIPE_M_MAJOR = os.environ.get("FLAGGEMS_MM_W8A8_M_MAJOR", "1") == "1"
-_FIXPIPE_READY = False
-
-
-def _init_fixpipe() -> None:
-    global _FIXPIPE_READY
-    if _FIXPIPE_READY:
-        return
-    bc = ensure_bitcode()
-    try:
-        install_cann90_custom_op_compat()
-
-        @al.register_custom_op
-        class fixpipe_vdeqf16:  # noqa: N801
-            name = "fixpipe_vdeqf16"
-            core = al.CORE.CUBE
-            pipe = al.PIPE.PIPE_FIX
-            mode = al.MODE.SIMD
-            symbol = _fixpipe_symbol()
-            bitcode = str(bc)
-            source = str(source_path())
-            compile = makefile_compile()
-
-            def __init__(
-                self,
-                acc,
-                deq,
-                row_diag,
-                c,
-                pid_m,
-                pid_n,
-                tile_m,
-                tile_n,
-                acc_stride,
-                ldc,
-                load_deq,
-                load_diag,
-                out_bf16,
-                out=None,
-            ):
-                # HIVM CustomOp verifier requires a tensor/memref `outs`
-                # segment. C is a GM pointer written in-place, so it stays in
-                # `ins`; `out` is a dummy UB tile only to form the op.
-                assert out is not None, "fixpipe_vdeqf16 requires a dummy out tensor"
-                self.arg_type["pid_m"] = tl.int32
-                self.arg_type["pid_n"] = tl.int32
-                self.arg_type["tile_m"] = tl.int32
-                self.arg_type["tile_n"] = tl.int32
-                self.arg_type["acc_stride"] = tl.int32
-                self.arg_type["ldc"] = tl.int32
-                self.arg_type["load_deq"] = tl.int32
-                self.arg_type["load_diag"] = tl.int32
-                self.arg_type["out_bf16"] = tl.int32
-                del acc, deq, row_diag, c
-
-    except AssertionError as exc:
-        if "already used" not in str(exc):
-            raise
-    _FIXPIPE_READY = True
-    logger.info("mm_w8a8_fp8 FixPipe Common IR ready (%s)", bc)
-
-
-_init_fixpipe()
-
-
-@libentry()
-@triton.jit
-def mm_w8a8_fp8_fixpipe_kernel(
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    deq_ptr,
-    row_diag_ptr,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    OUT_M: tl.constexpr,
-    OUT_N: tl.constexpr,
-    N_CORES: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    DISALLOW_ACC: tl.constexpr,
-    M_MAJOR: tl.constexpr,
-    OUT_BF16: tl.constexpr,
-):
-    # M/N/K/N_CORES are constexpr so the K trip count, grid and deq path
-    # fold. Host pads to full tiles and packs B as contiguous KxN tiles.
-    pid = ext.program_id(0)
-    grid_m: tl.constexpr = tl.cdiv(OUT_M, BLOCK_M)
-    grid_n: tl.constexpr = tl.cdiv(OUT_N, BLOCK_N)
-    n_tiles: tl.constexpr = grid_m * grid_n
-    cache_deq: tl.constexpr = OUT_N <= 8192
-
-    with al.scope(core_mode="cube"):
-        dummy = tl.full([16], 0, tl.float16)
-        q = n_tiles // N_CORES
-        r = n_tiles % N_CORES
-        start = tl.where(pid < r, pid * (q + 1), r * (q + 1) + (pid - r) * q)
-        count = q + tl.where(pid < r, 1, 0)
-        if M_MAJOR:
-            pid_m = start // grid_n
-            pid_n = start % grid_n
-        else:
-            pid_n = start // grid_m
-            pid_m = start % grid_m
-        for i in tl.range(0, count):
-            load_deq = 2 if (cache_deq and i == 0) else (0 if cache_deq else 1)
-            load_diag = 1 if (not M_MAJOR or i == 0 or pid_n == 0) else 0
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-            off_m = (pid_m * BLOCK_M).to(tl.int32)
-            off_n = (pid_n * BLOCK_N).to(tl.int32)
-            tile_m = tl.minimum(BLOCK_M, OUT_M - off_m)
-            tile_n = tl.minimum(BLOCK_N, OUT_N - off_n)
-            a_block_ptr = tl.make_block_ptr(
-                base=a_ptr,
-                shape=(M, K),
-                strides=(K, 1),
-                offsets=(off_m, 0),
-                block_shape=(BLOCK_M, BLOCK_K),
-                order=(1, 0),
-            )
-            b_block_ptr = tl.make_block_ptr(
-                base=b_ptr + pid_n * K * BLOCK_N,
-                shape=(K, BLOCK_N),
-                strides=(BLOCK_N, 1),
-                offsets=(0, 0),
-                block_shape=(BLOCK_K, BLOCK_N),
-                order=(1, 0),
-            )
-            if DISALLOW_ACC:
-                for k0 in tl.range(
-                    0, K, BLOCK_K, num_stages=2, disallow_acc_multi_buffer=True
-                ):
-                    a = tl.load(a_block_ptr)
-                    b = tl.load(b_block_ptr)
-                    acc = tl.dot(a, b, acc, out_dtype=tl.int32)
-                    a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-                    b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
-            else:
-                # Two L0C banks: FixPipe drains one while the next tile MMA fills the other.
-                for k0 in tl.range(
-                    0, K, BLOCK_K, num_stages=2, disallow_acc_multi_buffer=False
-                ):
-                    a = tl.load(a_block_ptr)
-                    b = tl.load(b_block_ptr)
-                    acc = tl.dot(a, b, acc, out_dtype=tl.int32)
-                    a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-                    b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
-            al.custom(
-                "fixpipe_vdeqf16",
-                acc,
-                deq_ptr,
-                row_diag_ptr,
-                c_ptr,
-                off_m,
-                off_n,
-                tile_m.to(tl.int32),
-                tile_n.to(tl.int32),
-                BLOCK_M,
-                OUT_N,
-                tl.cast(load_deq, tl.int32),
-                tl.cast(load_diag, tl.int32),
-                tl.cast(OUT_BF16, tl.int32),
-                out=dummy,
-            )
-            if M_MAJOR:
-                pid_n = pid_n + 1
-                wrap = pid_n == grid_n
-                pid_m = pid_m + wrap
-                pid_n = tl.where(wrap, 0, pid_n)
-            else:
-                pid_m = pid_m + 1
-                wrap = pid_m == grid_m
-                pid_n = pid_n + wrap
-                pid_m = tl.where(wrap, 0, pid_m)
 
 
 @libentry()
@@ -388,8 +202,7 @@ def mm_w8a8_fp8_int32_kernel(
 ):
     """INT8 Cube with a plain INT32 FixPipe drain.
 
-    Row and column scales are fused in the existing Vector output kernel.
-    This avoids the fixed CommonIR custom-op cost without adding a launch.
+    Row and column scales are applied in the Vector output kernel.
     """
     pid = ext.program_id(0)
     grid_m: tl.constexpr = tl.cdiv(M, BLOCK_M)
@@ -671,48 +484,6 @@ def _quantize_int8_cols(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q.contiguous(), scale.contiguous()
 
 
-def _pack_deq_u64(scale: torch.Tensor) -> torch.Tensor:
-    """Pack fp32 IEEE bits into the low 32 bits of int64 (AscendC uint64 deq)."""
-    bits = scale.contiguous().to(torch.float32).view(torch.int32)
-    return (bits.to(torch.int64) & 0xFFFFFFFF).contiguous()
-
-
-def _pack_col_deq(b_s: torch.Tensor) -> torch.Tensor:
-    """Pack an N-channel VDEQF16 scale vector."""
-    n_pad = _align_up(b_s.numel(), 32)
-    packed = _pack_deq_u64(b_s)
-    if n_pad != b_s.numel():
-        out = packed.new_zeros((n_pad,))
-        out[: b_s.numel()] = packed
-        return out.contiguous()
-    return packed.contiguous()
-
-
-def _prepare_aic_epilogue(
-    a_s: torch.Tensor, b_s: torch.Tensor, block_m: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prepare scale inputs for the single AIC kernel.
-
-    ``VDEQF16`` applies one N-channel vector to every row.  Fold the largest
-    row scale into that vector and provide the remaining per-row ratios as
-    packed 16x16 diagonal FP16 matrices.  The CommonIR epilogue consumes both
-    inputs inside AIC and writes the final output directly.
-    """
-    assert block_m % 16 == 0 and block_m <= 128
-    assert a_s.numel() % block_m == 0
-    row_ref = a_s.abs().amax().clamp_min(1e-10)
-    deq = _pack_col_deq(b_s * row_ref)
-    row_ratio = (a_s / row_ref).to(torch.float16)
-    groups = a_s.numel() // block_m
-    m1 = block_m // 16
-    row_diag_nd = torch.diag_embed(row_ratio.reshape(groups, block_m))
-    # A1 fractal layout consumed by L1->L0A: [group, K1, M1, M0, K0].
-    row_diag = (
-        row_diag_nd.reshape(groups, m1, 16, m1, 16).permute(0, 3, 1, 2, 4).contiguous()
-    )
-    return deq, row_diag
-
-
 def _b_cache_key(b: torch.Tensor) -> tuple:
     return (
         b.device,
@@ -724,21 +495,20 @@ def _b_cache_key(b: torch.Tensor) -> tuple:
     )
 
 
-def _get_cached_b(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _get_cached_b(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # Inference tensors have no version counter. Recompute rather than return
     # stale weights when they are mutated in an inference_mode region.
     try:
         key = _b_cache_key(b)
     except RuntimeError:
         q, scale = _quantize_int8_cols(b)
-        return q, scale, _pack_col_deq(scale)
+        return q, scale
     cached = _B_CACHE.get(key)
     if cached is not None:
         _B_CACHE.move_to_end(key)
         return cached[1:]
     q, scale = _quantize_int8_cols(b)
-    packed = _pack_col_deq(scale)
-    item = (q, scale, packed)
+    item = (q, scale)
     # Keep the original storage alive so allocator address reuse cannot alias.
     _B_CACHE[key] = (b, *item)
     if len(_B_CACHE) > _B_CACHE_MAX:
@@ -746,24 +516,9 @@ def _get_cached_b(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Te
     return item
 
 
-def _get_cached_b_int8(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    q, scale, _packed = _get_cached_b(b)
-    return q, scale
-
-
-def _c_workspace(device, m: int, n: int, dtype=torch.float16) -> torch.Tensor:
-    key = (str(device), m, n, dtype)
-    buf = _C_WORKSPACE.get(key)
-    if buf is None or buf.shape != (m, n) or buf.dtype != dtype:
-        buf = torch.empty((m, n), device=device, dtype=dtype)
-        _C_WORKSPACE[key] = buf
-    return buf
-
-
 def clear_mm_w8a8_fp8_caches() -> None:
     _B_CACHE.clear()
     _B_PACKED_CACHE.clear()
-    _C_WORKSPACE.clear()
 
 
 def get_mm_w8a8_fp8_cache_stats() -> dict:
@@ -771,7 +526,6 @@ def get_mm_w8a8_fp8_cache_stats() -> dict:
         "b_int8": len(_B_CACHE),
         "b_packed": len(_B_PACKED_CACHE),
         "cache_max_entries": _B_CACHE_MAX,
-        "fixpipe": _FIXPIPE_READY,
     }
 
 
@@ -781,15 +535,6 @@ def _cube_core_count() -> int:
     if env:
         return max(1, int(env))
     return 20
-
-
-def _l0c_bytes(block_m: int, block_n: int) -> int:
-    return block_m * block_n * 4
-
-
-def _can_acc_pingpong(block_m: int, block_n: int) -> bool:
-    """910B L0C is 128KB. Two int32 banks must fit for MMA/FixPipe overlap."""
-    return _l0c_bytes(block_m, block_n) * 2 <= 128 * 1024
 
 
 def _pick_fixpipe_tiles(M: int, N: int, K: int) -> tuple[int, int, int]:
@@ -915,47 +660,6 @@ def _pad_fixpipe_inputs(a_q, b_q, a_s, b_s, M, N, K, block_m, block_n, block_k):
     return a_pad, b_tiles, a_s_pad, b_s_pad, m_pad, n_pad, k_pad
 
 
-def _launch_fixpipe(a_q, b_q, a_s, b_s, out, M, N, K, deq=None):
-    orig_m, orig_n = M, N
-    block_m, block_n, block_k = _pick_fixpipe_tiles(M, N, K)
-    block_m = min(block_m, 128)
-    a_q, b_q, a_s, b_s, M, N, K = _pad_fixpipe_inputs(
-        a_q, b_q, a_s, b_s, M, N, K, block_m, block_n, block_k
-    )
-    del deq
-    deq, row_diag = _prepare_aic_epilogue(a_s, b_s, block_m)
-    n_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
-    wave = _cube_core_count()
-    grid = min(n_tiles, wave)
-    mm_w8a8_fp8_fixpipe_kernel[grid,](
-        a_q,
-        b_q,
-        out,
-        deq,
-        row_diag,
-        M,
-        N,
-        K,
-        orig_m,
-        orig_n,
-        grid,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        DISALLOW_ACC=not _can_acc_pingpong(block_m, block_n),
-        M_MAJOR=_FIXPIPE_M_MAJOR,
-        OUT_BF16=1 if out.dtype == torch.bfloat16 else 0,
-        mix_mode="aic",
-        num_warps=1,
-        num_stages=2,
-        optimize_dynamic_offset=True,
-        unit_flag=False,
-        limit_auto_multi_buffer_of_local_buffer="no-l0c",
-    )
-    assert orig_n % 16 == 0, "AIC VDEQF16 path requires N to be a multiple of 16"
-    return out
-
-
 def _pick_int32_tiles(M: int, N: int, K: int) -> tuple[int, int, int]:
     if os.environ.get("FLAGGEMS_FIXPIPE_TILES"):
         return _pick_fixpipe_tiles(M, N, K)
@@ -1025,40 +729,6 @@ def _pick_int32_tiles(M: int, N: int, K: int) -> tuple[int, int, int]:
     return block_m, block_n, block_k
 
 
-def _pick_aic_tiles(M: int, N: int, K: int):
-    if M <= 0 or N <= 0:
-        return None
-    if N == 2048 and K == 512 and 1024 <= M <= 16384 and M % 16 == 0:
-        return 128, 256, 128
-    if K == 2048 and N == 64:
-        if 32 < M <= 128:
-            return 16, 64, 1024
-        if 128 < M <= 512:
-            return 32, 64, 1024
-        if M == 2048:
-            return 64, 64, 1024
-    if K == 2048 and N == 256:
-        if M <= 64:
-            return 16, 64, 1024
-        if 128 < M <= 320:
-            return 32, 128, 512
-        if 320 < M <= 512:
-            return 64, 128, 512
-    if K == 512 and N == 2048 and M <= 512:
-        if M <= 32:
-            return 16, 128, 512
-        if M <= 256:
-            return _align_up(triton.cdiv(M, 2), 16), 256, 256
-        # Five M groups with eight N groups balance two tiles per Cube.
-        return _align_up(triton.cdiv(M, 5), 16), 256, 256
-    if K == 2048 and N == 1024:
-        if M <= 16:
-            return 16, 64, 1024
-        if M <= 64:
-            return 32, 128, 512
-    return None
-
-
 def _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K):
     """Prepare a callable that executes only matmul and output scaling.
 
@@ -1103,58 +773,6 @@ def _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K):
             "workspace_bytes": 0,
         }
 
-    nz_tiles = None
-    if K == 2048 and M % 8 == 0:
-        if N in (9216, 12288) and 8 <= M <= 512:
-            nz_tiles = (_align_up(triton.cdiv(M, triton.cdiv(M, 128)), 16), 128, 256)
-        elif N == 1024 and 64 < M <= 512:
-            # Eight N tiles: use two M groups for one wave, five for two.
-            groups = 2 if M <= 256 else 5
-            nz_tiles = (_align_up(triton.cdiv(M, groups), 16), 128, 256)
-        elif N == 256 and 1024 <= M < 8192:
-            # Two N tiles per M group; balance each wave over 20 Cube cores.
-            groups = triton.cdiv(triton.cdiv(M, 128), 10) * 10
-            nz_tiles = (_align_up(triton.cdiv(M, groups), 16), 128, 256)
-    if (
-        nz_tiles is not None
-        and out.dtype in (torch.bfloat16, torch.float16)
-        and out.is_contiguous()
-        and not os.environ.get("FLAGGEMS_FIXPIPE_TILES")
-        and not os.environ.get("FLAGGEMS_MM_W8A8_EPILOGUE")
-    ):
-        from .ascendc.mm_nz import prepare as prepare_nz
-
-        return prepare_nz(a_q, b_q, a_s, b_s, out, M, N, K, nz_tiles)
-
-    aic_tiles = _pick_aic_tiles(M, N, K)
-    if (
-        aic_tiles is not None
-        and out.dtype == torch.bfloat16
-        and out.is_contiguous()
-        and not os.environ.get("FLAGGEMS_FIXPIPE_TILES")
-        and not os.environ.get("FLAGGEMS_MM_W8A8_EPILOGUE")
-    ):
-        from .ascendc.mm_aic import prepare as prepare_aic
-
-        input_nz = N == 2048 and K == 512 and M > 128
-        if input_nz:
-            aic_tiles = (aic_tiles[0], aic_tiles[1], 128)
-        batch_rows = input_nz and M >= 1024
-        return prepare_aic(
-            a_q,
-            b_q,
-            a_s,
-            b_s,
-            out,
-            M,
-            N,
-            K,
-            aic_tiles,
-            input_nz=input_nz,
-            batch_rows=batch_rows,
-            prefetch=batch_rows,
-        )
-
     mixed = (
         M >= 1024
         and N >= 1024
@@ -1195,6 +813,8 @@ def _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K):
         limit_auto_multi_buffer_of_local_buffer="no-l0c",
     )
     if mixed:
+        # One CV workspace slot keeps persistent mixed tiles synchronized on CANN 9.1.
+        opts["set_workspace_multibuffer"] = 1
 
         def call():
             _mm_w8a8_mixed_kernel[(grid,)](
@@ -1259,22 +879,6 @@ def _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K):
         if N <= 256 and M > 128:
             rows = 32 if M >= 1024 and M % 32 == 0 else (16 if M % 16 == 0 else 8)
     grid_v = min(40, triton.cdiv(M, rows) * triton.cdiv(N, cols))
-    custom_epilogue = None
-    if (
-        os.environ.get("FLAGGEMS_MM_W8A8_EPILOGUE") == "ascendc"
-        and out.is_contiguous()
-        and M > 0
-        and N > 0
-        and M % 8 == 0
-        and N % 64 == 0
-    ):
-        from .ascendc.vector_epilogue import prepare as prepare_vector_epilogue
-
-        custom_rows = 16 if M % 16 == 0 else 8
-        custom_cols = min(512, N & -N)
-        custom_epilogue, _, _ = prepare_vector_epilogue(
-            acc, a_s, b_s, out, M, N, custom_rows, custom_cols
-        )
 
     def call():
         mm_w8a8_fp8_int32_kernel[(grid,)](
@@ -1287,9 +891,7 @@ def _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K):
             grid,
             **opts,
         )
-        if custom_epilogue is not None:
-            custom_epilogue()
-        elif static_output:
+        if static_output:
             _scale_int32_static_kernel[(M // rows,)](
                 acc,
                 a_s,
@@ -1324,13 +926,13 @@ def _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K):
         "scale_tile": [rows, cols],
         "static_output": static_output,
         "dense_output": dense_output,
-        "epilogue": "ascendc_brcb" if custom_epilogue is not None else "triton",
+        "epilogue": "triton",
         "kernel_count": 2,
         "workspace_bytes": mp * np * 4,
     }
 
 
-def _launch(a_q, b_q, a_s, b_s, out, M, N, K, deq=None):
+def _launch(a_q, b_q, a_s, b_s, out, M, N, K):
     call, _ = _prepare_mm_w8a8_kernel(a_q, b_q, a_s, b_s, out, M, N, K)
     call()
     return out
@@ -1346,10 +948,10 @@ def mm_w8a8_fp8(a, b, *, out_dtype: Optional[torch.dtype] = None):
     M, K = a.shape
     _, N = b.shape
     a_q, a_s = _quantize_int8_rows(a)
-    b_q, b_s, deq = _get_cached_b(b)
+    b_q, b_s = _get_cached_b(b)
     out = torch.empty((M, N), device=a.device, dtype=_resolve_out_dtype(a, out_dtype))
     with torch_device_fn.device(a.device):
-        return _launch(a_q, b_q, a_s, b_s, out, M, N, K, deq=deq)
+        return _launch(a_q, b_q, a_s, b_s, out, M, N, K)
 
 
 def mm_w8a8_fp8_out(a, b, *, out):
@@ -1363,6 +965,6 @@ def mm_w8a8_fp8_out(a, b, *, out):
     _, N = b.shape
     assert out.shape == (M, N), "incompatible output shape"
     a_q, a_s = _quantize_int8_rows(a)
-    b_q, b_s, deq = _get_cached_b(b)
+    b_q, b_s = _get_cached_b(b)
     with torch_device_fn.device(a.device):
-        return _launch(a_q, b_q, a_s, b_s, out, M, N, K, deq=deq)
+        return _launch(a_q, b_q, a_s, b_s, out, M, N, K)

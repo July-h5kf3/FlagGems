@@ -304,7 +304,6 @@ flaggems-flagtune-compare = "flag_gems.flagtune.offline.cli.compare:main"
 
 "flag_gems" = ["backends.yaml"]
 "flag_gems.runtime" = ["*/**/*.yaml"]
-"flag_gems.runtime.backend._ascend.ops.ascendc" = ["*.cpp", "*.hpp"]
 "flag_gems.flagtune.inference" = ["manifest.json"]
 "flag_gems.flagtune.offline.contracts" = ["configs/*.yaml"]
 

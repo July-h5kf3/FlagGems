@@ -872,21 +872,25 @@ def test_npot_cube_tiles(dtype, shape):
 @pytest.mark.parametrize(
     "shape", [(104, 256, 2048), (160, 1024, 2048), (368, 2048, 512), (160, 12288, 2048)]
 )
-def test_ascendc_vector_epilogue(monkeypatch, dtype, shape):
-    monkeypatch.setenv("FLAGGEMS_MM_W8A8_EPILOGUE", "ascendc")
+def test_tle_vector_epilogue(dtype, shape):
     test_profiled_dispatch_paths(dtype, shape)
 
 
 @pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend W8A8 regression")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_ascendc_vector_graph_updates(dtype):
-    from flag_gems.runtime.backend._ascend.ops.ascendc.vector_epilogue import prepare
-
+def test_vector_scale_graph_updates(dtype):
+    mod = _mod()
+    torch.manual_seed(5973)
     c = torch.randint(-100000, 100000, (104, 256), device="npu", dtype=torch.int32)
     sa = torch.rand((104,), device="npu", dtype=torch.float32)
     sb = torch.rand((256,), device="npu", dtype=torch.float32)
     out = torch.empty((104, 256), device="npu", dtype=dtype)
-    fn, _, _ = prepare(c, sa, sb, out, 104, 256, 8, 256)
+
+    def fn():
+        mod._scale_int32_dense_kernel[(min(40, (104 // 8) * (256 // 256)),)](
+            c, sa, sb, out, 104, 256, 256, 8, 256
+        )
+
     fn()
     torch.npu.synchronize()
     g = torch.npu.NPUGraph()
@@ -904,37 +908,6 @@ def test_ascendc_vector_graph_updates(dtype):
     torch.npu.synchronize()
     ref = (c.float() * sa[:, None] * sb[None, :]).to(dtype)
     torch.testing.assert_close(out, ref, rtol=0.016, atol=0.0512)
-
-
-@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend W8A8 regression")
-def test_custom_vector_output_abi():
-    from flag_gems.runtime.backend._ascend.ops.ascendc.compile_fixpipe import (
-        lower_custom_op_to_call,
-    )
-
-    ir = """module {
-  func.func @test(%a: memref<8xf32>, %b: memref<8xf32>) {
-CUSTOM_OPERATION_PLACEHOLDER
-    return
-  }
-}"""
-    ir = ir.replace(
-        "CUSTOM_OPERATION_PLACEHOLDER",
-        (
-            '    hivm.hir.custom {symbol = "sample", hivm.tcore_type = #hivm.tcore_type<VECTO'
-            'R>, extra_attr = "flaggems_pass_outputs=true"} "sample" ins(%a : memref<8xf32>) '
-            "outs(%b : memref<8xf32>)"
-        ),
-    )
-    lowered = lower_custom_op_to_call(ir)
-    assert "func.func private @_mlir_ciface_sample(i64, i64)" in lowered
-    assert "#hivm.func_core_type<AIV>" in lowered
-    legacy = ir.replace(', extra_attr = "flaggems_pass_outputs=true"', "").replace(
-        "tcore_type<VECTOR>", "tcore_type<CUBE>"
-    )
-    lowered = lower_custom_op_to_call(legacy)
-    assert "func.func private @_mlir_ciface_sample(i64)" in lowered
-    assert "#hivm.func_core_type<AIC>" in lowered
 
 
 @pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend W8A8 regression")
@@ -1028,38 +1001,6 @@ def test_aic_fpbuffer_two_streams():
     torch.npu.synchronize()
     for out, (a, b) in zip(outputs, inputs):
         torch.testing.assert_close(out, _ref(a, b), rtol=0.016, atol=0.0512)
-
-
-@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend W8A8 regression")
-def test_declared_cube_only_rejects_live_vector():
-    from flag_gems.runtime.backend._ascend.ops.ascendc.compile_fixpipe import (
-        strip_declared_cube_only_stub,
-    )
-
-    ir = """module {
-  func.func @sample_mix_aic() attributes {hivm.part_of_mix} {
-    return
-  }
-  func.func @sample_mix_aiv() attributes {hivm.part_of_mix} {
-    return
-  }
-}"""
-    result = strip_declared_cube_only_stub(ir)
-    assert "@sample(" in result
-    assert "@sample_mix_aiv" not in result
-    assert "hivm.part_of_mix" not in result
-    for op in [
-        "func.call @write_output() : () -> ()",
-        "hivm.hir.store ins(%a : memref<16xf32>) outs(%b : memref<16xf32>)",
-    ]:
-        bad = ir.replace(
-            "  func.func @sample_mix_aiv() attributes {hivm.part_of_mix} {\n    return",
-            "  func.func @sample_mix_aiv() attributes {hivm.part_of_mix} {\n    "
-            + op
-            + "\n    return",
-        )
-        with pytest.raises(ValueError):
-            strip_declared_cube_only_stub(bad)
 
 
 @pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend W8A8 regression")

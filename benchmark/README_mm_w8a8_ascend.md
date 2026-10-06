@@ -6,32 +6,28 @@ it does not imply native FP8 matrix multiplication on Ascend 910B.
 
 ## Implementation
 
-- Shape-dependent tiling, with NZ-prepacked inputs for wide N and selected narrow N cases.
-- Exact INT32 accumulation plus a fused FP32 scale/cast Vector pass where appropriate.
-- Guarded Cube-only `al.custom` paths: Fixpipe VDEQF16 into L1, row scaling on Cube,
-  and Fixpipe BF16 output. Large short-K cases use 16-row scale blocks, batched
-  Fixpipe output, and next-tile L1 prefetch.
-- A device range check selects a software FP32 scaling fallback when the FP16
-  intermediate is unsafe. That fallback is for correctness, not a performance guarantee.
+- Shape-dependent tiling using the existing `tl.dot` kernels.
+- Exact INT32 accumulation followed by FP32 row/column scaling and an output cast.
+- No custom-op registration, local AscendC compilation, or compiler IR rewriting.
+- Native mixed kernels use one Cube-to-Vector workspace slot for correct
+  persistent tile reuse on CANN 9.1.
 
 ## Local validation
 
-The CI-preparation snapshot passed `pre-commit run --all-files`, all rule-check
+Before removal of the local AscendC fragments, the CI-preparation snapshot passed
+`pre-commit run --all-files`, all rule-check
 scripts, and the repository `tools/test-op.sh` on CANN 9.0 with
 Torch 2.10.0+cpu, torch-npu 2.10.0, and FlagTree 0.6.1+ascend3.5:
 225 tests passed in normal mode and 225 passed with `--ref=cpu --quick`.
-The built wheel contains the Python/C++ fragments; five installed-wheel smoke
-checks passed. This was local reproduction, not a completed upstream CI run.
-The final commit only additionally normalizes a header's line endings and adds
-these documentation/reference files; final-commit validation is recorded in the PR.
+Five installed-wheel smoke checks also passed on that earlier implementation.
+These results do not validate the current implementation; current validation
+is recorded in the PR.
 
 ### Known blockers before ready for review
 
-1. The CANN 8.5 CI compiler (FlagTree 0.6.0+ascend3.2) lacks intermediate pipeline
-   APIs required by the compatibility layer. Its backend tests have not passed.
+1. Backend tests on the CANN 8.5 CI environment remain unverified.
 2. Re-run all 433 performance shapes on the submitted CI-compatible source and
    pinned compiler. The reference measurements below belong to an earlier source.
-3. Review the compiler compatibility hooks and mixed/Cube entry handling.
 
 ## Historical performance evidence (not this commit)
 
