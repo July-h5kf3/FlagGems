@@ -16,6 +16,7 @@ import statistics
 
 import pytest
 import torch
+import triton
 
 import flag_gems
 
@@ -73,39 +74,6 @@ class ParallelMmW8A8Int8Benchmark(ParallelBlasBenchmark):
         return 2 * a.shape[0] * a.shape[1] * b.shape[1]
 
 
-def do_bench_npugraph(fn, rep):
-    """Median full-call device latency in ms; preparation and capture are untimed."""
-    stream = torch.npu.Stream()
-    stream.wait_stream(torch.npu.current_stream())
-    with torch.npu.stream(stream):
-        fn()
-        start = torch.npu.Event(enable_timing=True)
-        end = torch.npu.Event(enable_timing=True)
-        start.record()
-        for _ in range(5):
-            fn()
-        end.record()
-        torch.npu.synchronize()
-        estimate = start.elapsed_time(end) / 5
-        repeats = 1000 if estimate == 0 else max(1, int(rep / estimate))
-        graph = torch.npu.NPUGraph()
-        graph.capture_begin()
-        for _ in range(repeats):
-            fn()
-        graph.capture_end()
-        torch.npu.synchronize()
-        samples = []
-        for _ in range(10):
-            start.record()
-            graph.replay()
-            end.record()
-            torch.npu.synchronize()
-            samples.append(start.elapsed_time(end) / repeats)
-        graph.reset()
-    torch.npu.current_stream().wait_stream(stream)
-    return statistics.median(samples)
-
-
 class AscendMmW8A8Int8Benchmark(ParallelMmW8A8Int8Benchmark):
     """Prequantized inputs and paired public-call timing against INT8 or BF16."""
 
@@ -130,8 +98,8 @@ class AscendMmW8A8Int8Benchmark(ParallelMmW8A8Int8Benchmark):
     def _build_metric_from_input(self, input_item):
         import torch_npu
 
-        if Config.mode == BenchMode.KERNEL:
-            raise ValueError("Use --mode cudagraph to time the complete Ascend call")
+        if Config.mode == BenchMode.CUDAGRAPH:
+            raise ValueError("Use --mode kernel for NPU Event timing")
         a, b, sa, sb = input_item
         out = torch.empty(
             (a.shape[0], b.shape[1]), device=a.device, dtype=torch.bfloat16
@@ -160,8 +128,13 @@ class AscendMmW8A8Int8Benchmark(ParallelMmW8A8Int8Benchmark):
         for round_index in range(3):
             for index in (0, 1) if round_index % 2 == 0 else (1, 0):
                 latency = (
-                    do_bench_npugraph(calls[index], Config.repetition)
-                    if Config.mode == BenchMode.CUDAGRAPH
+                    triton.testing.do_bench(
+                        calls[index],
+                        warmup=Config.warm_up,
+                        rep=Config.repetition,
+                        return_mode="median",
+                    )
+                    if Config.mode == BenchMode.KERNEL
                     else self._time_callable(calls[index], None)
                 )
                 timings[index].append(latency)
