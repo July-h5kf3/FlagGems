@@ -16,12 +16,10 @@ import statistics
 
 import pytest
 import torch
-import triton
 
 import flag_gems
 
-from .conftest import Config
-from .consts import FLOAT_DTYPES, BenchmarkMetrics, BenchMode
+from .consts import FLOAT_DTYPES, BenchmarkMetrics
 from .test_blas_perf_parallel import (
     ParallelBlasBenchmark,
     ParallelMmW8A8Fp8Benchmark,
@@ -98,8 +96,6 @@ class AscendMmW8A8Int8Benchmark(ParallelMmW8A8Int8Benchmark):
     def _build_metric_from_input(self, input_item):
         import torch_npu
 
-        if Config.mode == BenchMode.CUDAGRAPH:
-            raise ValueError("Use --mode kernel for NPU Event timing")
         a, b, sa, sb = input_item
         out = torch.empty(
             (a.shape[0], b.shape[1]), device=a.device, dtype=torch.bfloat16
@@ -127,16 +123,7 @@ class AscendMmW8A8Int8Benchmark(ParallelMmW8A8Int8Benchmark):
         timings = ([], [])
         for round_index in range(3):
             for index in (0, 1) if round_index % 2 == 0 else (1, 0):
-                latency = (
-                    triton.testing.do_bench(
-                        calls[index],
-                        warmup=Config.warm_up,
-                        rep=Config.repetition,
-                        return_mode="median",
-                    )
-                    if Config.mode == BenchMode.KERNEL
-                    else self._time_callable(calls[index], None)
-                )
+                latency = self._time_callable(calls[index], None)
                 timings[index].append(latency)
         latency, latency_base = map(statistics.median, timings)
         return BenchmarkMetrics(
