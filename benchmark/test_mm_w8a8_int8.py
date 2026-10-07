@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import statistics
+
 import pytest
 import torch
 
 import flag_gems
 
-from .consts import FLOAT_DTYPES
+from .conftest import Config
+from .consts import FLOAT_DTYPES, BenchmarkMetrics, BenchMode
 from .test_blas_perf_parallel import (
     ParallelBlasBenchmark,
     ParallelMmW8A8Fp8Benchmark,
@@ -70,18 +73,131 @@ class ParallelMmW8A8Int8Benchmark(ParallelBlasBenchmark):
         return 2 * a.shape[0] * a.shape[1] * b.shape[1]
 
 
+def do_bench_npugraph(fn, rep):
+    """Median full-call device latency in ms; preparation and capture are untimed."""
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        fn()
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
+        start.record()
+        for _ in range(5):
+            fn()
+        end.record()
+        torch.npu.synchronize()
+        estimate = start.elapsed_time(end) / 5
+        repeats = 1000 if estimate == 0 else max(1, int(rep / estimate))
+        graph = torch.npu.NPUGraph()
+        graph.capture_begin()
+        for _ in range(repeats):
+            fn()
+        graph.capture_end()
+        torch.npu.synchronize()
+        samples = []
+        for _ in range(10):
+            start.record()
+            graph.replay()
+            end.record()
+            torch.npu.synchronize()
+            samples.append(start.elapsed_time(end) / repeats)
+        graph.reset()
+    torch.npu.current_stream().wait_stream(stream)
+    return statistics.median(samples)
+
+
+class AscendMmW8A8Int8Benchmark(ParallelMmW8A8Int8Benchmark):
+    """Prequantized inputs and paired public-call timing against INT8 or BF16."""
+
+    def __init__(self, *args, baseline, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.baseline = baseline
+
+    def get_input_iter(self, cur_dtype):
+        for _, m, n, k in self.shapes:
+            torch.manual_seed(0)
+            a = torch.randint(-128, 128, (m, k), device=self.device, dtype=torch.int8)
+            b = torch.randint(
+                -128, 128, (n, k), device=self.device, dtype=torch.int8
+            ).t()
+            sa = torch.rand(m, device=self.device) * 0.01
+            sb = torch.rand(n, device=self.device) * 0.01
+            yield a, b, sa, sb
+
+    def get_parallel_metric_group_size(self, shape):
+        return 1
+
+    def _build_metric_from_input(self, input_item):
+        import torch_npu
+
+        if Config.mode == BenchMode.KERNEL:
+            raise ValueError("Use --mode cudagraph to time the complete Ascend call")
+        a, b, sa, sb = input_item
+        out = torch.empty(
+            (a.shape[0], b.shape[1]), device=a.device, dtype=torch.bfloat16
+        )
+
+        def candidate():
+            return flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out)
+
+        if self.baseline == "native_int8":
+
+            def baseline():
+                return torch_npu.npu_quant_matmul(
+                    a, b, sb, pertoken_scale=sa, output_dtype=torch.bfloat16
+                )
+
+        else:
+            a_bf16 = (a.float() * sa[:, None]).bfloat16()
+            b_bf16 = (b.t().float() * sb[:, None]).bfloat16().t()
+            out_bf16 = torch.empty_like(out)
+
+            def baseline():
+                return torch.mm(a_bf16, b_bf16, out=out_bf16)
+
+        calls = (candidate, baseline)
+        timings = ([], [])
+        for round_index in range(3):
+            for index in (0, 1) if round_index % 2 == 0 else (1, 0):
+                latency = (
+                    do_bench_npugraph(calls[index], Config.repetition)
+                    if Config.mode == BenchMode.CUDAGRAPH
+                    else self._time_callable(calls[index], None)
+                )
+                timings[index].append(latency)
+        latency, latency_base = map(statistics.median, timings)
+        return BenchmarkMetrics(
+            shape_detail=self.record_shapes(a, b),
+            latency=latency,
+            latency_base=latency_base,
+            speedup=latency_base / latency,
+            tflops=2 * a.shape[0] * b.shape[1] * a.shape[1] / latency / 1e9,
+        )
+
+
 @pytest.mark.mm_w8a8_int8
-def test_mm_w8a8_int8():
+@pytest.mark.parametrize(
+    "baseline",
+    ["bf16", "native_int8"] if flag_gems.vendor_name == "ascend" else ["bf16"],
+)
+def test_mm_w8a8_int8(baseline):
     if flag_gems.vendor_name == "thead" or not hasattr(flag_gems, "mm_w8a8_int8_out"):
         pytest.skip("mm_w8a8_int8 is not implemented by the active backend")
-    bench = ParallelMmW8A8Int8Benchmark(
+    bench_cls = (
+        AscendMmW8A8Int8Benchmark
+        if flag_gems.vendor_name == "ascend"
+        else ParallelMmW8A8Int8Benchmark
+    )
+    options = {"baseline": baseline} if flag_gems.vendor_name == "ascend" else {}
+    bench = bench_cls(
         input_fn=mm_input_fn,
         op_name="mm_w8a8_int8",
         torch_op=torch.mm,
-        dtypes=FLOAT_DTYPES,
+        dtypes=[torch.bfloat16] if flag_gems.vendor_name == "ascend" else FLOAT_DTYPES,
+        **options,
     )
     bench.set_gems(flag_gems.mm_w8a8_int8)
-    print("BF16 baseline: torch; A/B quantization offline; INT8 GEMM and scaling timed")
+    print(f"Baseline: {baseline}; prequantized INT8 GEMM and scaling timed")
     bench.run()
 
 
