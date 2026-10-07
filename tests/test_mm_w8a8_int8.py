@@ -431,9 +431,33 @@ def test_prequantized(shape, dtype, scalar, bias_on, layout):
 @pytest.mark.skipif(
     flag_gems.vendor_name not in ("hygon", "ascend"), reason="INT8 long-K accumulation"
 )
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (2, 3, 262145),
+        pytest.param(
+            (1, 64, 4096),
+            marks=pytest.mark.skipif(
+                flag_gems.vendor_name != "ascend", reason="Ascend Vector reduction"
+            ),
+        ),
+        pytest.param(
+            (2, 64, 4096),
+            marks=pytest.mark.skipif(
+                flag_gems.vendor_name != "ascend", reason="Ascend Vector reduction"
+            ),
+        ),
+        pytest.param(
+            (1, 4, 16384),
+            marks=pytest.mark.skipif(
+                flag_gems.vendor_name != "ascend", reason="Ascend Vector reduction"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("code", [-128, 127])
-def test_long_k_overflow(code):
-    a, b, sa, sb = inputs(2, 3, 262145)
+def test_long_k_overflow(code, shape):
+    a, b, sa, sb = inputs(*shape)
     a.fill_(code)
     b.fill_(code)
     sa.fill_(1)
@@ -442,15 +466,41 @@ def test_long_k_overflow(code):
     gems_assert_equal(y.cpu(), reference(a, b, sa, sb))
 
 
-@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend long-K reduction")
-def test_long_k_cancellation():
-    a = torch.full((1, 131072), 127, device=flag_gems.device, dtype=torch.int8)
-    b = torch.full((131072, 1), -127, device=a.device, dtype=torch.int8)
-    b[:65536].fill_(127)
-    b[0, 0] = 126
-    scale = torch.ones(1, device=a.device)
-    y = flag_gems.mm_w8a8_int8(a, b, scale, scale, torch.float32)
-    gems_assert_equal(y.cpu(), reference(a, b, scale, scale))
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend", reason="Ascend integer reduction"
+)
+@pytest.mark.parametrize(
+    "shape,dtype,scalar_bias",
+    [
+        ((1, 1, 131072), torch.float32, False),
+        ((1, 64, 4096), torch.float32, False),
+        ((2, 64, 4096), torch.float32, False),
+        ((1, 4, 16384), torch.float32, False),
+        ((1, 64, 4096), torch.bfloat16, True),
+        ((2, 64, 4096), torch.bfloat16, True),
+        ((1, 4, 16384), torch.bfloat16, True),
+    ],
+)
+def test_long_k_cancellation(shape, dtype, scalar_bias):
+    m, n, k = shape
+    a = torch.full((m, k), 127, device=flag_gems.device, dtype=torch.int8)
+    b = torch.full((n, k), -127, device=a.device, dtype=torch.int8).t()
+    b[: k // 2].fill_(127)
+    b[0].fill_(126)
+    if scalar_bias:
+        sa = torch.full((1,), 0.5, device=a.device)
+        sb = torch.full((1,), 0.25, device=a.device)
+        bias = torch.arange(n, device=a.device, dtype=dtype) * 0.25
+    else:
+        sa = torch.ones(m, device=a.device)
+        sb = torch.ones(n, device=a.device)
+        bias = None
+    expected = reference(a, b, sa, sb, bias, dtype)
+    y = flag_gems.mm_w8a8_int8(a, b, sa, sb, dtype, bias)
+    gems_assert_equal(y.cpu(), expected)
+    out = torch.empty_like(y)
+    assert flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias) is out
+    gems_assert_equal(out.cpu(), expected)
 
 
 @pytest.mark.skipif(
@@ -483,6 +533,24 @@ def test_mixed_scales(a_scalar, b_scalar):
             (2048, 2048, 2048),
             marks=pytest.mark.skipif(
                 flag_gems.vendor_name != "ascend", reason="Ascend mixed kernel"
+            ),
+        ),
+        pytest.param(
+            (1, 64, 4096),
+            marks=pytest.mark.skipif(
+                flag_gems.vendor_name != "ascend", reason="Ascend Vector kernel"
+            ),
+        ),
+        pytest.param(
+            (2, 64, 4096),
+            marks=pytest.mark.skipif(
+                flag_gems.vendor_name != "ascend", reason="Ascend Vector kernel"
+            ),
+        ),
+        pytest.param(
+            (1, 4, 16384),
+            marks=pytest.mark.skipif(
+                flag_gems.vendor_name != "ascend", reason="Ascend Vector kernel"
             ),
         ),
     ],
