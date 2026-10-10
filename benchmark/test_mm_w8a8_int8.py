@@ -19,6 +19,8 @@ import torch
 
 import flag_gems
 
+from . import consts
+from .conftest import Config
 from .consts import FLOAT_DTYPES, BenchmarkMetrics
 from .test_blas_perf_parallel import (
     ParallelBlasBenchmark,
@@ -92,6 +94,45 @@ class AscendMmW8A8Int8Benchmark(ParallelMmW8A8Int8Benchmark):
 
     def get_parallel_metric_group_size(self, shape):
         return 1
+
+    def _time_callable(self, fn, xs):
+        # Ascend has no triton do_bench_cudagraph, so NPU graph timing lives here
+        # in the operator benchmark instead of the shared benchmark base.
+        if Config.mode != consts.BenchMode.CUDAGRAPH:
+            return super()._time_callable(fn, xs)
+        torch_device_fn = flag_gems.runtime.torch_device_fn
+        stream = torch_device_fn.Stream()
+        stream.wait_stream(torch_device_fn.current_stream())
+        with torch_device_fn.stream(stream):
+            fn()
+            start = torch_device_fn.Event(enable_timing=True)
+            end = torch_device_fn.Event(enable_timing=True)
+            start.record()
+            for _ in range(5):
+                fn()
+            end.record()
+            torch_device_fn.synchronize()
+            estimate = start.elapsed_time(end) / 5
+            repeats = (
+                1000 if estimate == 0 else max(1, int(Config.repetition / estimate))
+            )
+            graph = torch_device_fn.NPUGraph()
+            with torch_device_fn.graph(graph, stream=stream):
+                for _ in range(repeats):
+                    fn()
+            torch_device_fn.synchronize()
+            samples = []
+            for _ in range(10):
+                start = torch_device_fn.Event(enable_timing=True)
+                end = torch_device_fn.Event(enable_timing=True)
+                start.record()
+                graph.replay()
+                end.record()
+                torch_device_fn.synchronize()
+                samples.append(start.elapsed_time(end) / repeats)
+            graph.reset()
+        torch_device_fn.current_stream().wait_stream(stream)
+        return statistics.median(samples)
 
     def _build_metric_from_input(self, input_item):
         import torch_npu
