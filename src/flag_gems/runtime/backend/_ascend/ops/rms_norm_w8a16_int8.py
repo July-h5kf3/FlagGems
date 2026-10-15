@@ -20,9 +20,9 @@ weights from GM into UB. The default group size is 128. The group count is
 ``ceil(N / group_size)``; a final partial group is supported on every path.
 
 Dispatch:
-- Power-of-two N <= 4096 with ``N % group_size == 0``: 1D kernel with BLOCK_M
-  rows so INT8 weight + scale are loaded once per program and reused. Mid-size
-  M uses BLOCK_M=8; small and very large M use BLOCK_M=2 (higher occupancy).
+- Power-of-two N <= 4096 with ``N % group_size == 0``: tiled kernel bound to
+  the physical Vector core count. Each core processes consecutive row tiles
+  and reuses dequantized, broadcast weights across its tiles.
 - Power-of-two N <= 8192 with ``N % group_size == 0``: 1D row kernel.
   Full-row BLOCK_M overflows Ascend UB by a few hundred bytes. Scale is loaded
   uniquely and broadcast via reshape (no ``cols // group_size`` gather, no
@@ -97,33 +97,31 @@ def rms_norm_int8_w8a16_blockm_kernel(
     w_ptr,
     w_scale_ptr,
     M,
-    N,
+    N: tl.constexpr,
     eps,
-    BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    pid = ext.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask_n = cols < N
-    # Weight is reused across BLOCK_M rows; reload-per-row is extra HBM
-    # and extra scalar prologue when M is large.
-    w = tl.load(w_ptr + cols, mask=mask_n, other=0.0).to(tl.float32)
-    w_scale = tl.load(w_scale_ptr + tl.arange(0, NUM_GROUPS)).to(tl.float32)
-    w2 = tl.reshape(w, (NUM_GROUPS, GROUP_SIZE))
-    for i in range(0, BLOCK_M):
-        row = pid * BLOCK_M + i
-        row_mask = row < M
-        x = tl.load(in_ptr + row * N + cols, mask=mask_n & row_mask, other=0.0).to(
-            tl.float32
-        )
-        rrms = 1 / tl.sqrt(tl.sum(x * x, axis=0) / N + eps)
-        y = tl.reshape(
-            tl.reshape(x, (NUM_GROUPS, GROUP_SIZE)) * rrms * w2 * w_scale[:, None],
-            (BLOCK_SIZE,),
-        )
-        tl.store(out_ptr + row * N + cols, y, mask=mask_n & row_mask)
+    columns = tl.arange(0, N)
+    weight_q = tl.load(w_ptr + columns).to(tl.float32)
+    scales = tl.load(w_scale_ptr + tl.arange(0, N // GROUP_SIZE)).to(tl.float32)
+    weight = tl.reshape(
+        tl.reshape(weight_q, (N // GROUP_SIZE, GROUP_SIZE)) * scales[:, None], (N,)
+    )
+    weight = tl.broadcast_to(weight[None, :], (BLOCK_M, N))
+    row_offsets = tl.arange(0, BLOCK_M)
+    tiles_per_core = tl.cdiv(tl.cdiv(M, BLOCK_M), tl.num_programs(0))
+    tile_start = tl.program_id(0) * tiles_per_core
+    tile_stop = tl.minimum(tile_start + tiles_per_core, tl.cdiv(M, BLOCK_M))
+    for tile in range(tile_start, tile_stop):
+        rows = tile * BLOCK_M + row_offsets
+        offsets = rows[:, None] * N + columns[None, :]
+        mask = rows[:, None] < M
+        x = tl.load(in_ptr + offsets, mask=mask, other=0).to(tl.float32)
+        variance = tl.sum(x * x, axis=1) / N
+        inverse_rms = tl.rsqrt(variance + eps)
+        y = x * inverse_rms[:, None] * weight
+        tl.store(out_ptr + offsets, y, mask=mask)
 
 
 @libentry()
@@ -333,27 +331,17 @@ def rms_norm_w8a16_int8(
         # FP32 2D tile (512B row stride, UB bank conflict). An exact division
         # of a power-of-two N implies a power-of-two GROUP_SIZE/NUM_GROUPS.
         if N <= 4096 and N == triton.next_power_of_2(N) and N % group_size == 0:
-            # BLOCK_M=8 is best for a few hundred rows; BLOCK_M=2 wins on
-            # tiny M (occupancy) and large M (more programs, same reuse).
-            if 256 <= M < 1024:
-                block_m, num_warps = 8, 2
-            else:
-                block_m = 2
-                num_warps = 2 if 16 <= M < 256 else 4
-            grid = triton.cdiv(M, block_m)
+            block_m = (
+                1
+                if N >= 2048 and M <= 16
+                else min(triton.next_power_of_2(max(M, 1)), max(1, 8192 // N))
+            )
+            cores = torch_device_fn.get_device_limit(torch_device_fn.current_device())[
+                "vector_core_num"
+            ]
+            grid = min(triton.cdiv(M, block_m), cores)
             rms_norm_int8_w8a16_blockm_kernel[grid,](
-                y,
-                x,
-                weight_q,
-                weight_scale,
-                M,
-                N,
-                eps,
-                N,
-                group_size,
-                num_groups,
-                block_m,
-                num_warps=num_warps,
+                y, x, weight_q, weight_scale, M, N, eps, group_size, block_m
             )
         elif N <= 8192 and N == triton.next_power_of_2(N) and N % group_size == 0:
             rms_norm_int8_w8a16_kernel[M,](
