@@ -20,7 +20,15 @@ from flag_gems.runtime import torch_device_fn
 
 from .accuracy_utils import gems_assert_equal
 
-pytestmark = pytest.mark.mm_w8a8_int8
+INT8_REGISTERED = "mm_w8a8_int8_out" in dict(
+    flag_gems.runtime.backend.get_customized_ops(flag_gems.vendor_name)
+)
+pytestmark = [
+    pytest.mark.mm_w8a8,
+    pytest.mark.skipif(
+        not INT8_REGISTERED, reason="W8A8 INT8 backend is not registered"
+    ),
+]
 
 
 SHAPES = [
@@ -53,7 +61,7 @@ SHAPES = [
 @pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.mm_w8a8_int8
+@pytest.mark.mm_w8a8
 def test_mm_w8a8_int8(shape, dtype):
     m, n, k = shape
     a = torch.randint(-128, 128, (m, k), device=flag_gems.device, dtype=torch.int8)
@@ -71,7 +79,7 @@ def test_mm_w8a8_int8(shape, dtype):
     flag_gems.vendor_name not in ("thead", "ascend"), reason="INT8 strided matrices"
 )
 @pytest.mark.parametrize("layout", ["row_major", "sliced", "broadcast"])
-@pytest.mark.mm_w8a8_int8
+@pytest.mark.mm_w8a8
 def test_mm_w8a8_int8_strides(layout):
     m, n, k = 17, 35, 67
     a = torch.randint(-10, 11, (m, k), device=flag_gems.device, dtype=torch.int8)
@@ -95,7 +103,7 @@ def test_mm_w8a8_int8_strides(layout):
 @pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
 @pytest.mark.parametrize("use_graph", [False, True])
 @pytest.mark.parametrize("use_out", [False, True])
-@pytest.mark.mm_w8a8_int8
+@pytest.mark.mm_w8a8
 @pytest.mark.parametrize("shape", [(16, 32, 128), (1, 64, 2048), (128, 1, 2048)])
 def test_mm_w8a8_int8_updates(use_graph, use_out, shape):
     m, n, k = shape
@@ -141,7 +149,7 @@ def test_mm_w8a8_int8_updates(use_graph, use_out, shape):
 
 @pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
 @pytest.mark.parametrize("shape", [(2, 3, 0), (0, 3, 8), (2, 0, 8), (0, 0, 0)])
-@pytest.mark.mm_w8a8_int8
+@pytest.mark.mm_w8a8
 def test_mm_w8a8_int8_empty(shape):
     m, n, k = shape
     a = torch.empty((m, k), device=flag_gems.device, dtype=torch.int8)
@@ -153,7 +161,7 @@ def test_mm_w8a8_int8_empty(shape):
 
 
 @pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
-@pytest.mark.mm_w8a8_int8
+@pytest.mark.mm_w8a8
 def test_mm_w8a8_int8_reject_float():
     a = torch.ones((2, 3), device=flag_gems.device)
     b = torch.ones((3, 4), device=a.device)
@@ -375,12 +383,6 @@ def reference(a, b, sa, sb, bias=None, dtype=torch.float32):
     return value.to(dtype)
 
 
-_PREQUANTIZED = ("hygon", "metax", "ascend")
-
-
-@pytest.mark.skipif(
-    flag_gems.vendor_name not in _PREQUANTIZED, reason="prequantized W8A8 INT8 only"
-)
 @pytest.mark.parametrize(
     "shape",
     [
@@ -406,7 +408,7 @@ _PREQUANTIZED = ("hygon", "metax", "ascend")
     "scalar,bias_on,layout",
     [(False, False, False), (False, True, True), (True, True, False)],
 )
-@pytest.mark.mm_w8a8_int8
+@pytest.mark.mm_w8a8
 def test_prequantized(shape, dtype, scalar, bias_on, layout):
     if flag_gems.vendor_name == "metax" and dtype == torch.float32:
         pytest.skip("MetaX scaled_mm output is FP16 or BF16")
@@ -436,9 +438,6 @@ def test_long_k_overflow(code):
     gems_assert_equal(y.cpu(), reference(a, b, sa, sb))
 
 
-@pytest.mark.skipif(
-    flag_gems.vendor_name not in _PREQUANTIZED, reason="prequantized W8A8 INT8 only"
-)
 @pytest.mark.parametrize("a_scalar,b_scalar", [(True, False), (False, True)])
 def test_mixed_scales(a_scalar, b_scalar):
     a, b, sa, sb = inputs(17, 13, 31)
@@ -449,9 +448,6 @@ def test_mixed_scales(a_scalar, b_scalar):
     gems_assert_equal(y.cpu(), reference(a, b, sa, sb, dtype=torch.bfloat16))
 
 
-@pytest.mark.skipif(
-    flag_gems.vendor_name not in _PREQUANTIZED, reason="prequantized W8A8 INT8 only"
-)
 def test_graph_updates():
     a, b, sa, sb = inputs(17, 13, 31)
     dtype = torch.bfloat16 if flag_gems.vendor_name == "metax" else torch.float32
@@ -476,9 +472,6 @@ def test_graph_updates():
     gems_assert_equal(out.cpu(), reference(a, b, sa, sb, bias, dtype))
 
 
-@pytest.mark.skipif(
-    flag_gems.vendor_name not in _PREQUANTIZED, reason="prequantized W8A8 INT8 only"
-)
 @pytest.mark.parametrize(
     "bad",
     [

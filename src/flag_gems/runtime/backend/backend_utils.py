@@ -15,6 +15,7 @@
 import functools
 import os
 from dataclasses import dataclass
+from typing import Callable, Optional
 
 import yaml
 
@@ -36,7 +37,9 @@ class VendorDescriptor:
     bf16_enabled: bool = True
     int64_enabled: bool = True
     fp8_enabled: bool = True
+    complex_enabled: bool = True
     tle_enabled: bool = False
+    graph_benchmark: Optional[Callable] = None
 
 
 def get_tune_config(vendor_name=None, file_mode="r", file_path=None):
