@@ -17,6 +17,7 @@ import torch
 
 import flag_gems
 from flag_gems.runtime import torch_device_fn
+from flag_gems.runtime.backend import get_customized_ops
 
 from . import base
 
@@ -89,9 +90,9 @@ class RmsNormW8A16FP8Benchmark(base.Benchmark):
             yield x, (n,), weight_fp8, scales, weight_ref
 
 
-@pytest.mark.rms_norm_w8a16
-@pytest.mark.skipif(not _fp8_available(), reason="Requires FP8 E4M3FN support")
-def test_rms_norm_w8a16_fp8():
+def run_rms_norm_w8a16_fp8():
+    if not _fp8_available():
+        pytest.skip("Requires FP8 E4M3FN support")
     print("Baseline: Torch BF16 (torch.nn.functional.rms_norm)")
     bench = RmsNormW8A16FP8Benchmark(
         op_name="rms_norm_w8a16",
@@ -99,4 +100,25 @@ def test_rms_norm_w8a16_fp8():
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_rms_norm_w8a16_fp8)
+    bench.run()
+
+
+@pytest.mark.rms_norm_w8a16
+def test_rms_norm_w8a16():
+    registered_ops = dict(get_customized_ops(flag_gems.vendor_name))
+    if "rms_norm_w8a16_int8" not in registered_ops:
+        run_rms_norm_w8a16_fp8()
+        return
+    from .test_rms_norm import (
+        RmsNormInt8W8A16Benchmark,
+        _gems_rms_norm_w8a16_int8,
+        _torch_rms_norm_w8a16,
+    )
+
+    bench = RmsNormInt8W8A16Benchmark(
+        op_name="rms_norm_w8a16",
+        torch_op=_torch_rms_norm_w8a16,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_rms_norm_w8a16_int8)
     bench.run()

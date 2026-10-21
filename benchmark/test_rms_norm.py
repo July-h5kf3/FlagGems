@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 import torch
+import yaml
 
 import flag_gems
 
 from . import base
+from .conftest import Config
+from .consts import BenchLevel
+from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 
 @pytest.mark.rms_norm
@@ -37,6 +43,7 @@ def test_rms_norm():
 
 
 GROUP_SIZE = 128
+EPSILON = 1e-5
 
 
 def _quantize_int8_grouped(w, group_size=GROUP_SIZE):
@@ -56,32 +63,59 @@ def _quantize_int8_grouped(w, group_size=GROUP_SIZE):
 
 
 def _torch_rms_norm_w8a16(x, normalized_shape, weight_q, weight_scale, weight_ref):
-    return torch.nn.functional.rms_norm(x, normalized_shape, weight_ref)
+    return torch.nn.functional.rms_norm(x, normalized_shape, weight_ref, eps=EPSILON)
 
 
 def _gems_rms_norm_w8a16_int8(
     x, normalized_shape, weight_int8, weight_scale, weight_ref
 ):
-    return flag_gems.rms_norm_w8a16_int8(x, normalized_shape, weight_int8, weight_scale)
+    return flag_gems.rms_norm_w8a16_int8(
+        x,
+        normalized_shape,
+        weight_int8,
+        weight_scale,
+        eps=EPSILON,
+        group_size=GROUP_SIZE,
+    )
 
 
 class RmsNormW8A16Benchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "M, N"
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
+    DEFAULT_SHAPES = [
+        (2, 256),
+        (256, 256),
+        (32768, 256),
+        (1, 2048),
+        (496, 2048),
+        (512, 2048),
+        (1035, 2048),
+        (16384, 2048),
+    ]
     quantize_weight = None
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [
-            (1, 4096),
-            (16, 4096),
-            (64, 4096),
-            (256, 4096),
-            (1024, 4096),
-            (1, 8192),
-            (64, 8192),
-            (256, 8192),
-            (1, 16384),
-            (64, 16384),
-        ]
+        shape_file_path = shape_file_path or self.DEFAULT_SHAPE_FILES
+        if Path(shape_file_path).resolve() != Path(self.DEFAULT_SHAPE_FILES).resolve():
+            super().set_shapes(shape_file_path)
+            return
+        # The shared core YAML also has a generic Benchmark entry with 1D shapes.
+        self.shapes = list(self.DEFAULT_SHAPES)
+        self.shape_desc = self.DEFAULT_SHAPE_DESC
+        if Config.bench_level == BenchLevel.COMPREHENSIVE and not Config.query:
+            self.shapes = list(dict.fromkeys(self.shapes + self.set_more_shapes()))
+
+    def set_more_shapes(self):
+        # An explicit shape file must remain authoritative for manual shards.
+        if (
+            Path(Config.shape_file).resolve()
+            != Path(self.DEFAULT_SHAPE_FILES).resolve()
+        ):
+            return []
+        shape_path = Path(__file__).parent / "models_shapes" / "rms_norm_w8a16.yaml"
+        with shape_path.open(encoding="utf-8") as shape_file:
+            shape_config = yaml.safe_load(shape_file)
+        return [tuple(shape) for shape in shape_config[self.op_name]["shapes"]]
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
@@ -89,23 +123,15 @@ class RmsNormW8A16Benchmark(base.Benchmark):
             x = torch.randn(shape, dtype=dtype, device=self.device)
             weight = torch.randn(n, dtype=dtype, device=self.device)
             weight_q, weight_scale = self.quantize_weight(weight)
-            yield x, (n,), weight_q, weight_scale, weight
+            # Prepare the BF16 baseline weight before either implementation is timed.
+            weight_ref = (
+                weight_q.float()
+                * weight_scale.float().repeat_interleave(GROUP_SIZE)[:n]
+            ).to(dtype)
+            yield x, (n,), weight_q, weight_scale, weight_ref
 
 
-class RmsNormInt8W8A16Benchmark(RmsNormW8A16Benchmark):
+class RmsNormInt8W8A16Benchmark(ParallelBenchmarkMixin, RmsNormW8A16Benchmark):
+    SHAPE_CONFIG_KEYS = ("rms_norm_w8a16",)
+    RECORD_PARALLEL_RESULTS = True
     quantize_weight = staticmethod(_quantize_int8_grouped)
-
-
-@pytest.mark.rms_norm_w8a16
-@pytest.mark.skipif(
-    flag_gems.vendor_name != "ascend",
-    reason="RMSNorm W8A16 INT8 is only available on Ascend",
-)
-def test_rms_norm_w8a16_int8():
-    bench = RmsNormInt8W8A16Benchmark(
-        op_name="rms_norm_w8a16",
-        torch_op=_torch_rms_norm_w8a16,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_gems_rms_norm_w8a16_int8)
-    bench.run()

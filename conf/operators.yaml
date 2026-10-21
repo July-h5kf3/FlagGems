@@ -16706,7 +16706,8 @@ ops:
 
     '
   for:
-  - None
+  - rms_norm_w8a16_fp8
+  - rms_norm_w8a16_int8
   labels:
   - NoCPU
   - Normalization

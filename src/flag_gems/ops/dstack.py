@@ -76,8 +76,16 @@ _MULTI_SELECT_UNSUPPORTED = {
     torch.float8_e5m2,
     torch.float8_e4m3fnuz,
     torch.float8_e5m2fnuz,
-    torch.float8_e8m0fnu,
 }
+
+
+# E8M0 is optional on the older Torch releases used by some backends.
+try:
+    from torch import float8_e8m0fnu
+except ImportError:
+    pass
+else:
+    _MULTI_SELECT_UNSUPPORTED.add(float8_e8m0fnu)
 
 
 def _next_pow2(value: int) -> int:
