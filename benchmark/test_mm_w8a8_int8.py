@@ -131,6 +131,7 @@ def test_mm_w8a8_int8():
     )
     if "mm_w8a8_int8_out" not in registered_ops:
         pytest.skip("mm_w8a8_int8 is not implemented by the active backend")
+    torch.manual_seed(0)
     bench_cls = (
         ParallelMmW8A8Int8THeadBenchmark
         if flag_gems.vendor_name == "thead"
