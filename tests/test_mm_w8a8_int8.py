@@ -383,6 +383,10 @@ def reference(a, b, sa, sb, bias=None, dtype=torch.float32):
     return value.to(dtype)
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name == "thead",
+    reason="PPU keeps its existing INT8 accuracy suite",
+)
 @pytest.mark.parametrize(
     "shape",
     [
@@ -439,6 +443,10 @@ def test_long_k_overflow(code):
     gems_assert_equal(y.cpu(), reference(a, b, sa, sb))
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name == "thead",
+    reason="PPU keeps its existing INT8 accuracy suite",
+)
 @pytest.mark.parametrize("a_scalar,b_scalar", [(True, False), (False, True)])
 def test_mixed_scales(a_scalar, b_scalar):
     a, b, sa, sb = inputs(17, 13, 31)
@@ -449,6 +457,10 @@ def test_mixed_scales(a_scalar, b_scalar):
     gems_assert_equal(y.cpu(), reference(a, b, sa, sb, dtype=torch.bfloat16))
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name == "thead",
+    reason="PPU keeps its existing INT8 accuracy suite",
+)
 def test_graph_updates():
     a, b, sa, sb = inputs(17, 13, 31)
     dtype = torch.bfloat16 if flag_gems.vendor_name == "metax" else torch.float32
@@ -473,6 +485,10 @@ def test_graph_updates():
     gems_assert_equal(out.cpu(), reference(a, b, sa, sb, bias, dtype))
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name == "thead",
+    reason="PPU keeps its existing INT8 accuracy suite",
+)
 @pytest.mark.parametrize(
     "bad",
     [
