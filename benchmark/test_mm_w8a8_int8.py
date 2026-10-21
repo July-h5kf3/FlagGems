@@ -39,8 +39,12 @@ class ParallelMmW8A8Int8Benchmark(ParallelBlasBenchmark):
 
     def prepare_call(self, op, a, b):
         if op is self.torch_op:
-            a_bf16, b_bf16 = a.to(torch.bfloat16), b.to(torch.bfloat16)
-            return lambda: op(a_bf16, b_bf16)
+            a_bf16 = a.to(torch.bfloat16)
+            b_bf16 = b.to(torch.bfloat16).t().contiguous().t()
+            out_bf16 = torch.empty(
+                (a.shape[0], b.shape[1]), device=a.device, dtype=torch.bfloat16
+            )
+            return lambda: op(a_bf16, b_bf16, out=out_bf16)
         # Quantize both inputs offline; time only the public scaled INT8 GEMM.
         activation = a.float()
         peak_a = activation.abs().amax(dim=1).clamp_min(1e-10)
