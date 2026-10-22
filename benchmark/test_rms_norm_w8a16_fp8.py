@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 import torch
+import yaml
 
 import flag_gems
 from flag_gems.runtime import torch_device_fn
+from flag_gems.runtime.backend import get_customized_ops
 
 from . import base
+from .conftest import Config
+from .consts import BenchLevel
+from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 GROUP_SIZE = 128
 
@@ -45,26 +52,62 @@ def _gems_rms_norm_w8a16_fp8(x, shape, weight_fp8, weight_scale, weight_ref):
     )
 
 
-class RmsNormW8A16FP8Benchmark(base.Benchmark):
+class RmsNormW8A16FP8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
     DEFAULT_SHAPE_DESC = "M, N"
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
+    DEFAULT_SHAPES = [
+        (1, 4096),
+        (16, 4096),
+        (64, 4096),
+        (256, 4096),
+        (1024, 4096),
+        (1, 8192),
+        (64, 8192),
+        (256, 8192),
+        (1, 16384),
+        (64, 16384),
+        (1, 32768),
+        (64, 32768),
+        (4096, 4096),
+        (16, 33024),
+    ]
+    SHAPE_CONFIG_KEYS = ("rms_norm_w8a16",)
+    RECORD_PARALLEL_RESULTS = True
+
+    def run(self, case_ids=None):
+        # Preserve the base runner's case validation and special-mode controls.
+        if (
+            case_ids is not None
+            or Config.case_ids is not None
+            or Config.reference_only
+            or Config.preflight_only
+            or Config.profile_only
+            or Config.list_cases
+            or Config.skip_native
+        ):
+            return base.Benchmark.run(self, case_ids=case_ids)
+        return super().run()
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [
-            (1, 4096),
-            (16, 4096),
-            (64, 4096),
-            (256, 4096),
-            (1024, 4096),
-            (1, 8192),
-            (64, 8192),
-            (256, 8192),
-            (1, 16384),
-            (64, 16384),
-            (1, 32768),
-            (64, 32768),
-            (4096, 4096),
-            (16, 33024),
-        ]
+        self.shape_file = str(
+            Path(shape_file_path or self.DEFAULT_SHAPE_FILES).resolve()
+        )
+        if self.shape_file != str(Path(self.DEFAULT_SHAPE_FILES).resolve()):
+            super().set_shapes(self.shape_file)
+            return
+        self.shapes = self.DEFAULT_SHAPES[:]
+        self.shape_desc = self.DEFAULT_SHAPE_DESC
+        if Config.bench_level == BenchLevel.COMPREHENSIVE and not Config.query:
+            self.shapes = list(dict.fromkeys(self.shapes + self.set_more_shapes()))
+
+    def set_more_shapes(self):
+        # Worker shards and explicit shape files must not expand a second time.
+        if self.shape_file != str(Path(self.DEFAULT_SHAPE_FILES).resolve()):
+            return []
+        shape_path = Path(__file__).parent / "models_shapes" / "rms_norm_w8a16_fp8.yaml"
+        with shape_path.open(encoding="utf-8") as shape_file:
+            shape_config = yaml.safe_load(shape_file)
+        return [tuple(shape) for shape in shape_config[self.op_name]["shapes"]]
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
@@ -90,13 +133,29 @@ class RmsNormW8A16FP8Benchmark(base.Benchmark):
 
 
 @pytest.mark.rms_norm_w8a16
-@pytest.mark.skipif(not _fp8_available(), reason="Requires FP8 E4M3FN support")
-def test_rms_norm_w8a16_fp8():
+def test_rms_norm_w8a16():
     print("Baseline: Torch BF16 (torch.nn.functional.rms_norm)")
-    bench = RmsNormW8A16FP8Benchmark(
-        op_name="rms_norm_w8a16",
-        torch_op=_torch_rms_norm,
-        dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(_gems_rms_norm_w8a16_fp8)
+    registered_ops = dict(get_customized_ops(flag_gems.vendor_name))
+    if "rms_norm_w8a16_int8" in registered_ops:
+        from .test_rms_norm import (
+            RmsNormInt8W8A16Benchmark,
+            _gems_rms_norm_w8a16_int8,
+            _torch_rms_norm_w8a16,
+        )
+
+        bench = RmsNormInt8W8A16Benchmark(
+            op_name="rms_norm_w8a16",
+            torch_op=_torch_rms_norm_w8a16,
+            dtypes=[torch.bfloat16],
+        )
+        bench.set_gems(_gems_rms_norm_w8a16_int8)
+    else:
+        if not _fp8_available():
+            pytest.skip("Requires FP8 E4M3FN support")
+        bench = RmsNormW8A16FP8Benchmark(
+            op_name="rms_norm_w8a16",
+            torch_op=_torch_rms_norm,
+            dtypes=[torch.bfloat16],
+        )
+        bench.set_gems(_gems_rms_norm_w8a16_fp8)
     bench.run()
