@@ -40,7 +40,6 @@ from .consts import (
     FLOAT_DTYPES,
     BenchLevel,
     BenchmarkMetrics,
-    BenchmarkResult,
     OperationAttribute,
     model_shapes,
 )
@@ -1065,15 +1064,7 @@ class ParallelBenchmarkMixin:
                 self._emit_result(dtype, metrics)
                 continue
 
-            result = BenchmarkResult(
-                level=Config.bench_level.value,
-                op_name=self.op_name,
-                dtype=str(dtype),
-                mode=Config.mode.value,
-                result=metrics,
-            )
-            print(result)
-            emit_record_logger(result.to_json())
+            result = self._emit_result(dtype, metrics)
             if os.environ.get(PARALLEL_RESULT_FILE_ENV):
                 with open(os.environ[PARALLEL_RESULT_FILE_ENV], "wb") as result_file:
                     pickle.dump(result, result_file)
@@ -1614,6 +1605,10 @@ def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
 
 
 @pytest.mark.mm_w8a8
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "nvidia",
+    reason="The parallel FP8 benchmark requires CUDA Graph; use test_mm_w8a8_fp8.py on other backends",
+)
 def test_mm_w8a8_fp8():
     if not hasattr(flag_gems, "mm_w8a8_fp8_out"):
         pytest.skip("mm_w8a8_fp8 benchmark requires the Hopper W8A8 backend")
