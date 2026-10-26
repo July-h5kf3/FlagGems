@@ -407,6 +407,7 @@ _PREQUANTIZED = ("hygon", "metax", "ascend")
     [(False, False, False), (False, True, True), (True, True, False)],
 )
 @pytest.mark.mm_w8a8
+@pytest.mark.mm_w8a8_out
 def test_prequantized(shape, dtype, scalar, bias_on, layout):
     if flag_gems.vendor_name == "metax" and dtype == torch.float32:
         pytest.skip("MetaX scaled_mm output is FP16 or BF16")
