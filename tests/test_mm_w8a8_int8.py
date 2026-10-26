@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from importlib import import_module
-from pathlib import Path
-
 import pytest
 import torch
 
@@ -23,28 +20,7 @@ from flag_gems.runtime import torch_device_fn
 
 from .accuracy_utils import gems_assert_equal
 
-VENDOR_MODULE = import_module(f"flag_gems.runtime.backend._{flag_gems.vendor_name}")
-VALIDATION_SOURCE = Path(VENDOR_MODULE.__file__).parent / "testing" / "mm_w8a8_int8.py"
-ADAPTER = (
-    import_module(f"{VENDOR_MODULE.__name__}.testing.mm_w8a8_int8")
-    if VALIDATION_SOURCE.is_file()
-    else None
-)
-
-
-def backend_supports(feature):
-    return ADAPTER is not None and ADAPTER.supports(feature)
-
-
-INT8_REGISTERED = "mm_w8a8_int8_out" in dict(
-    flag_gems.runtime.backend.get_customized_ops(flag_gems.vendor_name)
-)
-pytestmark = [
-    pytest.mark.mm_w8a8,
-    pytest.mark.skipif(
-        not INT8_REGISTERED, reason="W8A8 INT8 backend is not registered"
-    ),
-]
+pytestmark = pytest.mark.mm_w8a8
 
 
 SHAPES = [
@@ -92,8 +68,7 @@ def test_mm_w8a8_int8(shape, dtype):
 
 
 @pytest.mark.skipif(
-    not (flag_gems.vendor_name == "thead" or backend_supports("strided_inputs")),
-    reason="INT8 strided matrices",
+    flag_gems.vendor_name not in ("thead", "ascend"), reason="INT8 strided matrices"
 )
 @pytest.mark.parametrize("layout", ["row_major", "sliced", "broadcast"])
 @pytest.mark.mm_w8a8
@@ -244,8 +219,7 @@ def test_scaled_bias(shape, out_dtype, scales):
 
 
 @pytest.mark.skipif(
-    not (flag_gems.vendor_name == "thead" or backend_supports("default_float32")),
-    reason="INT8 default output dtype",
+    flag_gems.vendor_name not in ("thead", "ascend"), reason="INT8 default output dtype"
 )
 @pytest.mark.parametrize("shape", [(2, 3, 0), (0, 3, 8), (2, 0, 8), (0, 0, 0)])
 def test_scaled_empty_bias(shape):
@@ -354,8 +328,7 @@ def test_scaled_validation(invalid):
 
 
 @pytest.mark.skipif(
-    not (flag_gems.vendor_name == "thead" or backend_supports("default_float32")),
-    reason="INT8 default output dtype",
+    flag_gems.vendor_name not in ("thead", "ascend"), reason="INT8 default output dtype"
 )
 @pytest.mark.parametrize(
     "shape", [(1, 17, 32), (3, 35, 128), (17, 35, 67), (3, 17, 33001)]
@@ -402,9 +375,11 @@ def reference(a, b, sa, sb, bias=None, dtype=torch.float32):
     return value.to(dtype)
 
 
+_PREQUANTIZED = ("hygon", "metax", "ascend")
+
+
 @pytest.mark.skipif(
-    flag_gems.vendor_name == "thead",
-    reason="PPU keeps its existing INT8 accuracy suite",
+    flag_gems.vendor_name not in _PREQUANTIZED, reason="prequantized W8A8 INT8 only"
 )
 @pytest.mark.parametrize(
     "shape",
@@ -432,7 +407,6 @@ def reference(a, b, sa, sb, bias=None, dtype=torch.float32):
     [(False, False, False), (False, True, True), (True, True, False)],
 )
 @pytest.mark.mm_w8a8
-@pytest.mark.mm_w8a8_out
 def test_prequantized(shape, dtype, scalar, bias_on, layout):
     if flag_gems.vendor_name == "metax" and dtype == torch.float32:
         pytest.skip("MetaX scaled_mm output is FP16 or BF16")
@@ -449,8 +423,7 @@ def test_prequantized(shape, dtype, scalar, bias_on, layout):
 
 
 @pytest.mark.skipif(
-    not (flag_gems.vendor_name == "hygon" or backend_supports("long_k")),
-    reason="INT8 long-K accumulation",
+    flag_gems.vendor_name not in ("hygon", "ascend"), reason="INT8 long-K accumulation"
 )
 @pytest.mark.parametrize("code", [-128, 127])
 def test_long_k_overflow(code):
@@ -464,8 +437,7 @@ def test_long_k_overflow(code):
 
 
 @pytest.mark.skipif(
-    flag_gems.vendor_name == "thead",
-    reason="PPU keeps its existing INT8 accuracy suite",
+    flag_gems.vendor_name not in _PREQUANTIZED, reason="prequantized W8A8 INT8 only"
 )
 @pytest.mark.parametrize("a_scalar,b_scalar", [(True, False), (False, True)])
 def test_mixed_scales(a_scalar, b_scalar):
@@ -478,8 +450,7 @@ def test_mixed_scales(a_scalar, b_scalar):
 
 
 @pytest.mark.skipif(
-    flag_gems.vendor_name == "thead",
-    reason="PPU keeps its existing INT8 accuracy suite",
+    flag_gems.vendor_name not in _PREQUANTIZED, reason="prequantized W8A8 INT8 only"
 )
 def test_graph_updates():
     a, b, sa, sb = inputs(17, 13, 31)
@@ -488,7 +459,12 @@ def test_graph_updates():
     out = torch.empty((17, 13), device=flag_gems.device, dtype=dtype)
     for _ in range(3):
         flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias)
-    graph = ADAPTER.new_graph() if ADAPTER is not None else torch_device_fn.CUDAGraph()
+    graph_type = (
+        torch_device_fn.NPUGraph
+        if flag_gems.vendor_name == "ascend"
+        else torch_device_fn.CUDAGraph
+    )
+    graph = graph_type()
     with torch_device_fn.graph(graph):
         flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out, bias=bias)
     a.fill_(-128)
@@ -501,8 +477,7 @@ def test_graph_updates():
 
 
 @pytest.mark.skipif(
-    flag_gems.vendor_name == "thead",
-    reason="PPU keeps its existing INT8 accuracy suite",
+    flag_gems.vendor_name not in _PREQUANTIZED, reason="prequantized W8A8 INT8 only"
 )
 @pytest.mark.parametrize(
     "bad",
@@ -526,8 +501,8 @@ def test_graph_updates():
 def test_invalid(bad):
     if flag_gems.vendor_name == "metax" and bad in ("scale_stride", "alias"):
         pytest.skip("MetaX copies strided scales and does not reject aliased out")
-    if backend_supports("accepts_" + bad):
-        pytest.skip("The registered backend accepts this layout")
+    if flag_gems.vendor_name == "ascend" and bad in ("scale_stride", "out_stride"):
+        pytest.skip("Ascend accepts strided scales and 2D output")
     a, b, sa, sb = inputs(3, 5, 7)
     bias = None
     out_dtype = torch.bfloat16 if flag_gems.vendor_name == "metax" else torch.float32

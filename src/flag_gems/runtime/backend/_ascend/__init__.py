@@ -14,7 +14,7 @@
 
 from backend_utils import VendorDescriptor  # noqa: F402
 
-from .utils import CORE_NUM, benchmark_graph  # noqa: F401
+from .utils import CORE_NUM  # noqa: F401
 
 
 def get_triton_extra_name():
@@ -38,7 +38,6 @@ vendor_info = VendorDescriptor(
     dispatch_key="PrivateUse1",
     triton_extra_name=get_triton_extra_name(),
     fp64_enabled=False,
-    graph_benchmark=benchmark_graph,
 )
 
 CUSTOMIZED_UNUSED_OPS = (
