@@ -12,46 +12,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-only gates for the Ascend topk pin and the Hygon mm FP8 skip.
+"""CPU-only gates for the Ascend topk lowering probe and the Hygon mm FP8 skip.
 
 These tests are intentionally unmarked. Acceptance selects ``topk_w8a16`` and
 ``mm_w8a8``; this file must not change those collections.
 """
 
-from .ascend_topk_segment import ascend_custom_segment_bug, ascend_segment_error
+from .ascend_topk_segment import ascend_segment_error, lowering_reports_segment_bug
 from .mm_fp8_vendor_gate import nvidia_hopper_fp8
 
 
-def test_flagtree_ascend35_segment_pin():
-    assert ascend_custom_segment_bug("npu", "ascend", "0.7.0+ascend3.5")
-    assert ascend_custom_segment_bug("npu", "ascend", "flagtree==0.7.0+ascend3.5")
-    assert ascend_custom_segment_bug("cpu", "ascend", "0.7.0+ascend3.5")
-    assert not ascend_custom_segment_bug("npu", "ascend", "0.8.0+ascend3.5")
-    assert not ascend_custom_segment_bug("npu", "ascend", "0.7.0+ascend3.6")
-    assert not ascend_custom_segment_bug("cuda", "nvidia", "0.7.0+ascend3.5")
-    assert not ascend_custom_segment_bug("cuda", "hygon", "0.7.0+hcu3.6")
-    assert not ascend_custom_segment_bug("npu", "ascend", "")
-    assert not ascend_custom_segment_bug("npu", "ascend", None)
+def _raise(exc):
+    def lower():
+        raise exc
 
-    mlir = RuntimeError(
-        "operandSegmentSizes = array<i32: 0, 0> hivm.hir.custom sort32"
-    )
-    wrapped = RuntimeError("compile failed")
-    wrapped.__cause__ = mlir
-    assert ascend_segment_error(mlir)
-    assert ascend_segment_error(wrapped)
+    return lower
+
+
+def test_ascend_segment_gate_follows_lowering_not_version():
     sample = (
         "'hivm.hir.custom' op operand count (4) does not match with the total "
         "size (0) specified in attribute 'operandSegmentSizes' "
         'name = "sort32", operandSegmentSizes = array<i32: 0, 0>'
     )
-    assert ascend_segment_error(RuntimeError(sample))
-    assert ascend_segment_error(
-        RuntimeError("compare_scalar operandSegmentSizes mismatch")
+    assert lowering_reports_segment_bug(_raise(RuntimeError(sample)))
+    wrapped = RuntimeError("compile failed")
+    wrapped.__cause__ = RuntimeError(sample)
+    assert ascend_segment_error(wrapped)
+    assert lowering_reports_segment_bug(_raise(wrapped))
+    assert lowering_reports_segment_bug(
+        _raise(RuntimeError("compare_scalar operandSegmentSizes mismatch"))
     )
-    capacity = ValueError("K and N exceed the supported Ascend sort capacity")
-    assert not ascend_segment_error(capacity)
-    assert not ascend_segment_error(RuntimeError("operandSegmentSizes only"))
+    assert lowering_reports_segment_bug(
+        lambda: (
+            'hivm.hir.custom name = "sort32", '
+            "operandSegmentSizes = array<i32: 0, 0>"
+        )
+    )
+
+    good_ir = (
+        "flagtree==0.7.0+ascend3.5 hivm.hir.custom sort32 "
+        "operandSegmentSizes = array<i32: 3, 1, 0>"
+    )
+    assert not lowering_reports_segment_bug(lambda: good_ir)
+    assert not lowering_reports_segment_bug(lambda: "flagtree==0.7.0+ascend3.5")
+    assert not lowering_reports_segment_bug(lambda: "")
+    assert not lowering_reports_segment_bug(
+        _raise(ValueError("K and N exceed the supported Ascend sort capacity"))
+    )
+    assert not lowering_reports_segment_bug(
+        _raise(RuntimeError("operandSegmentSizes only"))
+    )
+    assert not lowering_reports_segment_bug(_raise(ImportError("cann extension")))
 
 
 def test_nvidia_hopper_fp8_gate_skips_hygon():

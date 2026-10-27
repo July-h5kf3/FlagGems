@@ -22,9 +22,8 @@ import flag_gems
 
 from tests.ascend_topk_segment import (
     SEGMENT_REASON,
-    ascend_custom_segment_bug,
     ascend_segment_error,
-    flagtree_version,
+    ascend_sort32_segment_bug,
 )
 
 from . import base
@@ -207,11 +206,7 @@ class AscendGraphMode(Enum):
 def test_topk_w8a16_fp8(baseline, monkeypatch):
     vendor = getattr(flag_gems, "vendor_name", None)
     ascend = flag_gems.device == "npu" or vendor == "ascend"
-    if ascend and ascend_custom_segment_bug(
-        flag_gems.device,
-        vendor,
-        flagtree_version(),
-    ):
+    if ascend and ascend_sort32_segment_bug():
         pytest.skip(SEGMENT_REASON)
     if flag_gems.device == "npu":
         monkeypatch.setattr(Config, "mode", AscendGraphMode.NPUGRAPH)
