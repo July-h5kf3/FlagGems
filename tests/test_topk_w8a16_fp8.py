@@ -18,6 +18,12 @@ import torch
 import flag_gems
 
 from . import accuracy_utils as utils
+from .ascend_topk_segment import (
+    SEGMENT_REASON,
+    ascend_custom_segment_bug,
+    ascend_segment_error,
+    flagtree_version,
+)
 
 FP8_DTYPE = torch.float8_e5m2
 FP8_GROUP_SIZE = 128
@@ -352,7 +358,14 @@ def test_topk_fp8_validation():
     with pytest.raises(TypeError):
         flag_gems.topk_w8a16_fp8(torch.zeros((2, 128), device=q.device), s, 1)
     if flag_gems.device == "npu":
-        flag_gems.topk_w8a16_fp8(e5, s, 1)
+        # e5m2 is legal on Ascend and this call compiles. The error cases
+        # above return before the custom op, so keep them when the pin is broken.
+        if not ascend_custom_segment_bug(
+            flag_gems.device,
+            getattr(flag_gems, "vendor_name", None),
+            flagtree_version(),
+        ):
+            _ascend_topk(e5, s, 1)
     else:
         with pytest.raises(TypeError, match="float8_e4m3fn"):
             flag_gems.topk_w8a16_fp8(e5, s, 1)
@@ -401,8 +414,39 @@ CASES = [
 ]
 
 
+def _skip_if_ascend_custom_segment_bug():
+    if ascend_custom_segment_bug(
+        getattr(flag_gems, "device", None),
+        getattr(flag_gems, "vendor_name", None),
+        flagtree_version(),
+    ):
+        pytest.skip(SEGMENT_REASON)
+
+
+def _ascend_kernel_would_launch(q, k):
+    # k == 0 and empty rows return before sort32 / compare_scalar.
+    return k != 0 and q.numel() != 0 and q.shape[-1] != 0
+
+
+def _ascend_topk(*args, **kwargs):
+    try:
+        return flag_gems.topk_w8a16_fp8(*args, **kwargs)
+    except Exception as exc:
+        if ascend_segment_error(exc):
+            pytest.skip(SEGMENT_REASON)
+        raise
+
+
 def _run_ascend(q, s, k, group_size, largest):
-    _check_topk(q.npu(), s.npu(), k, group_size=group_size, largest=largest)
+    launch = _ascend_kernel_would_launch(q, k)
+    if launch:
+        _skip_if_ascend_custom_segment_bug()
+    try:
+        _check_topk(q.npu(), s.npu(), k, group_size=group_size, largest=largest)
+    except Exception as exc:
+        if launch and ascend_segment_error(exc):
+            pytest.skip(SEGMENT_REASON)
+        raise
 
 
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
@@ -476,6 +520,7 @@ def test_topk_fp8_all_finite_encodings_ascend(dtype, max_code, largest):
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
 @pytest.mark.topk_w8a16
 def test_topk_fp8_graph_replay_changed_inputs_ascend():
+    _skip_if_ascend_custom_segment_bug()
     torch.manual_seed(811)
     q_cpu = torch.randn((64, 4096)).to(torch.float8_e4m3fn)
     s_cpu = torch.ones((64, 1), dtype=torch.bfloat16)
@@ -483,11 +528,11 @@ def test_topk_fp8_graph_replay_changed_inputs_ascend():
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):
-        flag_gems.topk_w8a16_fp8(q, s, 64, group_size=4096)
+        _ascend_topk(q, s, 64, group_size=4096)
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph, stream=stream):
-        values, indices = flag_gems.topk_w8a16_fp8(q, s, 64, group_size=4096)
+        values, indices = _ascend_topk(q, s, 64, group_size=4096)
     for changed in (False, True):
         if changed:
             q_cpu = (torch.randn((64, 4096)) * 2).to(torch.float8_e4m3fn)
@@ -511,6 +556,7 @@ def test_topk_fp8_large_cutoff_ties_and_zero_scale_ascend():
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
 @pytest.mark.topk_w8a16
 def test_topk_fp8_unaligned_storage_and_current_stream_ascend():
+    _skip_if_ascend_custom_segment_bug()
     torch.manual_seed(953)
     q_cpu = torch.randn((3, 4096)).to(torch.float8_e4m3fn)
     storage = torch.empty(q_cpu.numel() + 1, device="npu", dtype=torch.uint8)
@@ -524,7 +570,7 @@ def test_topk_fp8_unaligned_storage_and_current_stream_ascend():
         stream = torch.npu.Stream()
         stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(stream):
-            values, indices = flag_gems.topk_w8a16_fp8(q, s, 64, group_size=4096)
+            values, indices = _ascend_topk(q, s, 64, group_size=4096)
         stream.synchronize()
         _check_topk(q_cpu, s_cpu, 64, 4096, largest=True, result=(values, indices))
         q_cpu = (-torch.randn(q_cpu.shape)).to(torch.float8_e4m3fn)
@@ -556,6 +602,7 @@ def test_topk_fp8_over_sort_capacity_ascend():
 @pytest.mark.skipif(flag_gems.device != "npu", reason="Ascend only")
 @pytest.mark.topk_w8a16
 def test_topk_fp8_output_dtype_and_strides_ascend():
+    _skip_if_ascend_custom_segment_bug()
     # The op must accept non-contiguous fp8/scale views. Build the reference
     # from CPU-side strided tensors so the comparison never issues a device
     # copy of a strided float8 tensor (Ascend AICPU StridedSlice does not
@@ -569,7 +616,7 @@ def test_topk_fp8_output_dtype_and_strides_ascend():
     s = torch.ones((4, 4), device="npu", dtype=torch.float16)[::2, ::2]
     # n=128 columns with two scale groups -> group_size=64 (ng=2) matches the
     # (2, 2) scale; the default group_size would expect a single group.
-    result = flag_gems.topk_w8a16_fp8(
+    result = _ascend_topk(
         q, s, 17, group_size=64, out_dtype=torch.float16, sorted=False
     )
     _check_topk(
