@@ -59,14 +59,15 @@ def _quantize_fp8_weight(weight, group_size=GROUP_SIZE):
 
 @pytest.mark.rms_norm_w8a16
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("n", [256, 4096])
 @pytest.mark.parametrize("capture", [False, True], ids=["eager", "graph"])
 @pytest.mark.skipif(
     flag_gems.vendor_name not in ("thead", "mthreads", "metax")
     or not _cuda_fp8_e4m3fn_available(),
     reason="Regression test for backend W8A16 weight dequantization",
 )
-def test_rms_norm_w8a16_fp8_weight_updates(dtype, capture):
-    n = 4096
+def test_rms_norm_w8a16_fp8_weight_updates(dtype, n, capture):
+    torch.manual_seed(6210)
     inp = torch.randn((512, n), device=flag_gems.device, dtype=dtype)
     weight_q = torch.ones(n, device=inp.device, dtype=dtype).to(FP8_DTYPE)
     weight_scale = torch.ones(n // GROUP_SIZE, device=inp.device, dtype=dtype)
@@ -119,7 +120,14 @@ def test_rms_norm_w8a16_fp8_weight_updates(dtype, capture):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "m,n,group_size",
-    [(2, 256, 128), (2, 384, 128), (2, 32768, 64), (2, 33024, 128), (513, 4096, 128)],
+    [
+        (2, 256, 128),
+        (257, 256, 128),
+        (2, 384, 128),
+        (2, 32768, 64),
+        (2, 33024, 128),
+        (513, 4096, 128),
+    ],
 )
 @pytest.mark.skipif(
     flag_gems.vendor_name not in ("thead", "mthreads", "metax")
@@ -216,6 +224,9 @@ def test_rms_norm_w8a16_fp8(shape):
     "shape,normalized_shape,group_size,strided",
     [
         ((0, 4096), (4096,), 128, False),
+        ((129, 256), (256,), 128, False),
+        ((1031, 256), (256,), 128, False),
+        ((65, 2048), (2048,), 128, False),
         ((3, 65), (65,), 64, False),
         ((5, 1000), (1000,), 128, True),
         ((3, 1056), (1056,), 96, True),
@@ -241,6 +252,7 @@ def test_rms_norm_w8a16_fp8_mthreads_shapes(
 ):
     import math
 
+    torch.manual_seed(6210)
     n = math.prod(normalized_shape)
     inp_shape = (*shape[:-1], shape[-1] * 2) if strided else shape
     inp = torch.randn(inp_shape, device=flag_gems.device, dtype=dtype)

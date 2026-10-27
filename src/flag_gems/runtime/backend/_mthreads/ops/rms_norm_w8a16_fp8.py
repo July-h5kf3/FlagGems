@@ -17,6 +17,7 @@ import math
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
@@ -24,15 +25,23 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
+NARROW_ROW_LAYOUT = tle.gpu.BlockEncoding(
+    size_per_thread=[1, 8],
+    threads_per_warp=[1, 32],
+    warps_per_cta=[4, 1],
+    order=[1, 0],
+)
+NARROW_WEIGHT_LAYOUT = tle.gpu.SlicedEncoding(0, NARROW_ROW_LAYOUT)
+
 
 @libentry()
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit(do_not_specialize=["M", "eps"])
 def rms_norm_w8a16_fp8_kernel(
     X,
     W,
     S,
     Y,
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     W_STRIDE: tl.constexpr,
     S_STRIDE: tl.constexpr,
@@ -41,13 +50,13 @@ def rms_norm_w8a16_fp8_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_M: tl.constexpr,
     NUM_WARPS: tl.constexpr,
+    USE_TLE: tl.constexpr = False,
+    ROW_LAYOUT: tl.constexpr = None,
+    WEIGHT_LAYOUT: tl.constexpr = None,
 ):
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.arange(0, BLOCK_N)
-    offsets = rows[:, None] * N + cols[None, :]
-    mask = (rows[:, None] < M) & (cols[None, :] < N)
-    x = tl.load(X + offsets, mask=mask, other=0.0).to(tl.float32)
-    inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / N + eps)
+    # Anchor the weight slice layout before inferring two-dimensional offsets.
     w = tl.load(W + cols * W_STRIDE, mask=cols < N, other=0.0).to(tl.float32)
     if GROUP_SIZE <= BLOCK_N and GROUP_SIZE & (GROUP_SIZE - 1) == 0:
         groups = tl.arange(0, BLOCK_N // GROUP_SIZE)
@@ -63,6 +72,14 @@ def rms_norm_w8a16_fp8_kernel(
             S + (cols // GROUP_SIZE) * S_STRIDE, mask=cols < N, other=0.0
         ).to(tl.float32)
         w *= scale
+    if USE_TLE:
+        w = tle.gpu.set_layout(w, WEIGHT_LAYOUT)
+    offsets = rows[:, None] * N + cols[None, :]
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    x = tl.load(X + offsets, mask=mask, other=0.0).to(tl.float32)
+    if USE_TLE:
+        x = tle.gpu.set_layout(x, ROW_LAYOUT)
+    inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / N + eps)
     # Share decoded weights across rows without materializing a device buffer.
     y = (x * inv_rms[:, None]) * w[None, :]
     tl.store(Y + offsets, y, mask=mask)
@@ -175,14 +192,27 @@ def rms_norm_w8a16_fp8(
             )
         elif n <= 65536:
             block_m = 1
+            use_tle = (
+                n == 256
+                and m >= 256
+                and group_size == 128
+                and weight_fp8.stride(0) == 1
+                and weight_scale.stride(0) == 1
+            )
             if n <= 1024:
                 num_warps = 4
+                if use_tle:
+                    # Four rows reduce program count; larger inputs can share
+                    # decoded weights across sixteen rows without spilling.
+                    block_m = 4 if m < 8192 else 16
             elif n <= 4096:
                 if m <= 16:
                     num_warps = 32
                 elif m <= 64:
                     num_warps = 16
                 elif m < 512:
+                    num_warps = 8
+                elif n == 2048 and m < 4096:
                     num_warps = 8
                 else:
                     block_m, num_warps = 2, 16
@@ -202,6 +232,9 @@ def rms_norm_w8a16_fp8(
                 triton.next_power_of_2(n),
                 block_m,
                 num_warps,
+                USE_TLE=use_tle,
+                ROW_LAYOUT=NARROW_ROW_LAYOUT if use_tle else None,
+                WEIGHT_LAYOUT=NARROW_WEIGHT_LAYOUT if use_tle else None,
                 num_warps=num_warps,
             )
         else:
