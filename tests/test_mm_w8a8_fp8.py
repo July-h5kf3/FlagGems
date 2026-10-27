@@ -19,18 +19,32 @@ import triton
 import flag_gems
 
 from . import accuracy_utils as utils
+from .mm_fp8_vendor_gate import nvidia_hopper_fp8
 
 
 def _cuda_hopper_w8a8_fp8_available():
+    # Vendor first: Hygon's CUDA shim can throw or report a Hopper-like
+    # capability, and that must stay a skip rather than an error or a fail.
+    if getattr(flag_gems, "vendor_name", None) != "nvidia":
+        return False
+    if flag_gems.device != "cuda":
+        return False
+    try:
+        cuda_ok = torch.cuda.is_available()
+        capability = torch.cuda.get_device_capability() if cuda_ok else None
+    except Exception:
+        cuda_ok = False
+        capability = None
     tensor_descriptor = getattr(
         getattr(triton, "tools", None), "tensor_descriptor", None
     )
-    return (
-        flag_gems.device == "cuda"
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] >= 9
-        and hasattr(torch, "float8_e4m3fn")
-        and hasattr(tensor_descriptor, "TensorDescriptor")
+    return nvidia_hopper_fp8(
+        flag_gems.vendor_name,
+        flag_gems.device,
+        cuda_ok,
+        capability,
+        hasattr(torch, "float8_e4m3fn"),
+        hasattr(tensor_descriptor, "TensorDescriptor"),
     )
 
 
@@ -85,7 +99,7 @@ def _scaled_fp8_reference(a, b, sa, sb):
 )
 @pytest.mark.skipif(
     not (_cuda_hopper_w8a8_fp8_available() or _mthreads_w8a8_fp8_available()),
-    reason="mm_w8a8_fp8 requires Hopper or MThreads FP8 support",
+    reason="mm_w8a8_fp8 requires NVIDIA Hopper or MThreads; Hygon acceptance is INT8",
 )
 def test_mm_w8a8_fp8(M, N, K):
     dtype = torch.bfloat16
