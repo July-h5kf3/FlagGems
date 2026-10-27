@@ -20,12 +20,6 @@ import torch
 
 import flag_gems
 
-from tests.ascend_topk_segment import (
-    SEGMENT_REASON,
-    ascend_segment_error,
-    ascend_sort32_segment_bug,
-)
-
 from . import base
 from .conftest import Config
 
@@ -204,10 +198,6 @@ class AscendGraphMode(Enum):
     ),
 )
 def test_topk_w8a16_fp8(baseline, monkeypatch):
-    vendor = getattr(flag_gems, "vendor_name", None)
-    ascend = flag_gems.device == "npu" or vendor == "ascend"
-    if ascend and ascend_sort32_segment_bug():
-        pytest.skip(SEGMENT_REASON)
     if flag_gems.device == "npu":
         monkeypatch.setattr(Config, "mode", AscendGraphMode.NPUGRAPH)
         benchmark_class = AscendTopKFp8W8A16Benchmark
@@ -222,9 +212,4 @@ def test_topk_w8a16_fp8(baseline, monkeypatch):
     print(
         f"FP8 format: {FP8_DTYPE}; BF16 baseline: {baseline}; input quantization excluded"
     )
-    try:
-        bench.run()
-    except Exception as exc:
-        if ascend and ascend_segment_error(exc):
-            pytest.skip(SEGMENT_REASON)
-        raise
+    bench.run()
