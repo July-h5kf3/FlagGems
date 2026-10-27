@@ -107,6 +107,21 @@ jobs:
           source .venv/bin/activate
           tools/test-op.sh ${{ inputs.pr_id }}
 
+      - name: Test Ascend TopK SDK integration
+        if: >-
+          inputs.backend == 'ascend-cann910' && inputs.test_script == '' &&
+          (contains(inputs.changed_files, 'backends.yaml') ||
+           contains(inputs.changed_files, '_ascend/env.sh') ||
+           contains(inputs.changed_files, '910B.yaml'))
+        shell: bash
+        env:
+          CHANGED_FILES: tests/test_topk_w8a16_fp8.py benchmark/test_topk_w8a16_fp8.py
+          # Keep the main backend test coverage when this smoke suite starts.
+          COVERAGE_FILE: .coverage-ascend-sdk
+        run: |
+          source .venv/bin/activate
+          tools/test-op.sh ${{ inputs.pr_id }}
+
   # Kunlunxin runs inside a container on the klx-p800 server, since the XPU
   # driver/runtime it needs is only set up inside this image.
   # Equivalent to:
