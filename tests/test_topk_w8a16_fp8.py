@@ -20,9 +20,8 @@ import flag_gems
 from . import accuracy_utils as utils
 from .ascend_topk_segment import (
     SEGMENT_REASON,
-    ascend_custom_segment_bug,
     ascend_segment_error,
-    flagtree_version,
+    ascend_sort32_segment_bug,
 )
 
 FP8_DTYPE = torch.float8_e5m2
@@ -359,12 +358,8 @@ def test_topk_fp8_validation():
         flag_gems.topk_w8a16_fp8(torch.zeros((2, 128), device=q.device), s, 1)
     if flag_gems.device == "npu":
         # e5m2 is legal on Ascend and this call compiles. The error cases
-        # above return before the custom op, so keep them when the pin is broken.
-        if not ascend_custom_segment_bug(
-            flag_gems.device,
-            getattr(flag_gems, "vendor_name", None),
-            flagtree_version(),
-        ):
+        # above return before the custom op, so keep them when lowering is broken.
+        if not ascend_sort32_segment_bug():
             _ascend_topk(e5, s, 1)
     else:
         with pytest.raises(TypeError, match="float8_e4m3fn"):
@@ -415,11 +410,7 @@ CASES = [
 
 
 def _skip_if_ascend_custom_segment_bug():
-    if ascend_custom_segment_bug(
-        getattr(flag_gems, "device", None),
-        getattr(flag_gems, "vendor_name", None),
-        flagtree_version(),
-    ):
+    if ascend_sort32_segment_bug():
         pytest.skip(SEGMENT_REASON)
 
 

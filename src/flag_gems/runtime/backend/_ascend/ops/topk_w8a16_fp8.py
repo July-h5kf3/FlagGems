@@ -105,12 +105,11 @@ def _sort(v, ids, B: tl.constexpr, K: tl.constexpr):
     KEEP: tl.constexpr = triton.next_power_of_2(K) if K >= 8 else 8
     # FlagTree registry ABI (#1159): sort32(fp32 values, uint32 indices,
     # repeat count, fp32 pair out). compare_scalar (#1156) is
-    # (src, fp32 scalar, CMPMODE, count, bitmask out). flagtree==0.7.0+ascend3.5
-    # still lowers these al.custom calls to hivm.hir.custom with
-    # operandSegmentSizes=[0, 0] while the operands are attached. That
-    # attribute is written by the HIVM CustomOp builder, not by this
-    # argument list. Acceptance skips those kernels; do not republish FlagTree
-    # from this tree.
+    # (src, fp32 scalar, CMPMODE, count, bitmask out). Those symbols are in
+    # flagtree==0.7.0+ascend3.5. Some builds still emit hivm.hir.custom with
+    # operandSegmentSizes=[0, 0] from the HIVM CustomOp builder, not from
+    # this argument list. Acceptance probes that lowering and skips only
+    # when it is still broken. Do not republish FlagTree from this tree.
     pairs = al.custom("sort32", v, ids, B // 32, out=tl.full((2 * B,), 0, tl.float32))
     if PREFIX:
         pairs = _prefix_view(pairs, B // 32, 64, 2 * KEEP)

@@ -101,9 +101,11 @@ backends:
     triton: triton==3.5.0
     triton_post_install:
       - triton_ascend==3.2.1
-    # Tagged at FlagTree #1156. sort32/compare_scalar (#1159/#1156) are in
-    # this build, but hivm.hir.custom is still emitted with
-    # operandSegmentSizes=[0, 0]. Do not replace this pin from FlagGems.
+    # FlagTree #1156/#1159 (this pin) ship sort32/compare_scalar. Some
+    # acceptance images still lower hivm.hir.custom with
+    # operandSegmentSizes=[0, 0]. Tests detect that lowering at runtime.
+    # Do not replace this pin from FlagGems, and do not skip on the
+    # version string: a rebuilt custom_ops.bc keeps this version.
     flagtree: flagtree==0.7.0+ascend3.5
     env_source:
       - /usr/local/Ascend/cann/set_env.sh
