@@ -90,8 +90,8 @@ Install the dependencies for your backend (the backend keys are the same ones
 # NVIDIA CUDA 12.8
 flaggems-setup nvidia-cuda128
 
-# Huawei Ascend CANN 9.0.0
-flaggems-setup ascend-cann900
+# Huawei Ascend CANN 9.1 or newer
+flaggems-setup ascend-cann910
 
 # MetaX MACA 3.8.1
 flaggems-setup metax-maca3810
@@ -122,6 +122,32 @@ COMPILER=triton flaggems-setup nvidia-cuda128
 ```
 
 See [Environment variables](#env-vars) for the full `COMPILER` behavior.
+
+### Ascend FP8 TopK requirements
+
+The Ascend `topk_w8a16_fp8` implementation uses FlagTree custom ops and requires
+CANN 9.1.0 or newer. CANN 9.0 cannot read this custom-op IR correctly and can
+report `operandSegmentSizes = [0, 0]`. Upgrading the Python packages alone does
+not upgrade the CANN SDK.
+
+Select the complete SDK before installing dependencies:
+
+```shell
+export CANN_ENV_SCRIPT=/path/to/cann-9.1/set_env.sh
+source "$CANN_ENV_SCRIPT"
+export FLAGTREE_BACKEND=ascend
+flaggems-setup ascend-cann910
+```
+
+`ascend-cann910` pins FlagTree in `backends.yaml`, includes its `pybind11` and
+`cann-shmem` dependencies, and checks the SDK version and compiler paths before
+installing packages. It fails on an incompatible SDK; it does not skip tests.
+The older `ascend-cann850` and `ascend-cann900` profiles remain available.
+
+For source installations, use `./setup.sh ascend-cann910`. The selected
+`CANN_ENV_SCRIPT` is saved in `.venv/bin/activate`, so later activation loads the
+same complete SDK and repeats the compatibility check. The Ascend CI entry also
+uses `ascend-cann910`; its runner must provide a compatible SDK.
 
 ## 3. Build and install from source {#install-from-source}
 
@@ -156,8 +182,8 @@ For example:
 # NVIDIA CUDA 12.8
 ./setup.sh nvidia-cuda128
 
-# Huawei Ascend CANN 9.0.0
-./setup.sh ascend-cann900
+# Huawei Ascend CANN 9.1 or newer
+./setup.sh ascend-cann910
 
 # MetaX MACA 3.8.1
 ./setup.sh metax-maca3810

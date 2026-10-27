@@ -94,6 +94,17 @@ ascend-cann900 = [
     "flagtree==0.7.1a1+ascend3.5",
 ]
 
+ascend-cann910 = [
+    "cann-shmem==1.6.0",
+    "torch==2.10.0+cpu",
+    "torch-npu==2.10.0",
+    "pybind11==3.0.3",
+    "decorator==5.2.1",
+    "attrs==25.3.0",
+    "psutil==7.0.0",
+    "flagtree==0.7.1a1+ascend3.5",
+]
+
 biren-br2xx = [
     "torch==2.12.0+cpu",
     "torch-supa==1.0.0.21200+br2xx",
@@ -311,6 +322,7 @@ flaggems-flagtune-compare = "flag_gems.flagtune.offline.cli.compare:main"
 
 "flag_gems" = ["backends.yaml"]
 "flag_gems.runtime" = ["*/**/*.yaml"]
+"flag_gems.runtime.backend._ascend" = ["env.sh"]
 "flag_gems.runtime.backend._metax" = ["stft_fft_shim.cpp"]
 "flag_gems.flagtune.inference" = ["manifest.json"]
 "flag_gems.flagtune.offline.contracts" = ["configs/*.yaml"]

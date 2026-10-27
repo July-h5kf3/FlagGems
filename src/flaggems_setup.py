@@ -277,6 +277,22 @@ def main():
     print(f"Compiler: {compiler}")
     print()
 
+    for script in backend.get("required_env_source", []):
+        script_path = locate_backends_yaml().parent / script
+        print(f"Required SDK environment: {script_path}")
+        if args.dry_run:
+            continue
+        try:
+            exported = subprocess.check_output(
+                ["bash", "-ec", 'source "$1" >&2; env -0', "bash", str(script_path)]
+            )
+        except subprocess.CalledProcessError as exc:
+            raise SystemExit(exc.returncode) from None
+        os.environ.update(
+            os.fsdecode(entry).split("=", 1) for entry in exported.split(b"\0") if entry
+        )
+        print(f"Source {script_path} in shells that run FlagGems.")
+
     # Step 1: Install vendor packages (torch + vendor runtime)
     print("[Step 1] Installing vendor packages ...")
     install_pkgs(pip, deps, index, mirror, dry_run=args.dry_run)

@@ -108,6 +108,11 @@ jobs:
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}"
 
+      - name: Check Ascend SDK environment setup
+        id: check-ascend-environment
+        continue-on-error: true
+        run: python3 -m unittest discover -s tools -p 'test_ascend_environment.py'
+
       - name: Check operators.yaml
         id: check-operators-yaml
         if: steps.derive.outputs.has_changes == 'true'
@@ -169,7 +174,7 @@ jobs:
           STEPS_JSON: ${{ toJSON(steps) }}
         run: |
           failed=0
-          for step_id in check-operators-yaml check-init-exports check-kernelgen-tests check-operator-markers check-aten-operators; do
+          for step_id in check-operators-yaml check-init-exports check-kernelgen-tests check-operator-markers check-aten-operators check-ascend-environment; do
             result=$(echo "$STEPS_JSON" | jq -r --arg id "$step_id" '.[$id].outcome // "skipped"')
             echo "$step_id: $result"
             if [ "$result" = "failure" ]; then

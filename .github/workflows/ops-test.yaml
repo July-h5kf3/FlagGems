@@ -253,6 +253,12 @@ jobs:
             ' || true
           fi
 
+      - name: Check Ascend SDK compatibility
+        if: matrix.backend == 'ascend-cann910'
+        env: ${{ fromJSON(matrix.test_env) }}
+        shell: bash --login -e -o pipefail {0}
+        run: source tools/env.sh ascend-cann910
+
       - name: Install FlagGems dependencies
         env: ${{ fromJSON(matrix.test_env) }}
         shell: bash --login -e -o pipefail {0}

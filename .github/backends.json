@@ -1,6 +1,6 @@
 [
   {
-    "backend": "ascend-cann900",
+    "backend": "ascend-cann910",
     "vendor": "ascend",
     "runner_label": "cann9",
     "command_aliases": ["ascend", "cann9"],

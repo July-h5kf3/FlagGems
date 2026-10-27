@@ -9,6 +9,7 @@
 # way regardless of which shell sources .venv/bin/activate.
 #
 # Usage: bash tools/source_env_bash.sh <script-to-source>
+# Add --required to propagate SDK errors instead of keeping optional behavior.
 # Output (on stdout): export KEY='VALUE' lines, one per changed/added var.
 
 set -euo pipefail
@@ -24,8 +25,17 @@ env -0 >"${before_file}"
 # normally pre-defined by profile scripts in a login shell. Relax -eu while
 # sourcing so an unset-variable reference doesn't kill this whole helper.
 set +eu
-source "${script}" >/dev/null 2>&1
+if [ "${2:-}" = "--required" ]; then
+    source "${script}" >/dev/null
+    source_status=$?
+else
+    source "${script}" >/dev/null 2>&1
+    source_status=0
+fi
 set -eu
+if [ "$source_status" -ne 0 ]; then
+    exit "$source_status"
+fi
 env -0 >"${after_file}"
 
 python3 - "${before_file}" "${after_file}" <<'PY'

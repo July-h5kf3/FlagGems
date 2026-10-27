@@ -48,6 +48,8 @@
 #
 # "env_source:" — vendor scripts to source (list of paths).
 #   Each script is sourced if it exists.
+# "required_env_source:" — package-relative scripts that must succeed before
+#   installation and activation. "env_capture" persists selected SDK variables.
 
 pypi_base: "https://resource.flagos.net/repository/flagos-pypi-{vendor}/simple"
 mirror: "https://mirrors.aliyun.com/pypi/simple"
@@ -108,6 +110,25 @@ backends:
       - cann-shmem==1.6.0
       - torch==2.10.0+cpu
       - torch-npu==2.10.0
+      - decorator==5.2.1
+      - attrs==25.3.0
+      - psutil==7.0.0
+
+  ascend-cann910:
+    python: "3.11"
+    cmake_backend: NPU
+    flagtree: flagtree==0.7.1a1+ascend3.5
+    env:
+      FLAGTREE_BACKEND: ascend
+    required_env_source:
+      - runtime/backend/_ascend/env.sh
+    env_capture:
+      - CANN_ENV_SCRIPT
+    deps:
+      - cann-shmem==1.6.0
+      - torch==2.10.0+cpu
+      - torch-npu==2.10.0
+      - pybind11==3.0.3
       - decorator==5.2.1
       - attrs==25.3.0
       - psutil==7.0.0

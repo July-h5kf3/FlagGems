@@ -345,6 +345,7 @@ ok
 printf "Writing environment to .venv/bin/activate ..."
 python3 -c "
 import os
+import shlex
 import yaml
 
 cfg = yaml.safe_load(open('${BACKENDS_YAML}'))
@@ -360,6 +361,9 @@ for k, v in b.get('env', {}).items():
 repo_root = os.getcwd()
 helper = os.path.join(repo_root, 'tools', 'source_env_bash.sh')
 
+for key in b.get('env_capture', []):
+    lines.append(f'export {key}={shlex.quote(os.environ[key])}')
+
 for script in b.get('env_source', []):
     # Vendor scripts (e.g. the hygon DTK env.sh) locate themselves via the
     # bash-only \${BASH_SOURCE[0]}, which resolves incorrectly when the
@@ -368,6 +372,13 @@ for script in b.get('env_source', []):
     # Route through tools/source_env_bash.sh, which sources it under a
     # clean bash and re-exports only the resulting diff.
     lines.append(f'[ -f {script} ] && eval \"\$(bash {helper} {script})\" || true')
+
+for script in b.get('required_env_source', []):
+    script = os.path.join(repo_root, 'src', 'flag_gems', script)
+    command = f'bash {shlex.quote(helper)} {shlex.quote(script)} --required'
+    lines.append(f'_flaggems_exports=\"\$({command})\" || return 1')
+    lines.append('eval \"\$_flaggems_exports\"')
+    lines.append('unset _flaggems_exports')
 
 lines.append('# --- end FlagGems environment ---')
 
