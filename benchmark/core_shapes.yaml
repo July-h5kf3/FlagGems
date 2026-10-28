@@ -1246,3 +1246,9 @@ batch_norm_elemt:
     - [128, 256, 32, 32]
     - [4, 32, 8, 8, 8]
   shape_desc: "N, C, *spatial"
+
+grouped_gemm_w8a8:
+  shapes:
+    - [45, 512, 6144, 257]
+    - [45, 6144, 256, 257]
+  shape_desc: "M,N,K,E"
