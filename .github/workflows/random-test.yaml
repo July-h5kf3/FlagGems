@@ -79,11 +79,11 @@ jobs:
               ;;
             ascend)
               VENDOR="ascend"
-              BACKEND="ascend-cann910"
+              BACKEND="ascend-cann900"
               ;;
             cann9)
               VENDOR="ascend"
-              BACKEND="ascend-cann910"
+              BACKEND="ascend-cann900"
               ;;
             metax)
               VENDOR="metax"

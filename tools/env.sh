@@ -30,9 +30,6 @@ flaggems_c_extensions_enabled() {
 }
 
 case $BACKEND in
-  ascend-cann910)
-    source "$(dirname "${BASH_SOURCE[0]}")/../src/flag_gems/runtime/backend/_ascend/env.sh" || return 1
-    ;;
   ascend|ascend-cann850|ascend-cann900)
     # This script is provided by the Huawei Ascend CANN toolkit installation.
     if [ -f /usr/local/Ascend/cann/set_env.sh ]; then

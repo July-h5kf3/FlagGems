@@ -109,10 +109,8 @@ jobs:
 
       - name: Test Ascend TopK SDK integration
         if: >-
-          inputs.backend == 'ascend-cann910' && inputs.test_script == '' &&
-          (contains(inputs.changed_files, 'backends.yaml') ||
-           contains(inputs.changed_files, '_ascend/env.sh') ||
-           contains(inputs.changed_files, '910B.yaml'))
+          inputs.backend == 'ascend-cann900' && inputs.test_script == '' &&
+          contains(inputs.changed_files, '910B.yaml')
         shell: bash
         env:
           CHANGED_FILES: tests/test_topk_w8a16_fp8.py benchmark/test_topk_w8a16_fp8.py
