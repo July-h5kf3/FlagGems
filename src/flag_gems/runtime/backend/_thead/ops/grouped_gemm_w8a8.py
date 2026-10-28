@@ -32,6 +32,71 @@ GEMV_ROW_LIMIT = 640
 
 
 @triton.jit
+def load_int8_vector(pointer, mask):
+    return tl.inline_asm_elementwise(
+        "{ ppu.mov.u32 $0, 0; ppu.mov.u32 $1, 0; ppu.mov.u32 $2, 0; "
+        "ppu.mov.u32 $3, 0; @$5 ppu.ld.global.nc.v4.b32 {$0,$1,$2,$3}, [$4]; }",
+        "=r,=r,=r,=r,l,b",
+        [pointer, mask],
+        dtype=(tl.int32, tl.int32, tl.int32, tl.int32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_gemv_vector_kernel(
+    A,
+    As,
+    B,
+    Bs,
+    C,
+    RowExperts,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    E: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K16: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    tiles_n = tl.cdiv(N, BLOCK_N)
+    group = pid // (GROUP_M * tiles_n)
+    group_rows = tl.minimum(M - group * GROUP_M, GROUP_M)
+    local_pid = pid % (GROUP_M * tiles_n)
+    row = (group * GROUP_M + local_pid % group_rows).to(tl.int64)
+    cols = local_pid // group_rows * BLOCK_N + tl.arange(0, BLOCK_N)
+    expert = tl.load(RowExperts + row).to(tl.int64)
+    vectors = tl.arange(0, BLOCK_K16)
+    a_ptr = A + row * K + vectors * 16
+    b_ptr = B + expert * N * K + cols[:, None] * K + vectors[None, :] * 16
+    acc = tl.zeros((BLOCK_N, BLOCK_K16), tl.int32)
+    for tile in range(tl.cdiv(K, 16 * BLOCK_K16)):
+        valid_k = vectors + tile * BLOCK_K16 < K // 16
+        a0, a1, a2, a3 = load_int8_vector(a_ptr + tile * BLOCK_K16 * 16, valid_k)
+        b0, b1, b2, b3 = load_int8_vector(
+            b_ptr + tile * BLOCK_K16 * 16, (cols[:, None] < N) & valid_k[None, :]
+        )
+        # Keep the four packed words in registers through the integer reduction.
+        acc = tl.inline_asm_elementwise(
+            "{ .reg .s32 partial; dp4a.s32.s32 partial,$1,$5,$9; "
+            "dp4a.s32.s32 partial,$2,$6,partial; "
+            "dp4a.s32.s32 partial,$3,$7,partial; "
+            "dp4a.s32.s32 $0,$4,$8,partial; }",
+            "=r,r,r,r,r,r,r,r,r,r",
+            [a0[None, :], a1[None, :], a2[None, :], a3[None, :], b0, b1, b2, b3, acc],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+    dot = tl.sum(acc, 1).to(tl.float32)
+    scale_a = tl.load(As + row)
+    scale_b = tl.load(Bs + expert * N + cols, cols < N, other=0)
+    tl.store(C + row * N + cols, dot * scale_a * scale_b, cols < N)
+
+
+@triton.jit
 def packed_gemv_step(
     a_ptrs,
     b_ptrs,
@@ -506,6 +571,14 @@ autotuned_grouped_prefetch_gemv = libentry()(
         rep=20,
     )(grouped_gemv_int8_kernel)
 )
+autotuned_grouped_vector_gemv = libentry()(
+    libtuner(
+        configs=runtime.get_tuned_config("grouped_gemm_w8a8_gemv_vector"),
+        key=["M", "N", "K", "E"],
+        warmup=5,
+        rep=20,
+    )(grouped_gemv_vector_kernel)
+)
 
 
 def grouped_gemm_w8a8(
@@ -582,7 +655,16 @@ def grouped_gemm_w8a8(
     ):
         grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), M)
         with torch_device_fn.device(A.device):
-            if K <= PREFETCH_REDUCTION_LIMIT:
+            if (
+                K == PREFETCH_REDUCTION_LIMIT
+                and A.data_ptr() % 16 == 0
+                and B.data_ptr() % 16 == 0
+            ):
+                vector_grid = lambda meta: (M * triton.cdiv(N, meta["BLOCK_N"]),)
+                autotuned_grouped_vector_gemv[vector_grid](
+                    A, As, B, Bs, C, m_indices, M, N, K, E
+                )
+            elif K <= PREFETCH_REDUCTION_LIMIT:
                 autotuned_grouped_prefetch_gemv[grid](
                     A, As, B, Bs, C, m_indices, M, N, K, E
                 )
