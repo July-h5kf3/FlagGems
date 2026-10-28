@@ -30,6 +30,7 @@ SHORT_REDUCTION_LIMIT = 1024
 PREFETCH_REDUCTION_LIMIT = 128
 ROW_PREFETCH_LIMIT = 32
 GEMV_ROW_LIMIT = 640
+RESIDENT_ROWS_PER_EXPERT = 64
 
 
 @libentry()
@@ -41,18 +42,37 @@ def grouped_expert_offsets(Counts, Starts, E: tl.constexpr, BLOCK_E: tl.constexp
 
 
 @triton.jit
-def grouped_aiu_prefetch(shared, source, dim_x, dim_k, start_x, BLOCK_N: tl.constexpr):
+def grouped_aiu_copy(shared, source, dim_x, dim_k, start_x, BLOCK_N: tl.constexpr):
     return tl.inline_asm_elementwise(
         "{ .reg .u32 tid; .reg .pred copy; ppu.mov.u32 tid,%tid.x; "
         "ppu.setp.lt.u32 copy,tid,32; "
         "@copy ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.zfill.2d.b8 "
         "[$1],[$2],{1,$3,$4,0,$5,0},{1,$6,128,1}; "
-        "ppu.cp.async.commit_group; ppu.mov.u32 $0,0; }",
+        "ppu.mov.u32 $0,0; }",
         "=r,r,l,r,r,r,r",
         [shared, source, dim_x, dim_k, start_x, BLOCK_N],
         dtype=tl.int32,
         is_pure=False,
         pack=1,
+    )
+
+
+@triton.jit
+def grouped_aiu_commit(dependency):
+    return tl.inline_asm_elementwise(
+        "ppu.cp.async.commit_group; ppu.mov.u32 $0,0;",
+        "=r,r",
+        [dependency],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_aiu_prefetch(shared, source, dim_x, dim_k, start_x, BLOCK_N: tl.constexpr):
+    return grouped_aiu_commit(
+        grouped_aiu_copy(shared, source, dim_x, dim_k, start_x, BLOCK_N)
     )
 
 
@@ -195,25 +215,28 @@ def grouped_store_bfloat16(C, row, col, low, high, mask, N: tl.constexpr):
 
 
 @triton.jit
-def grouped_mma_epilogue(
-    C, Bs, expert, row0, row1, end, nbase, lane, sa, c, N: tl.constexpr
-):
-    col = nbase + lane % 4
-    sb0 = tl.load(Bs + expert * N + col, col < N, other=0)
-    sb1 = tl.load(Bs + expert * N + col + 4, col + 4 < N, other=0)
-    sb2 = tl.load(Bs + expert * N + col + 8, col + 8 < N, other=0)
-    sb3 = tl.load(Bs + expert * N + col + 12, col + 12 < N, other=0)
+def grouped_b_scales(Bs, expert, col, N: tl.constexpr):
+    return (
+        tl.load(Bs + expert * N + col, col < N, other=0),
+        tl.load(Bs + expert * N + col + 4, col + 4 < N, other=0),
+        tl.load(Bs + expert * N + col + 8, col + 8 < N, other=0),
+        tl.load(Bs + expert * N + col + 12, col + 12 < N, other=0),
+    )
+
+
+@triton.jit
+def grouped_mma_epilogue(C, sb, row0, row1, end, nbase, lane, sa, c, N: tl.constexpr):
     p00 = grouped_pack_bfloat16(
-        c[0].to(tl.float32) * sa[0] * sb0, c[1].to(tl.float32) * sa[0] * sb1
+        c[0].to(tl.float32) * sa[0] * sb[0], c[1].to(tl.float32) * sa[0] * sb[1]
     )
     p01 = grouped_pack_bfloat16(
-        c[2].to(tl.float32) * sa[0] * sb2, c[3].to(tl.float32) * sa[0] * sb3
+        c[2].to(tl.float32) * sa[0] * sb[2], c[3].to(tl.float32) * sa[0] * sb[3]
     )
     p10 = grouped_pack_bfloat16(
-        c[4].to(tl.float32) * sa[1] * sb0, c[5].to(tl.float32) * sa[1] * sb1
+        c[4].to(tl.float32) * sa[1] * sb[0], c[5].to(tl.float32) * sa[1] * sb[1]
     )
     p11 = grouped_pack_bfloat16(
-        c[6].to(tl.float32) * sa[1] * sb2, c[7].to(tl.float32) * sa[1] * sb3
+        c[6].to(tl.float32) * sa[1] * sb[2], c[7].to(tl.float32) * sa[1] * sb[3]
     )
     lo0, hi0 = grouped_transpose_bfloat16(p00, p01, lane)
     lo1, hi1 = grouped_transpose_bfloat16(p10, p11, lane)
@@ -312,8 +335,7 @@ def grouped_persistent_int8_kernel(
             )
             grouped_mma_epilogue(
                 C,
-                Bs,
-                expert,
+                grouped_b_scales(Bs, expert, nt * BN + warp * 16 + lane % 4, N),
                 row0,
                 row1,
                 first + count,
@@ -324,6 +346,101 @@ def grouped_persistent_int8_kernel(
                 N,
             )
             iteration += 1
+
+
+@triton.jit
+def grouped_resident_int8_kernel(
+    A,
+    As,
+    B,
+    Bs,
+    C,
+    Counts,
+    Starts,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    E: tl.constexpr,
+):
+    tl.static_assert(K == 128 and N % 4 == 0)
+    BLOCK_M: tl.constexpr = 32
+    BLOCK_N: tl.constexpr = 64
+    WARPS: tl.constexpr = 2
+    N_REPS: tl.constexpr = 2
+    thread = tl.arange(0, 32 * WARPS * N_REPS)
+    lane = thread % 32
+    rep = thread // (32 * WARPS)
+    warp = tl.inline_asm_elementwise(
+        "{ .reg .u32 tid,w; ppu.mov.u32 tid,%tid.x; ppu.shr.u32 w,tid,5; ppu.to.uniform.b32 $0,w; }",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    expert = tl.program_id(1).to(tl.int64)
+    first = tl.load(Starts + expert).to(tl.int64)
+    count = tl.load(Counts + expert).to(tl.int64)
+    end = first + count
+    if count == 0:
+        return
+    smem = tle.gpu.alloc(
+        [(BLOCK_N + 2 * BLOCK_M) * 128],
+        tl.int8,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    shared = tle.gpu.local_ptr(smem, (0,)).to(tl.int64).to(tl.int32)
+    shared_a = shared + BLOCK_N * 128
+    nfirst = tl.program_id(0) * BLOCK_N
+    nx = warp * N_REPS * 16 + rep * 16
+    nbase = nfirst + nx
+    token = grouped_aiu_copy(shared, B + expert * N * K, N, K, nfirst, BLOCK_N)
+    token = grouped_aiu_copy(shared_a, A, end, K, first, BLOCK_M)
+    group = grouped_aiu_commit(token)
+    initial = grouped_aiu_wait(group)
+    b = (
+        grouped_aiu_fragment(shared, nx, 0, initial, BLOCK_N),
+        grouped_aiu_fragment(shared, nx, 32, initial, BLOCK_N),
+        grouped_aiu_fragment(shared, nx, 64, initial, BLOCK_N),
+        grouped_aiu_fragment(shared, nx, 96, initial, BLOCK_N),
+    )
+    sb = grouped_b_scales(Bs, expert, nbase + lane % 4, N)
+    for mb in range(tl.cdiv(count, BLOCK_M)):
+        if mb == 0:
+            ready = initial
+        else:
+            ready = grouped_aiu_wait(group)
+        row = first + mb * BLOCK_M
+        current = shared_a + (mb % 2) * BLOCK_M * 128
+        if (mb + 1) * BLOCK_M < count:
+            group = grouped_aiu_prefetch(
+                shared_a + ((mb + 1) % 2) * BLOCK_M * 128,
+                A,
+                end,
+                K,
+                row + BLOCK_M,
+                BLOCK_M,
+            )
+        else:
+            group = ready
+        zero = tl.full((32 * WARPS * N_REPS,), 0, tl.int32)
+        c0 = (zero, zero, zero, zero, zero, zero, zero, zero)
+        c1 = (zero, zero, zero, zero, zero, zero, zero, zero)
+        for sub in tl.static_range(4):
+            a0 = grouped_aiu_fragment(current, 0, sub * 32, ready, BLOCK_M)
+            c0 = grouped_mma(a0, b[sub], c0)
+            a1 = grouped_aiu_fragment(current, 16, sub * 32, ready, BLOCK_M)
+            c1 = grouped_mma(a1, b[sub], c1)
+        r0 = row + lane // 4
+        r1 = r0 + 8
+        sa = (tl.load(As + r0, r0 < end, other=0), tl.load(As + r1, r1 < end, other=0))
+        grouped_mma_epilogue(C, sb, r0, r1, end, nbase, lane, sa, c0, N)
+        r0 = row + 16 + lane // 4
+        r1 = r0 + 8
+        sa = (tl.load(As + r0, r0 < end, other=0), tl.load(As + r1, r1 < end, other=0))
+        grouped_mma_epilogue(C, sb, r0, r1, end, nbase, lane, sa, c1, N)
 
 
 @triton.jit
@@ -1013,6 +1130,36 @@ def grouped_gemm_w8a8(
                 )
             else:
                 autotuned_grouped_gemv[grid](A, As, B, Bs, C, m_indices, M, N, K, E)
+        return
+
+    if (
+        K == PREFETCH_REDUCTION_LIMIT
+        and M >= RESIDENT_ROWS_PER_EXPERT * E
+        and N % 4 == 0
+        and A.data_ptr() % 128 == 0
+        and B.data_ptr() % 128 == 0
+        and C.data_ptr() % 8 == 0
+    ):
+        starts = torch.empty_like(m_rows)
+        with torch_device_fn.device(A.device):
+            grouped_expert_offsets[(1,)](
+                m_rows, starts, E, triton.next_power_of_2(E), num_warps=4
+            )
+            grouped_resident_int8_kernel[(triton.cdiv(N, 64), E)](
+                A,
+                As,
+                B,
+                Bs,
+                C,
+                m_rows,
+                starts,
+                M,
+                N,
+                K,
+                E,
+                num_warps=2,
+                num_stages=1,
+            )
         return
 
     if (
