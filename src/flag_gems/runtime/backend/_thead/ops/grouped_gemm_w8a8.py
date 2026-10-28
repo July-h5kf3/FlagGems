@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 SMALL_ROW_LIMIT = 64
 SHORT_REDUCTION_LIMIT = 1024
-GEMV_ROW_LIMIT = 128
+GEMV_ROW_LIMIT = 576
 
 
 @triton.jit
