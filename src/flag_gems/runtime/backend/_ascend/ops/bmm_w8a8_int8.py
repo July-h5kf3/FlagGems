@@ -17,15 +17,17 @@
 import torch
 import triton
 import triton.language as tl
+from triton.experimental.tle import language as tle_async
 
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
-from .mm_w8a8_int8 import direct_mm_kernel
-from .mm_w8a8_int8 import mm_int8_vector_full
-from .mm_w8a8_int8 import mm_int8_vector_loop
-from .mm_w8a8_int8 import mm_w8a8_int8_out
-
+from .mm_w8a8_int8 import (
+    direct_mm_kernel,
+    mm_int8_vector_full,
+    mm_int8_vector_loop,
+    mm_w8a8_int8_out,
+)
 
 direct_scaled_mm = direct_mm_kernel.fn
 vector_loop = mm_int8_vector_loop.fn
@@ -140,6 +142,123 @@ def bmm_direct_scaled_mm(
         BK,
         CORES,
         True,
+    )
+
+
+@libentry()
+@triton.jit
+def bmm_split_k_kernel(
+    A,
+    B,
+    PARTIAL,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BATCH: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    CORES: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    batch = tl.program_id(1).to(tl.int64)
+    grid_m: tl.constexpr = tl.cdiv(M, BM)
+    grid_n: tl.constexpr = tl.cdiv(N, BN)
+    tiles: tl.constexpr = grid_m * grid_n
+    work_items: tl.constexpr = tiles * SPLIT_K
+    quotient = work_items // CORES
+    remainder = work_items % CORES
+    start = tl.where(
+        pid < remainder,
+        pid * (quotient + 1),
+        remainder * (quotient + 1) + (pid - remainder) * quotient,
+    )
+    count = quotient + tl.where(pid < remainder, 1, 0)
+    for work_offset in tl.range(0, count):
+        work = start + work_offset
+        tile = work // SPLIT_K
+        part = work % SPLIT_K
+        row_start = (tile // grid_n * BM).to(tl.int32)
+        col_start = (tile % grid_n * BN).to(tl.int32)
+        ap = tl.make_block_ptr(
+            A + batch * M * K,
+            (M, K),
+            (K, 1),
+            (row_start, part * (K // SPLIT_K)),
+            (BM, BK),
+            (1, 0),
+        )
+        bp = tl.make_block_ptr(
+            B + batch * N * K,
+            (K, N),
+            (1, K),
+            (part * (K // SPLIT_K), col_start),
+            (BK, BN),
+            (0, 1),
+        )
+        acc = tl.zeros((BM, BN), tl.int32)
+        for _ in tl.range(0, tl.cdiv(K, BK * SPLIT_K)):
+            if M % BM == 0 and K % BK == 0:
+                av = tl.load(ap)
+            else:
+                av = tl.load(ap, boundary_check=(0, 1), padding_option="zero")
+            if N % BN == 0 and K % BK == 0:
+                bv = tl.load(bp)
+            else:
+                bv = tl.load(bp, boundary_check=(0, 1), padding_option="zero")
+            acc = tl.dot(av, bv, acc, out_dtype=tl.int32)
+            ap = tl.advance(ap, (0, BK))
+            bp = tl.advance(bp, (BK, 0))
+        rows = row_start + tl.arange(0, BM)
+        columns = col_start + tl.arange(0, BN)
+        partial = PARTIAL + (part * BATCH + batch) * M * N
+        tl.store(
+            partial + rows[:, None] * N + columns[None, :],
+            acc,
+            (rows[:, None] < M) & (columns[None, :] < N),
+        )
+
+
+@libentry()
+@triton.jit
+def bmm_split_k_finish(
+    PARTIAL,
+    SA,
+    SB,
+    OUT,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BATCH: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    row = tl.program_id(0) * BM
+    column = tl.program_id(1) * BN
+    batch = tl.program_id(2).to(tl.int64)
+    acc = tl.zeros((BM, BN), tl.int32)
+    for part in range(SPLIT_K):
+        ptr = tl.make_block_ptr(
+            PARTIAL + (part * BATCH + batch) * M * N,
+            (M, N),
+            (N, 1),
+            (row, column),
+            (BM, BN),
+            (1, 0),
+        )
+        acc += tle_async.load(
+            ptr, boundary_check=(0, 1), padding_option="zero", is_async=True
+        )
+    rows = row + tl.arange(0, BM)
+    columns = column + tl.arange(0, BN)
+    scale_a = tl.load(SA + batch * M + rows, rows < M, other=0)
+    scale_b = tl.load(SB + batch * N + columns, columns < N, other=0)
+    value = acc.to(tl.float32) * scale_a[:, None] * scale_b[None, :]
+    tl.store(
+        OUT + batch * M * N + rows[:, None] * N + columns[None, :],
+        value,
+        (rows[:, None] < M) & (columns[None, :] < N),
     )
 
 
@@ -261,33 +380,92 @@ def bmm_w8a8_int8(
                 max(32, triton.next_power_of_2(reduction)),
             )
         else:
-            block_m = 16 if rows <= 16 else (32 if rows <= 32 else (64 if rows <= 256 else 128))
+            if rows <= 16:
+                block_m = 16
+            elif rows <= 32:
+                block_m = 32
+            elif rows <= 256:
+                block_m = 64
+            else:
+                block_m = 128
             block_n = 64 if rows <= 64 else (128 if rows <= 256 else 256)
             if rows <= 16:
                 max_block_k = 2048
             else:
                 max_block_k = 1024 if rows <= 256 else 512
             block_k = min(max_block_k, max(32, triton.next_power_of_2(reduction)))
-        cores = min(20, triton.cdiv(rows, block_m) * triton.cdiv(columns, block_n))
-        bmm_direct_scaled_mm[(cores, batch)](
-            activation,
-            weight,
-            activation_scale,
-            weight_scale,
-            out,
-            rows,
-            columns,
-            reduction,
-            rows,
-            block_m,
-            block_n,
-            block_k,
-            cores,
-            num_warps=1,
-            num_stages=2,
-            optimize_dynamic_offset=True,
-            unit_flag=False,
-            limit_auto_multi_buffer_of_local_buffer="no-l0c",
-            set_workspace_multibuffer=1,
+        use_split_k = (
+            columns == 1024
+            and reduction == 4096
+            and (128 < rows <= 224 or 256 < rows <= 384)
         )
+        if use_split_k:
+            split_k = 4
+            tiles = triton.cdiv(rows, block_m) * triton.cdiv(columns, block_n)
+            cores = min(20, tiles * split_k)
+            partials = torch.empty(
+                (split_k, batch, rows, columns),
+                dtype=torch.int32,
+                device=activation.device,
+            )
+            bmm_split_k_kernel[(cores, batch)](
+                activation,
+                weight,
+                partials,
+                rows,
+                columns,
+                reduction,
+                batch,
+                block_m,
+                block_n,
+                block_k,
+                cores,
+                split_k,
+                num_warps=1,
+                num_stages=2,
+                optimize_dynamic_offset=True,
+                unit_flag=False,
+                limit_auto_multi_buffer_of_local_buffer="no-l0c",
+                set_workspace_multibuffer=1,
+            )
+            bmm_split_k_finish[
+                (triton.cdiv(rows, 32), triton.cdiv(columns, 256), batch)
+            ](
+                partials,
+                activation_scale,
+                weight_scale,
+                out,
+                rows,
+                columns,
+                batch,
+                split_k,
+                32,
+                256,
+                num_warps=1,
+                multibuffer=False,
+                enable_fp_fusion=False,
+            )
+        else:
+            cores = min(20, triton.cdiv(rows, block_m) * triton.cdiv(columns, block_n))
+            bmm_direct_scaled_mm[(cores, batch)](
+                activation,
+                weight,
+                activation_scale,
+                weight_scale,
+                out,
+                rows,
+                columns,
+                reduction,
+                rows,
+                block_m,
+                block_n,
+                block_k,
+                cores,
+                num_warps=1,
+                num_stages=2,
+                optimize_dynamic_offset=True,
+                unit_flag=False,
+                limit_auto_multi_buffer_of_local_buffer="no-l0c",
+                set_workspace_multibuffer=1,
+            )
     return out
