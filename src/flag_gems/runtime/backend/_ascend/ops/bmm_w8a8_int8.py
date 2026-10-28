@@ -394,13 +394,27 @@ def bmm_w8a8_int8(
             else:
                 max_block_k = 1024 if rows <= 256 else 512
             block_k = min(max_block_k, max(32, triton.next_power_of_2(reduction)))
-        use_split_k = (
-            columns == 1024
-            and reduction == 4096
-            and (128 < rows <= 224 or 256 < rows <= 384)
-        )
-        if use_split_k:
+        if columns != 1024 or reduction != 4096:
+            split_k = 0
+        elif batch == 1 and (rows <= 256 or 384 < rows < 512):
+            # A separate epilogue avoids per-tile Cube/Vector synchronization.
+            if rows <= 32:
+                block_m = 16 if rows <= 16 else 32
+                block_n, block_k, split_k = 128, 1024, 2
+            elif rows <= 64:
+                block_m, block_n, block_k, split_k = 64, 128, 1024, 2
+            elif rows <= 128:
+                block_m, block_n, block_k, split_k = 128, 256, 512, 4
+            elif rows <= 256:
+                block_m, block_n, block_k = 64, 128, 1024
+                split_k = 2 if rows <= 192 else 1
+            else:
+                block_m, block_n, block_k, split_k = 128, 256, 512, 2
+        elif 128 < rows <= 224 or 256 < rows <= 384:
             split_k = 4
+        else:
+            split_k = 0
+        if split_k:
             tiles = triton.cdiv(rows, block_m) * triton.cdiv(columns, block_n)
             cores = min(20, tiles * split_k)
             partials = torch.empty(
