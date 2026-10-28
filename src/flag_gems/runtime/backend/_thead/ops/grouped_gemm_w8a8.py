@@ -27,13 +27,32 @@ logger = logging.getLogger(__name__)
 
 SMALL_ROW_LIMIT = 64
 SHORT_REDUCTION_LIMIT = 1024
-GEMV_ROW_LIMIT = 576
+PREFETCH_REDUCTION_LIMIT = 256
+GEMV_ROW_LIMIT = 640
 
 
 @triton.jit
 def packed_gemv_step(
-    a_ptrs, b_ptrs, acc, mask_k, mask_n, CACHE_B: tl.constexpr, EVICT_B: tl.constexpr
+    a_ptrs,
+    b_ptrs,
+    prefetch_ptrs,
+    acc,
+    mask_k,
+    prefetch_mask_k,
+    mask_n,
+    CACHE_B: tl.constexpr,
+    EVICT_B: tl.constexpr,
+    PREFETCH_B: tl.constexpr,
 ):
+    if PREFETCH_B:
+        _ = tl.inline_asm_elementwise(
+            "@$2 ppu.prefetch.global.L2 [ $1 ]; ppu.mov.u32 $0, 0;",
+            "=r,l,b",
+            [prefetch_ptrs, mask_n[:, None] & prefetch_mask_k[None, :]],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
     a = tl.load(a_ptrs, mask_k, other=0)
     b = tl.load(
         b_ptrs,
@@ -71,6 +90,8 @@ def grouped_gemv_int8_kernel(
     TLE_PIPELINE: tl.constexpr,
     CACHE_B: tl.constexpr = "",
     EVICT_B: tl.constexpr = "",
+    PREFETCH_B: tl.constexpr = False,
+    PREFETCH_DISTANCE: tl.constexpr = 1,
 ):
     tl.static_assert(K % 4 == 0 and WARPS > 0)
     row = tl.program_id(1).to(tl.int64)
@@ -87,11 +108,14 @@ def grouped_gemv_int8_kernel(
             acc = packed_gemv_step(
                 a_words + offset,
                 b_words + offset,
+                b_words + offset + PREFETCH_DISTANCE * BLOCK_K4,
                 acc,
                 words + offset < K // 4,
+                words + offset + PREFETCH_DISTANCE * BLOCK_K4 < K // 4,
                 cols < N,
                 CACHE_B,
                 EVICT_B,
+                PREFETCH_B,
             )
     else:
         for tile in range(tl.cdiv(K // 4, BLOCK_K4)):
@@ -99,11 +123,14 @@ def grouped_gemv_int8_kernel(
             acc = packed_gemv_step(
                 a_words + offset,
                 b_words + offset,
+                b_words + offset + PREFETCH_DISTANCE * BLOCK_K4,
                 acc,
                 words + offset < K // 4,
+                words + offset + PREFETCH_DISTANCE * BLOCK_K4 < K // 4,
                 cols < N,
                 CACHE_B,
                 EVICT_B,
+                PREFETCH_B,
             )
     dot = tl.sum(acc, 1).to(tl.float32)
     scale_a = tl.load(As + row)
@@ -471,6 +498,14 @@ autotuned_grouped_gemv = libentry()(
         rep=20,
     )(grouped_gemv_int8_kernel)
 )
+autotuned_grouped_prefetch_gemv = libentry()(
+    libtuner(
+        configs=runtime.get_tuned_config("grouped_gemm_w8a8_gemv_prefetch"),
+        key=["M", "N", "K", "E"],
+        warmup=5,
+        rep=20,
+    )(grouped_gemv_int8_kernel)
+)
 
 
 def grouped_gemm_w8a8(
@@ -547,7 +582,12 @@ def grouped_gemm_w8a8(
     ):
         grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), M)
         with torch_device_fn.device(A.device):
-            autotuned_grouped_gemv[grid](A, As, B, Bs, C, m_indices, M, N, K, E)
+            if K <= PREFETCH_REDUCTION_LIMIT:
+                autotuned_grouped_prefetch_gemv[grid](
+                    A, As, B, Bs, C, m_indices, M, N, K, E
+                )
+            else:
+                autotuned_grouped_gemv[grid](A, As, B, Bs, C, m_indices, M, N, K, E)
         return
 
     if (
