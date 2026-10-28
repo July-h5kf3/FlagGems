@@ -12,6 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+grouped_gemm_w8a8_persistent:
+  - META:
+      WARPS: 2
+      N_REPS: 2
+      N_GROUPS: 16
+    num_warps: 2
+    num_stages: 1
+  - META:
+      WARPS: 2
+      N_REPS: 4
+      N_GROUPS: 4
+    num_warps: 2
+    num_stages: 1
+  - META:
+      WARPS: 4
+      N_REPS: 2
+      N_GROUPS: 4
+    num_warps: 4
+    num_stages: 1
+  - META:
+      WARPS: 8
+      N_REPS: 2
+      N_GROUPS: 2
+    num_warps: 8
+    num_stages: 1
+  - META:
+      WARPS: 4
+      N_REPS: 4
+      N_GROUPS: 4
+    num_warps: 4
+    num_stages: 1
+  - META:
+      WARPS: 4
+      N_REPS: 1
+      N_GROUPS: 8
+    num_warps: 4
+    num_stages: 1
+
 grouped_gemm_w8a8_gemv:
   - META:
       BLOCK_N: 4

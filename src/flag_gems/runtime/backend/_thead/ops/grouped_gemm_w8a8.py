@@ -31,6 +31,293 @@ PREFETCH_REDUCTION_LIMIT = 128
 GEMV_ROW_LIMIT = 640
 
 
+@libentry()
+@triton.jit
+def grouped_expert_offsets(Counts, Starts, E: tl.constexpr, BLOCK_E: tl.constexpr):
+    experts = tl.arange(0, BLOCK_E)
+    counts = tl.load(Counts + experts, experts < E, other=0)
+    tl.store(Starts + experts, tl.cumsum(counts) - counts, experts < E)
+
+
+@triton.jit
+def grouped_aiu_prefetch(shared, source, dim_x, dim_k, start_x, BLOCK_N: tl.constexpr):
+    return tl.inline_asm_elementwise(
+        "{ .reg .u32 tid; .reg .pred copy; ppu.mov.u32 tid,%tid.x; "
+        "ppu.setp.lt.u32 copy,tid,32; "
+        "@copy ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.zfill.2d.b8 "
+        "[$1],[$2],{1,$3,$4,0,$5,0},{1,$6,128,1}; "
+        "ppu.cp.async.commit_group; ppu.mov.u32 $0,0; }",
+        "=r,r,l,r,r,r,r",
+        [shared, source, dim_x, dim_k, start_x, BLOCK_N],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_aiu_wait(dependency):
+    return tl.inline_asm_elementwise(
+        "ppu.cp.async.wait_group 0; bar.sync 0; ppu.mov.u32 $0,0;",
+        "=r,r",
+        [dependency],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_aiu_fragment(shared, x, channel, dependency, BLOCK_N: tl.constexpr):
+    return tl.inline_asm_elementwise(
+        "ppu.ldmatrix.sync.aligned.m8n8.x4.swzl.shared.b16 "
+        "{$0,$1,$2,$3},[$4],{0,$5,1,$6,1,$7};",
+        "=r,=r,=r,=r,r,r,r,r,r",
+        [shared, x, BLOCK_N, channel, dependency],
+        dtype=(tl.int32, tl.int32, tl.int32, tl.int32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_mma(a, b, c):
+    return tl.inline_asm_elementwise(
+        "ppu.mma.sync.aligned.m16n16k32.row.col.satfinite.s32.s8.s8.s32 "
+        "{$0,$1,$2,$3,$4,$5,$6,$7}, {$8,$9,$10,$11}, {$12,$13,$14,$15}, "
+        "{$16,$17,$18,$19,$20,$21,$22,$23};",
+        "=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r",
+        [
+            a[0],
+            a[1],
+            a[2],
+            a[3],
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            c[5],
+            c[6],
+            c[7],
+        ],
+        dtype=(
+            tl.int32,
+            tl.int32,
+            tl.int32,
+            tl.int32,
+            tl.int32,
+            tl.int32,
+            tl.int32,
+            tl.int32,
+        ),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_a_fragment(A, row0, row1, end, kw, K_OFFSET: tl.constexpr):
+    words = A.to(tl.pointer_type(tl.int32))
+    a0 = tl.load(words + row0 * 32 + kw + K_OFFSET, row0 < end, other=0)
+    a1 = tl.load(words + row0 * 32 + kw + K_OFFSET + 4, row0 < end, other=0)
+    a2 = tl.load(words + row1 * 32 + kw + K_OFFSET, row1 < end, other=0)
+    a3 = tl.load(words + row1 * 32 + kw + K_OFFSET + 4, row1 < end, other=0)
+    return a0, a1, a2, a3
+
+
+@triton.jit
+def grouped_shuffle_xor(value, DISTANCE: tl.constexpr):
+    return tl.inline_asm_elementwise(
+        "shfl.sync.bfly.b32 $0,$1,$2,31,-1;",
+        "=r,r,r",
+        [value, DISTANCE],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_pack_bfloat16(low, high):
+    return tl.inline_asm_elementwise(
+        "ppu.cvt.rn.bf16x2.f32 $0,$2,$1;",
+        "=r,f,f",
+        [low, high],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_transpose_bfloat16(x0, x1, lane):
+    neighbor0 = grouped_shuffle_xor(x0, 1)
+    neighbor1 = grouped_shuffle_xor(x1, 1)
+    control = tl.where((lane & 1) == 0, 0x5410, 0x3276)
+    y0 = tl.inline_asm_elementwise(
+        "prmt.b32 $0,$1,$2,$3;",
+        "=r,r,r,r",
+        [x0, neighbor0, control],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    y1 = tl.inline_asm_elementwise(
+        "prmt.b32 $0,$1,$2,$3;",
+        "=r,r,r,r",
+        [x1, neighbor1, control],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    low = (lane & 2) == 0
+    exchanged = grouped_shuffle_xor(tl.where(low, y1, y0), 2)
+    return tl.where(low, y0, exchanged), tl.where(low, exchanged, y1)
+
+
+@triton.jit
+def grouped_store_bfloat16(C, row, col, low, high, mask, N: tl.constexpr):
+    address = C.to(tl.pointer_type(tl.int32)) + row.to(tl.int64) * (N // 2) + col // 2
+    tl.inline_asm_elementwise(
+        "@$4 ppu.st.global.v2.b32 [$1],{$2,$3}; ppu.mov.u32 $0,0;",
+        "=r,l,r,r,b",
+        [address, low, high, mask],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_mma_epilogue(
+    C, Bs, expert, row0, row1, end, nbase, lane, sa, c, N: tl.constexpr
+):
+    col = nbase + lane % 4
+    sb0 = tl.load(Bs + expert * N + col, col < N, other=0)
+    sb1 = tl.load(Bs + expert * N + col + 4, col + 4 < N, other=0)
+    sb2 = tl.load(Bs + expert * N + col + 8, col + 8 < N, other=0)
+    sb3 = tl.load(Bs + expert * N + col + 12, col + 12 < N, other=0)
+    p00 = grouped_pack_bfloat16(
+        c[0].to(tl.float32) * sa[0] * sb0, c[1].to(tl.float32) * sa[0] * sb1
+    )
+    p01 = grouped_pack_bfloat16(
+        c[2].to(tl.float32) * sa[0] * sb2, c[3].to(tl.float32) * sa[0] * sb3
+    )
+    p10 = grouped_pack_bfloat16(
+        c[4].to(tl.float32) * sa[1] * sb0, c[5].to(tl.float32) * sa[1] * sb1
+    )
+    p11 = grouped_pack_bfloat16(
+        c[6].to(tl.float32) * sa[1] * sb2, c[7].to(tl.float32) * sa[1] * sb3
+    )
+    lo0, hi0 = grouped_transpose_bfloat16(p00, p01, lane)
+    lo1, hi1 = grouped_transpose_bfloat16(p10, p11, lane)
+    packed_col = nbase + (lane % 4) * 4
+    grouped_store_bfloat16(
+        C, row0, packed_col, lo0, hi0, (row0 < end) & (packed_col < N), N
+    )
+    grouped_store_bfloat16(
+        C, row1, packed_col, lo1, hi1, (row1 < end) & (packed_col < N), N
+    )
+
+
+@triton.jit
+def grouped_persistent_int8_kernel(
+    A,
+    As,
+    B,
+    Bs,
+    C,
+    Counts,
+    Starts,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    E: tl.constexpr,
+    WARPS: tl.constexpr,
+    N_REPS: tl.constexpr,
+    N_GROUPS: tl.constexpr,
+):
+    tl.static_assert(K == 128 and N % 4 == 0)
+    BN: tl.constexpr = WARPS * N_REPS * 16
+    thread = tl.arange(0, 32 * WARPS * N_REPS)
+    lane = thread % 32
+    warp = thread // 32
+    expert = tl.program_id(1).to(tl.int64)
+    first = tl.load(Starts + expert).to(tl.int64)
+    count = tl.load(Counts + expert).to(tl.int64)
+    first_n = tl.program_id(0)
+    tiles_n: tl.constexpr = triton.cdiv(N, BN)
+    if count == 0 or first_n >= tiles_n:
+        return
+    smem = tle.gpu.alloc(
+        [2 * BN * 128],
+        tl.int8,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    shared = tle.gpu.local_ptr(smem, (0,)).to(tl.int64).to(tl.int32)
+    bptr = B + expert * N * K
+    iteration = 0
+    for mb in range(tl.cdiv(count, 16)):
+        row0 = first + mb * 16 + lane // 4
+        row1 = row0 + 8
+        group = grouped_aiu_prefetch(
+            shared + (iteration % 2) * BN * 128, bptr, N, K, first_n * BN, BN
+        )
+        a0 = grouped_a_fragment(A, row0, row1, first + count, lane % 4, 0)
+        a1 = grouped_a_fragment(A, row0, row1, first + count, lane % 4, 8)
+        a2 = grouped_a_fragment(A, row0, row1, first + count, lane % 4, 16)
+        a3 = grouped_a_fragment(A, row0, row1, first + count, lane % 4, 24)
+        sa = (
+            tl.load(As + row0, row0 < first + count, other=0),
+            tl.load(As + row1, row1 < first + count, other=0),
+        )
+        for nt in range(first_n, tiles_n, N_GROUPS):
+            ready = grouped_aiu_wait(group)
+            slot = iteration % 2
+            current = shared + slot * BN * 128
+            if nt + N_GROUPS < tiles_n:
+                group = grouped_aiu_prefetch(
+                    shared + (1 - slot) * BN * 128, bptr, N, K, (nt + N_GROUPS) * BN, BN
+                )
+            else:
+                group = ready
+            zero = tl.full((32 * WARPS * N_REPS,), 0, tl.int32)
+            c = (zero, zero, zero, zero, zero, zero, zero, zero)
+            c = grouped_mma(
+                a0, grouped_aiu_fragment(current, warp * 16, 0, ready, BN), c
+            )
+            c = grouped_mma(
+                a1, grouped_aiu_fragment(current, warp * 16, 32, ready, BN), c
+            )
+            c = grouped_mma(
+                a2, grouped_aiu_fragment(current, warp * 16, 64, ready, BN), c
+            )
+            c = grouped_mma(
+                a3, grouped_aiu_fragment(current, warp * 16, 96, ready, BN), c
+            )
+            grouped_mma_epilogue(
+                C,
+                Bs,
+                expert,
+                row0,
+                row1,
+                first + count,
+                nt * BN + warp * 16,
+                lane,
+                sa,
+                c,
+                N,
+            )
+            iteration += 1
+
+
 @triton.jit
 def load_int8_vector(pointer, mask):
     return tl.inline_asm_elementwise(
@@ -581,6 +868,16 @@ autotuned_grouped_vector_gemv = libentry()(
 )
 
 
+autotuned_grouped_persistent = libentry()(
+    libtuner(
+        configs=runtime.get_tuned_config("grouped_gemm_w8a8_persistent"),
+        key=["M", "N", "K", "E"],
+        warmup=5,
+        rep=20,
+    )(grouped_persistent_int8_kernel)
+)
+
+
 def grouped_gemm_w8a8(
     A: torch.Tensor,
     As: torch.Tensor,
@@ -645,6 +942,28 @@ def grouped_gemm_w8a8(
         32,
     ):
         raise NotImplementedError("grouped INT8 GEMM requires PPU-ZW810E")
+
+    if (
+        K == PREFETCH_REDUCTION_LIMIT
+        and 2 * E <= M <= 16 * E
+        and N % 4 == 0
+        and A.data_ptr() % 128 == 0
+        and B.data_ptr() % 128 == 0
+        and C.data_ptr() % 8 == 0
+    ):
+        starts = torch.empty_like(m_rows)
+        grid = lambda meta: (
+            min(meta["N_GROUPS"], triton.cdiv(N, 16 * meta["WARPS"] * meta["N_REPS"])),
+            E,
+        )
+        with torch_device_fn.device(A.device):
+            grouped_expert_offsets[(1,)](
+                m_rows, starts, E, triton.next_power_of_2(E), num_warps=4
+            )
+            autotuned_grouped_persistent[grid](
+                A, As, B, Bs, C, m_rows, starts, M, N, K, E
+            )
+        return
 
     if (
         M <= GEMV_ROW_LIMIT
