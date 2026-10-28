@@ -31,6 +31,9 @@ PREFETCH_REDUCTION_LIMIT = 128
 ROW_PREFETCH_LIMIT = 32
 GEMV_ROW_LIMIT = 640
 RESIDENT_ROWS_PER_EXPERT = 64
+STREAMING_GEMV_ROW_LIMIT = 128
+GROUPED_VECTOR_MIN_ROWS = 512
+LARGE_REDUCTION_MIN = 4096
 
 
 @libentry()
@@ -457,6 +460,195 @@ def load_int8_vector(pointer, mask):
 
 
 @triton.jit
+def grouped_dot_vector(a, b, acc):
+    return tl.inline_asm_elementwise(
+        "{ .reg .s32 partial; dp4a.s32.s32 partial,$1,$5,$9; "
+        "dp4a.s32.s32 partial,$2,$6,partial; "
+        "dp4a.s32.s32 partial,$3,$7,partial; "
+        "dp4a.s32.s32 $0,$4,$8,partial; }",
+        "=r,r,r,r,r,r,r,r,r,r",
+        [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], acc],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_stream_copy(shared, source, dependency):
+    return tl.inline_asm_elementwise(
+        "ppu.cp.async.cg.shared.global [$1],[$2],16; "
+        "ppu.cp.async.commit_group; ppu.mov.u32 $0,0;",
+        "=r,r,l,r,~{memory}",
+        [shared, source, dependency],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_stream_wait(dependency):
+    return tl.inline_asm_elementwise(
+        "ppu.cp.async.wait_group 0; ppu.mov.u32 $0,0;",
+        "=r,r,~{memory}",
+        [dependency],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_stream_fragment(shared, dependency):
+    return tl.inline_asm_elementwise(
+        "ppu.ld.shared.v4.b32 {$0,$1,$2,$3},[$4];",
+        "=r,=r,=r,=r,r,r,~{memory}",
+        [shared, dependency],
+        dtype=(tl.int32, tl.int32, tl.int32, tl.int32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_stream_dp4a(a, b, acc):
+    return tl.inline_asm_elementwise(
+        "dp4a.s32.s32 $0,$1,$2,$3;",
+        "=r,r,r,r",
+        [a, b, acc],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_streaming_gemv_kernel(
+    A,
+    As,
+    B,
+    Bs,
+    C,
+    RowExperts,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    E: tl.constexpr,
+):
+    tl.static_assert(K % 512 == 0 and K >= 1024)
+    WARPS: tl.constexpr = 1
+    thread = tl.arange(0, 32 * WARPS)
+    row = tl.program_id(1).to(tl.int64)
+    expert = tl.load(RowExperts + row).to(tl.int64)
+    col = tl.program_id(0) * WARPS + thread // 32
+    kw = (thread % 32) * 16
+    smem = tle.gpu.alloc(
+        [2 * 32 * WARPS * 16],
+        tl.int8,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    bptr = B + expert * N * K + col * K + kw
+    aptr = A + row * K + kw
+    shared = tle.gpu.local_ptr(smem, (thread * 16,)).to(tl.int64).to(tl.int32)
+    group = grouped_stream_copy(shared, bptr, 0)
+    acc = tl.full((32 * WARPS,), 0, tl.int32)
+    for tile in range(K // 512):
+        ready = grouped_stream_wait(group)
+        if tile + 1 < K // 512:
+            following = (
+                tle.gpu.local_ptr(
+                    smem, ((((tile + 1) % 2) * 32 * WARPS + thread) * 16,)
+                )
+                .to(tl.int64)
+                .to(tl.int32)
+            )
+            group = grouped_stream_copy(following, bptr + (tile + 1) * 512, ready)
+        else:
+            group = ready
+        current = (
+            tle.gpu.local_ptr(smem, (((tile % 2) * 32 * WARPS + thread) * 16,))
+            .to(tl.int64)
+            .to(tl.int32)
+        )
+        b = grouped_stream_fragment(current, group)
+        a = load_int8_vector(aptr + tile * 512, tl.full((32 * WARPS,), True, tl.int1))
+        for word in tl.static_range(4):
+            acc = grouped_stream_dp4a(a[word], b[word], acc)
+    value = tl.sum(tl.reshape(acc, (WARPS, 32)), 1).to(tl.float32)
+    cols = tl.program_id(0) * WARPS + tl.arange(0, WARPS)
+    scale_a = tl.load(As + row)
+    scale_b = tl.load(Bs + expert * N + cols)
+    tl.store(C + row * N + cols, value * scale_a * scale_b)
+
+
+@triton.jit
+def grouped_vector_expert_kernel(
+    A,
+    As,
+    B,
+    Bs,
+    C,
+    Counts,
+    Starts,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    E: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K16: tl.constexpr,
+    UNROLL: tl.constexpr,
+):
+    expert = tl.program_id(1)
+    first = tl.load(Starts + expert)
+    count = tl.load(Counts + expert)
+    cols = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    vectors = tl.arange(0, BLOCK_K16)
+    for block in range(tl.cdiv(count, BLOCK_M)):
+        rows = first + block * BLOCK_M + tl.arange(0, BLOCK_M)
+        aptr = A + rows[:, None] * K + vectors[None, :] * 16
+        bptr = (
+            B + expert.to(tl.int64) * N * K + cols[:, None] * K + vectors[None, :] * 16
+        )
+        acc = tl.zeros((BLOCK_M, BLOCK_N, BLOCK_K16), tl.int32)
+        for tile in tl.range(tl.cdiv(K, 16 * BLOCK_K16), loop_unroll_factor=UNROLL):
+            valid_k = vectors + tile * BLOCK_K16 < K // 16
+            a = load_int8_vector(
+                aptr + tile * BLOCK_K16 * 16,
+                (rows[:, None] < first + count) & valid_k[None, :],
+            )
+            b = load_int8_vector(
+                bptr + tile * BLOCK_K16 * 16, (cols[:, None] < N) & valid_k[None, :]
+            )
+            acc = grouped_dot_vector(
+                (
+                    a[0][:, None, :],
+                    a[1][:, None, :],
+                    a[2][:, None, :],
+                    a[3][:, None, :],
+                ),
+                (
+                    b[0][None, :, :],
+                    b[1][None, :, :],
+                    b[2][None, :, :],
+                    b[3][None, :, :],
+                ),
+                acc,
+            )
+        value = tl.sum(acc, 2).to(tl.float32)
+        scale_a = tl.load(As + rows, rows < first + count, other=0)
+        scale_b = tl.load(Bs + expert * N + cols, cols < N, other=0)
+        tl.store(
+            C + rows[:, None] * N + cols[None, :],
+            value * scale_a[:, None] * scale_b[None, :],
+            (rows[:, None] < first + count) & (cols[None, :] < N),
+        )
+
+
+@triton.jit
 def grouped_gemv_vector_kernel(
     A,
     As,
@@ -490,17 +682,10 @@ def grouped_gemv_vector_kernel(
         b0, b1, b2, b3 = load_int8_vector(
             b_ptr + tile * BLOCK_K16 * 16, (cols[:, None] < N) & valid_k[None, :]
         )
-        # Keep the four packed words in registers through the integer reduction.
-        acc = tl.inline_asm_elementwise(
-            "{ .reg .s32 partial; dp4a.s32.s32 partial,$1,$5,$9; "
-            "dp4a.s32.s32 partial,$2,$6,partial; "
-            "dp4a.s32.s32 partial,$3,$7,partial; "
-            "dp4a.s32.s32 $0,$4,$8,partial; }",
-            "=r,r,r,r,r,r,r,r,r,r",
-            [a0[None, :], a1[None, :], a2[None, :], a3[None, :], b0, b1, b2, b3, acc],
-            dtype=tl.int32,
-            is_pure=True,
-            pack=1,
+        acc = grouped_dot_vector(
+            (a0[None, :], a1[None, :], a2[None, :], a3[None, :]),
+            (b0, b1, b2, b3),
+            acc,
         )
     dot = tl.sum(acc, 1).to(tl.float32)
     scale_a = tl.load(As + row)
@@ -1003,6 +1188,108 @@ autotuned_grouped_persistent = libentry()(
 )
 
 
+@triton.jit
+def grouped_vector_choice_kernel(
+    A,
+    As,
+    B,
+    Bs,
+    C,
+    RowExperts,
+    Counts,
+    Starts,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    E: tl.constexpr,
+    NAIVE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr = 1,
+    BLOCK_K16: tl.constexpr = 32,
+    UNROLL: tl.constexpr = 1,
+    BLOCK_K4: tl.constexpr = 128,
+    STAGES: tl.constexpr = 4,
+    WARPS: tl.constexpr = 1,
+    TLE_PIPELINE: tl.constexpr = False,
+    CACHE_B: tl.constexpr = "",
+    EVICT_B: tl.constexpr = "",
+):
+    if NAIVE:
+        grouped_gemv_int8_kernel(
+            A,
+            As,
+            B,
+            Bs,
+            C,
+            RowExperts,
+            M,
+            N,
+            K,
+            E,
+            BLOCK_N,
+            BLOCK_K4,
+            STAGES,
+            WARPS,
+            TLE_PIPELINE,
+            CACHE_B,
+            EVICT_B,
+        )
+    else:
+        grouped_vector_expert_kernel(
+            A,
+            As,
+            B,
+            Bs,
+            C,
+            Counts,
+            Starts,
+            M,
+            N,
+            K,
+            E,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K16,
+            UNROLL,
+        )
+
+
+# Benchmark tables require the same fields for both algorithms.
+grouped_vector_expert_configs = [
+    triton.Config(
+        {
+            "BLOCK_M": 1,
+            "BLOCK_K16": 32,
+            "UNROLL": 1,
+            "BLOCK_K4": 128,
+            "STAGES": 4,
+            "WARPS": 1,
+            "TLE_PIPELINE": False,
+            "CACHE_B": "",
+            "EVICT_B": "",
+            **config.kwargs,
+        },
+        num_warps=config.num_warps,
+        num_stages=config.num_stages,
+        num_ctas=config.num_ctas,
+    )
+    for config in runtime.get_tuned_config("grouped_gemm_w8a8_vector_expert")
+]
+MAX_GROUPED_VECTOR_M = max(
+    config.kwargs["BLOCK_M"]
+    for config in grouped_vector_expert_configs
+    if not config.kwargs["NAIVE"]
+)
+autotuned_grouped_vector_expert = libentry()(
+    libtuner(
+        configs=grouped_vector_expert_configs,
+        key=["M", "N", "K", "E"],
+        warmup=5,
+        rep=20,
+    )(grouped_vector_choice_kernel)
+)
+
+
 def grouped_gemm_w8a8(
     A: torch.Tensor,
     As: torch.Tensor,
@@ -1067,6 +1354,64 @@ def grouped_gemm_w8a8(
         32,
     ):
         raise NotImplementedError("grouped INT8 GEMM requires PPU-ZW810E")
+
+    if (
+        K >= LARGE_REDUCTION_MIN
+        and K % 512 == 0
+        and M <= STREAMING_GEMV_ROW_LIMIT
+        and N % 4 == 0
+        and A.data_ptr() % 16 == 0
+        and B.data_ptr() % 16 == 0
+    ):
+        with torch_device_fn.device(A.device):
+            grouped_streaming_gemv_kernel[(N, M)](
+                A,
+                As,
+                B,
+                Bs,
+                C,
+                m_indices,
+                M,
+                N,
+                K,
+                E,
+                num_warps=1,
+                num_stages=1,
+            )
+        return
+
+    if (
+        K >= LARGE_REDUCTION_MIN
+        and K % 512 == 0
+        and N >= 32
+        and GROUPED_VECTOR_MIN_ROWS <= M
+        and 2 * E <= M <= 4 * E
+        and (M + MAX_GROUPED_VECTOR_M) * K < 2**31
+        and E * N * K < 2**31
+        and 2 * (M + MAX_GROUPED_VECTOR_M) * N < 2**31
+        and A.data_ptr() % 16 == 0
+        and B.data_ptr() % 16 == 0
+    ):
+        starts = torch.empty_like(m_rows)
+
+        def vector_grid(meta):
+            if meta["NAIVE"]:
+                return triton.cdiv(N, meta["BLOCK_N"]), M
+            else:
+                grouped_expert_offsets[(1,)](
+                    m_rows,
+                    starts,
+                    E,
+                    triton.next_power_of_2(E),
+                    num_warps=4,
+                )
+                return triton.cdiv(N, meta["BLOCK_N"]), E
+
+        with torch_device_fn.device(A.device):
+            autotuned_grouped_vector_expert[vector_grid](
+                A, As, B, Bs, C, m_indices, m_rows, starts, M, N, K, E
+            )
+        return
 
     is_row_prefetch = M <= min(E, ROW_PREFETCH_LIMIT)
     if (

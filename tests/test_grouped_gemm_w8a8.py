@@ -98,9 +98,10 @@ def test_grouped_gemm_w8a8_deepgemm(n, k):
     gems_assert_close(args[4], expected, torch.bfloat16, atol=1e-3)
 
 
+@pytest.mark.parametrize("n", [64, 65])
 @pytest.mark.grouped_gemm_w8a8
-def test_grouped_gemm_w8a8_int8_extremes():
-    args = make_grouped_gemm_case([1, 0, 1], 65, 6144, flag_gems.device)
+def test_grouped_gemm_w8a8_int8_extremes(n):
+    args = make_grouped_gemm_case([1, 0, 1], n, 6144, flag_gems.device)
     args[0].fill_(-128)
     args[2][0].fill_(-128)
     args[2][2].fill_(127)
@@ -121,6 +122,8 @@ def test_grouped_gemm_w8a8_changing_expert_rows():
         ([0, 3, 0, 11] + [0] * 12, 68, 128),
         ([7, 0, 7, 0] + [0] * 12, 68, 128),
         ([0, 257, 0, 511], 68, 128),
+        ([4] * 128, 32, 4096),
+        ([0, 511] + [0] * 125 + [1], 32, 4096),
     ):
         args = make_grouped_gemm_case(lengths, n, k, flag_gems.device)
         expected = grouped_gemm_cpu_reference(*args[:4], lengths)

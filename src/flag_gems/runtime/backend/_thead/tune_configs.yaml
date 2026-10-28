@@ -62,6 +62,64 @@ grouped_gemm_w8a8_persistent:
     num_warps: 8
     num_stages: 1
 
+grouped_gemm_w8a8_vector_expert:
+  - gen: true
+    param_map:
+      META:
+        NAIVE: false
+        BLOCK_M: 2
+        BLOCK_N: 8
+        BLOCK_K16: 32
+        UNROLL: unroll
+      num_warps: 2
+      num_stages: 1
+    unroll: [1, 2]
+  - gen: true
+    param_map:
+      META:
+        NAIVE: false
+        BLOCK_M: 4
+        BLOCK_N: 8
+        BLOCK_K16: 32
+        UNROLL: unroll
+      num_warps: 2
+      num_stages: 1
+    unroll: [1, 2]
+  - META:
+      NAIVE: false
+      BLOCK_M: 2
+      BLOCK_N: 16
+      BLOCK_K16: 32
+      UNROLL: 1
+    num_warps: 4
+    num_stages: 1
+  - META:
+      NAIVE: false
+      BLOCK_M: 4
+      BLOCK_N: 16
+      BLOCK_K16: 32
+      UNROLL: 2
+    num_warps: 2
+    num_stages: 1
+  - META:
+      NAIVE: true
+      BLOCK_N: 4
+      BLOCK_K4: 128
+      WARPS: 1
+      STAGES: 4
+      TLE_PIPELINE: true
+    num_warps: 1
+    num_stages: 4
+  - META:
+      NAIVE: true
+      BLOCK_N: 8
+      BLOCK_K4: 128
+      WARPS: 1
+      STAGES: 4
+      TLE_PIPELINE: false
+    num_warps: 1
+    num_stages: 4
+
 grouped_gemm_w8a8_gemv:
   - META:
       BLOCK_N: 4
