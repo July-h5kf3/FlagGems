@@ -118,6 +118,8 @@ def test_grouped_gemm_w8a8_changing_expert_rows():
         ([0, 257, 0, 511], 128, 256),
         ([2] * 256, 68, 128),
         ([0, 511] + [0] * 253 + [1], 68, 128),
+        ([0, 3, 0, 11] + [0] * 12, 68, 128),
+        ([7, 0, 7, 0] + [0] * 12, 68, 128),
     ):
         args = make_grouped_gemm_case(lengths, n, k, flag_gems.device)
         expected = grouped_gemm_cpu_reference(*args[:4], lengths)

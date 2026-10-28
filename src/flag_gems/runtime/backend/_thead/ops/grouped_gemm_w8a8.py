@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 SMALL_ROW_LIMIT = 64
 SHORT_REDUCTION_LIMIT = 1024
 PREFETCH_REDUCTION_LIMIT = 128
+ROW_PREFETCH_LIMIT = 32
 GEMV_ROW_LIMIT = 640
 
 
@@ -232,12 +233,14 @@ def grouped_persistent_int8_kernel(
     B,
     Bs,
     C,
+    RowExperts,
     Counts,
     Starts,
     M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
     E: tl.constexpr,
+    ROW_MODE: tl.constexpr,
     WARPS: tl.constexpr,
     N_REPS: tl.constexpr,
     N_GROUPS: tl.constexpr,
@@ -247,9 +250,14 @@ def grouped_persistent_int8_kernel(
     thread = tl.arange(0, 32 * WARPS * N_REPS)
     lane = thread % 32
     warp = thread // 32
-    expert = tl.program_id(1).to(tl.int64)
-    first = tl.load(Starts + expert).to(tl.int64)
-    count = tl.load(Counts + expert).to(tl.int64)
+    if ROW_MODE:
+        first = tl.program_id(1).to(tl.int64)
+        expert = tl.load(RowExperts + first).to(tl.int64)
+        count = 1
+    else:
+        expert = tl.program_id(1).to(tl.int64)
+        first = tl.load(Starts + expert).to(tl.int64)
+        count = tl.load(Counts + expert).to(tl.int64)
     first_n = tl.program_id(0)
     tiles_n: tl.constexpr = triton.cdiv(N, BN)
     if count == 0 or first_n >= tiles_n:
@@ -871,7 +879,7 @@ autotuned_grouped_vector_gemv = libentry()(
 autotuned_grouped_persistent = libentry()(
     libtuner(
         configs=runtime.get_tuned_config("grouped_gemm_w8a8_persistent"),
-        key=["M", "N", "K", "E"],
+        key=["M", "N", "K", "E", "ROW_MODE"],
         warmup=5,
         rep=20,
     )(grouped_persistent_int8_kernel)
@@ -943,25 +951,41 @@ def grouped_gemm_w8a8(
     ):
         raise NotImplementedError("grouped INT8 GEMM requires PPU-ZW810E")
 
+    is_row_prefetch = M <= min(E, ROW_PREFETCH_LIMIT)
     if (
         K == PREFETCH_REDUCTION_LIMIT
-        and 2 * E <= M <= 16 * E
+        and (is_row_prefetch or 2 * E <= M <= 16 * E)
         and N % 4 == 0
         and A.data_ptr() % 128 == 0
         and B.data_ptr() % 128 == 0
         and C.data_ptr() % 8 == 0
     ):
-        starts = torch.empty_like(m_rows)
         grid = lambda meta: (
             min(meta["N_GROUPS"], triton.cdiv(N, 16 * meta["WARPS"] * meta["N_REPS"])),
-            E,
+            M if is_row_prefetch else E,
         )
         with torch_device_fn.device(A.device):
-            grouped_expert_offsets[(1,)](
-                m_rows, starts, E, triton.next_power_of_2(E), num_warps=4
-            )
+            if is_row_prefetch:
+                starts = None
+            else:
+                starts = torch.empty_like(m_rows)
+                grouped_expert_offsets[(1,)](
+                    m_rows, starts, E, triton.next_power_of_2(E), num_warps=4
+                )
             autotuned_grouped_persistent[grid](
-                A, As, B, Bs, C, m_rows, starts, M, N, K, E
+                A,
+                As,
+                B,
+                Bs,
+                C,
+                m_indices,
+                m_rows,
+                starts,
+                M,
+                N,
+                K,
+                E,
+                ROW_MODE=is_row_prefetch,
             )
         return
 

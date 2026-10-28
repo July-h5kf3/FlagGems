@@ -49,6 +49,18 @@ grouped_gemm_w8a8_persistent:
       N_GROUPS: 8
     num_warps: 4
     num_stages: 1
+  - META:
+      WARPS: 4
+      N_REPS: 1
+      N_GROUPS: 16
+    num_warps: 4
+    num_stages: 1
+  - META:
+      WARPS: 8
+      N_REPS: 1
+      N_GROUPS: 8
+    num_warps: 8
+    num_stages: 1
 
 grouped_gemm_w8a8_gemv:
   - META:
