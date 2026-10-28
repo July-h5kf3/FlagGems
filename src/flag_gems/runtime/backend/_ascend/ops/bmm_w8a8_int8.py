@@ -389,7 +389,7 @@ def bmm_w8a8_int8(
             else:
                 block_m = 128
             block_n = 64 if rows <= 64 else (128 if rows <= 256 else 256)
-            if rows <= 16:
+            if rows <= 64:
                 max_block_k = 2048
             else:
                 max_block_k = 1024 if rows <= 256 else 512
