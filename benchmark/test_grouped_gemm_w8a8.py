@@ -19,11 +19,9 @@ import flag_gems
 from tests.test_grouped_gemm_w8a8 import deepgemm_grouped_gemm, make_grouped_gemm_case
 
 from .base import Benchmark
-from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 
-class GroupedGemmInt8Benchmark(ParallelBenchmarkMixin, Benchmark):
-    RECORD_PARALLEL_RESULTS = True
+class GroupedGemmInt8Benchmark(Benchmark):
     DEFAULT_SHAPES = [(45, 512, 6144, 257), (45, 6144, 256, 257)]
     DEFAULT_SHAPE_DESC = "M,N,K,E"
 
