@@ -1607,7 +1607,7 @@ def grouped_gemm_w8a8(
         K >= LARGE_REDUCTION_MIN
         and K % 768 == 0
         and (
-            GROUPED_VECTOR_MIN_ROWS < M <= PIPELINE_MAX_ROWS_PER_EXPERT * E
+            max(GROUPED_VECTOR_MIN_ROWS, 4 * E) < M <= PIPELINE_MAX_ROWS_PER_EXPERT * E
             or M >= PIPELINE_DENSE_ROWS_PER_EXPERT * E
         )
         and 4 <= N <= 256
