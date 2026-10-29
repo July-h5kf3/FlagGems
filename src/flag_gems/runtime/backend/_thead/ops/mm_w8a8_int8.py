@@ -180,6 +180,14 @@ def _pick_tiles(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
     load two 128-byte K segments per tile to amortize async load overhead.
     Never pad BLOCK_N far past N: a 64-wide MMA on N=1 is ~64x wasted work.
     """
+    if 8 < m <= 256 and n <= 512 and 4096 < k <= 8192:
+        # More K work per load amortizes the long, narrow reduction.
+        return 32, 32, 256, 4, 3, 8
+    if m > 16 and n >= 2048 and k == 128:
+        # Complete the short reduction in one iteration.
+        if m <= 32:
+            return 16, 128, 128, 4, 1, 8
+        return 32, 128, 128, 4, 3, 1 if m < 1024 else 8
     if 1 < m <= 8 and n >= 32768 and 2048 <= k <= 4096:
         return 16, 128, 256, 4, 3, 8
     if 32 < m <= 128 and n <= 512 and k >= 2048:
@@ -332,8 +340,16 @@ def _launch(
             "THead mm_w8a8_int8 AIU path is unavailable: requires "
             "triton.experimental.tle."
         )
-    transpose_out = (m == 256 and n >= 16384 and 2048 <= k <= 4096) or (
-        m >= 1024 and n <= 1024 and 2048 <= k <= 4096
+    long_narrow_transpose = (
+        m >= 1024
+        and n <= 512
+        and 4096 < k <= 8192
+        and (n > 128 or (m >= 8192 and m % 64 == 0))
+    )
+    transpose_out = (
+        (m == 256 and n >= 16384 and 2048 <= k <= 4096)
+        or (m >= 1024 and n <= 1024 and 2048 <= k <= 4096)
+        or long_narrow_transpose
     )
     if transpose_out:
         # Both operands are already in the required physical layout.
@@ -341,14 +357,24 @@ def _launch(
         a_q, b_q = b_q, a_q
         a_scale, b_scale = b_scale, a_scale
         m, n = n, m
-        block_m, block_n, block_k, num_warps, num_stages, group_m = (
-            64,
-            256,
-            128,
-            8,
-            3,
-            8,
-        )
+        if long_narrow_transpose:
+            block_m, block_n, block_k, num_warps, num_stages, group_m = (
+                64,
+                64,
+                256,
+                4,
+                3,
+                8,
+            )
+        else:
+            block_m, block_n, block_k, num_warps, num_stages, group_m = (
+                64,
+                256,
+                128,
+                8,
+                3,
+                8,
+            )
     else:
         (
             block_m,
@@ -415,17 +441,22 @@ def _run_mm(a, b, scale_a, scale_b, out, m, n, k, bias=None):
                 out, bias, m * n, n, bias is not None, BLOCK=1024
             )
         return out
+    small_long_k = m <= 8 and n <= 512 and 4096 < k <= 8192
+    vector_dp4a = m == 1 and 512 <= n <= 16384 and 512 <= k <= 2048
     if (
-        1 < m <= 8
-        and n <= 512
-        and k <= 4096
+        ((1 < m <= 8 and n <= 512 and k <= 4096) or small_long_k or vector_dp4a)
         and k % 4 == 0
         and a.is_contiguous()
         and b.stride() == (1, k)
         and a.data_ptr() % 4 == 0
         and b.data_ptr() % 4 == 0
     ):
-        r, warps = (1, 1) if m > 4 else (2, 4)
+        if small_long_k:
+            r, warps = (1 if m == 1 else 4 if n <= 128 else 2), 4
+        elif vector_dp4a:
+            r, warps = (4 if k <= 768 else 2), 1
+        else:
+            r, warps = (1, 1) if m > 4 else (2, 4)
         with torch_device_fn.device(a.device):
             _small_rows[(triton.cdiv(n, r), m)](
                 a,
