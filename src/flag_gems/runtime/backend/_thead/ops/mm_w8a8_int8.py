@@ -35,8 +35,8 @@ except ImportError:
     tle_async = None
     HAS_TLE = False
 
-from flag_gems.runtime import get_heuristic_config, torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.runtime import get_tuned_config, torch_device_fn
+from flag_gems.utils import libentry, libtuner
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,90 @@ def _grouped_pids(
     return pid_m, pid_n
 
 
+def _prune_mm_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    m, n, k = args["M"], args["N"], args["K"]
+    max_m = max(16, triton.next_power_of_2(m))
+    if 8 < m <= 32 and n <= 512 and k > 4096:
+        max_m = 32
+    max_n = max(16, triton.next_power_of_2(n))
+    max_k = max(32, triton.next_power_of_2(k))
+    pruned = [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_M"] <= max_m
+        and config.kwargs["BLOCK_N"] <= max_n
+        and config.kwargs["BLOCK_K"] <= max_k
+        and (k < 256 or config.kwargs["BLOCK_K"] >= 128)
+        and (n <= 512 or config.kwargs["BLOCK_N"] >= 64)
+        and (m <= 256 or config.kwargs["BLOCK_M"] >= 32)
+        and (m <= 32 or n <= 512 or config.kwargs["BLOCK_M"] >= 32)
+        and (m <= 512 or n <= 512 or k < 256 or config.kwargs["BLOCK_M"] >= 64)
+    ]
+    if k == 128 and n >= 2048 and m > 16:
+        # The reduction fits in one step; deeper pipelines only add overhead.
+        pruned = [
+            config
+            for config in pruned
+            if config.kwargs["BLOCK_K"] == k and config.num_stages <= 2
+        ]
+    elif args["TRANSPOSE_OUT"] and n >= 2048 and k > 4096:
+        # Tall, narrow products reuse more rows through the transposed output.
+        pruned = [
+            config
+            for config in pruned
+            if config.kwargs["BLOCK_M"] >= 64 and config.kwargs["BLOCK_N"] >= 128
+        ]
+    elif m >= 1024 and n >= 1024 and k >= 4096:
+        pruned = [config for config in pruned if config.kwargs["BLOCK_M"] >= 64]
+    elif n <= 512 and 4096 < k <= 8192:
+        if 8 < m <= 256:
+            pruned = [
+                config
+                for config in pruned
+                if config.kwargs["BLOCK_K"] >= 256
+                and 32 <= config.kwargs["BLOCK_N"] <= 64
+            ]
+        elif m > 256:
+            pruned = [
+                config
+                for config in pruned
+                if config.kwargs["BLOCK_M"] >= 64 and config.kwargs["BLOCK_N"] >= 64
+            ]
+    return pruned
+
+
 @libentry()
+@libtuner(
+    configs=get_tuned_config("mm_w8a8_int8"),
+    key=[
+        "M",
+        "N",
+        "K",
+        "TRANSPOSE_OUT",
+        "A_SCALAR",
+        "B_SCALAR",
+        "HAS_BIAS",
+        "STORE_CACHE",
+    ],
+    prune_configs_by={"early_config_prune": _prune_mm_configs},
+    use_cuda_graph=True,
+    rep=30,
+)
+@triton.heuristics(
+    {
+        "BOUNDARY": lambda args: args["M"] % args["BLOCK_M"] != 0
+        or args["N"] % args["BLOCK_N"] != 0
+        or args["K"] % args["BLOCK_K"] != 0,
+        "STORE_MASK": lambda args: args["M"] % args["BLOCK_M"] != 0
+        or args["N"] % args["BLOCK_N"] != 0
+        or args["K"] % args["BLOCK_K"] != 0,
+        "NUM_WARPS": lambda args: args["num_warps"],
+        "FAST_TAIL": lambda args: args["BLOCK_M"] >= 128
+        and args["N"] >= 1024
+        and args["K"] >= 2048,
+    }
+)
 @triton.jit
 def _mm_w8a8_aiu_kernel(
     A_Q,
@@ -315,71 +398,11 @@ def _launch(
         a_q, b_q = b_q, a_q
         a_scale, b_scale = b_scale, a_scale
         m, n = n, m
-        if short_transpose:
-            block_m, block_n, block_k, num_warps, num_stages, group_m = (
-                64,
-                128,
-                128,
-                4,
-                2,
-                8,
-            )
-        elif long_narrow_transpose and n >= 2048:
-            block_m, block_n, block_k, num_warps, num_stages, group_m = (
-                64,
-                256,
-                128,
-                8,
-                3 if m <= 128 and n >= 12288 else 4,
-                8,
-            )
-        elif long_narrow_transpose:
-            block_m, block_n, block_k, num_warps, num_stages, group_m = (
-                64,
-                64,
-                256,
-                4,
-                3,
-                8,
-            )
-        else:
-            block_m, block_n, block_k, num_warps, num_stages, group_m = (
-                64,
-                256,
-                128,
-                8,
-                3,
-                8,
-            )
-    else:
-        (
-            block_m,
-            block_n,
-            block_k,
-            num_warps,
-            num_stages,
-            group_m,
-        ) = get_heuristic_config("mm_w8a8_int8")["TILES"]({"M": m, "N": n, "K": k})
-    n_b = n
-    boundary = (m % block_m) != 0 or (n_b % block_n) != 0 or (k % block_k) != 0
-    store_mask = boundary or (n != n_b)
-    logger.debug(
-        "GEMS_THEAD MM_W8A8_AIU m=%s n=%s k=%s n_b=%s "
-        "tiles=(%s,%s,%s) warps=%s stages=%s boundary=%s store_mask=%s",
-        m,
-        n,
-        k,
-        n_b,
-        block_m,
-        block_n,
-        block_k,
-        num_warps,
-        num_stages,
-        boundary,
-        store_mask,
-    )
+    logger.debug("GEMS_THEAD MM_W8A8_AIU m=%s n=%s k=%s", m, n, k)
     with torch_device_fn.device(a_q.device):
-        grid = (triton.cdiv(m, block_m) * triton.cdiv(n_b, block_n),)
+        grid = lambda meta: (
+            triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
+        )
         _mm_w8a8_aiu_kernel[grid](
             a_q,
             b_q,
@@ -388,24 +411,14 @@ def _launch(
             out,
             bias,
             m,
-            n_b,
+            n,
             k,
             n,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-            GROUP_M=group_m,
-            BOUNDARY=boundary,
-            STORE_MASK=store_mask,
-            NUM_WARPS=num_warps,
             TRANSPOSE_OUT=transpose_out,
-            FAST_TAIL=block_m >= 128 and n >= 1024 and k >= 2048,
             STORE_CACHE=store_cache,
             A_SCALAR=a_scale.numel() == 1,
             B_SCALAR=b_scale.numel() == 1,
             HAS_BIAS=bias is not None,
-            num_warps=num_warps,
-            num_stages=num_stages,
         )
     return out
 
@@ -521,7 +534,9 @@ def _run_mm(a, b, scale_a, scale_b, out, m, n, k, bias=None):
         if m * k > props.L2_cache_size and 4 * tile_count < 3 * wave_capacity:
             # Use more row tiles when activation traffic exceeds L2 and waves are underfilled.
             with torch_device_fn.device(a.device):
-                _mm_w8a8_rows192_kernel[(triton.cdiv(m, 192) * triton.cdiv(n, 64),)](
+                _mm_w8a8_rows192_kernel[
+                    lambda meta: (triton.cdiv(m, 192) * triton.cdiv(n, meta["BN"]),)
+                ](
                     a,
                     b,
                     scale_a,
@@ -531,15 +546,9 @@ def _run_mm(a, b, scale_a, scale_b, out, m, n, k, bias=None):
                     m,
                     n,
                     k,
-                    64,
-                    256,
-                    8,
-                    scale_a.numel() == 1,
-                    scale_b.numel() == 1,
-                    bias is not None,
-                    "",
-                    num_warps=8,
-                    num_stages=3,
+                    A_SCALAR=scale_a.numel() == 1,
+                    B_SCALAR=scale_b.numel() == 1,
+                    HAS_BIAS=bias is not None,
                 )
             return out
     return _launch(a, scale_a, b, scale_b, out, m, n, k, bias)
@@ -642,6 +651,7 @@ def mm_w8a8_int8_out(
 
 
 @libentry()
+@libtuner(configs=get_tuned_config("mm_w8a8_int8_rows192"), key=["M", "N", "K"])
 @triton.jit
 def _mm_w8a8_rows192_kernel(
     A,
