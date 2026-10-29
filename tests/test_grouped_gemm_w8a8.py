@@ -110,6 +110,28 @@ def test_grouped_gemm_w8a8_int8_extremes(n):
     gems_assert_equal(args[4].cpu(), expected)
 
 
+@pytest.mark.parametrize(
+    "lengths",
+    [[0, 1, 17, 0, 35] + [9] * 59, [0, 566] + [0] * 61 + [18], [0, 257, 0, 511]],
+)
+@pytest.mark.parametrize("values", ["random", "extreme", "cancellation"])
+@pytest.mark.grouped_gemm_w8a8
+def test_grouped_gemm_w8a8_pipeline(lengths, values):
+    n, k = 68, 6144
+    args = make_grouped_gemm_case(lengths, n, k, flag_gems.device)
+    if values != "random":
+        args[0].fill_(-128)
+        args[2].fill_(-128)
+        if values == "cancellation":
+            args[0].fill_(127)
+            args[2].fill_(127)
+            args[0][:, k // 2 :] = -127
+            args[0][:, k // 3] = 126
+    expected = grouped_gemm_cpu_reference(*args[:4], lengths)
+    flag_gems.grouped_gemm_w8a8(*args)
+    gems_assert_equal(args[4].cpu(), expected)
+
+
 @pytest.mark.grouped_gemm_w8a8
 def test_grouped_gemm_w8a8_changing_expert_rows():
     for lengths, n, k in (

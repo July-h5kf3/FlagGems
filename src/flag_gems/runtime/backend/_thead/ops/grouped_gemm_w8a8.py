@@ -34,6 +34,11 @@ RESIDENT_ROWS_PER_EXPERT = 64
 STREAMING_GEMV_ROW_LIMIT = 128
 GROUPED_VECTOR_MIN_ROWS = 512
 LARGE_REDUCTION_MIN = 4096
+PIPELINE_BLOCK_M = 16
+PIPELINE_DENSE_BLOCK_M = 128
+PIPELINE_DENSE_ROWS_PER_EXPERT = 64
+PIPELINE_PROGRAMS = 80
+PIPELINE_MAX_ROWS_PER_EXPERT = 16
 
 
 @libentry()
@@ -142,6 +147,224 @@ def grouped_mma(a, b, c):
         is_pure=True,
         pack=1,
     )
+
+
+@libentry()
+@triton.jit
+def grouped_pipeline_metadata(
+    Counts, Tiles, E: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_M: tl.constexpr
+):
+    expert = tl.program_id(0)
+    experts = tl.arange(0, BLOCK_E)
+    counts = tl.load(Counts + experts, experts < E, other=0)
+    tiles = tl.cdiv(counts, BLOCK_M)
+    first_row = tl.sum(tl.where(experts < expert, counts, 0), 0)
+    first_tile = tl.sum(tl.where(experts < expert, tiles, 0), 0)
+    count = tl.load(Counts + expert)
+    if expert == 0:
+        tl.store(Tiles, tl.sum(tiles, 0))
+    for block in range(tl.cdiv(count, BLOCK_M)):
+        row = first_row + block * BLOCK_M
+        tile = Tiles + 1 + 3 * (first_tile + block)
+        tl.store(tile, expert)
+        tl.store(tile + 1, row)
+        tl.store(tile + 2, tl.minimum(first_row + count, row + BLOCK_M))
+
+
+@triton.jit
+def grouped_pipeline_copy(
+    shared, source, dim_x, dim_k, start_x, start_k, X: tl.constexpr, dependency
+):
+    return tl.inline_asm_elementwise(
+        "{ .reg .u32 tid; .reg .pred copy; ppu.mov.u32 tid,%tid.x; "
+        "ppu.setp.lt.u32 copy,tid,32; "
+        "@copy ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.zfill.2d.b8 "
+        "[$1],[$2],{1,$3,$4,0,$5,$6},{1,$7,128,1}; ppu.mov.u32 $0,0; }",
+        "=r,r,l,r,r,r,r,r,r,~{memory}",
+        [shared, source, dim_x, dim_k, start_x, start_k, X, dependency],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_pipeline_stage(
+    shared,
+    A,
+    B,
+    first,
+    end,
+    nfirst,
+    kfirst,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    dependency,
+):
+    for part in tl.static_range(BK // 128):
+        token = grouped_pipeline_copy(
+            shared + part * BM * 128,
+            A,
+            end,
+            K,
+            first,
+            kfirst + part * 128,
+            BM,
+            dependency,
+        )
+        token = grouped_pipeline_copy(
+            shared + BM * BK + part * BN * 128,
+            B,
+            N,
+            K,
+            nfirst,
+            kfirst + part * 128,
+            BN,
+            token,
+        )
+    return tl.inline_asm_elementwise(
+        "ppu.cp.async.commit_group; ppu.mov.u32 $0,0;",
+        "=r,r,~{memory}",
+        [token],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grouped_pipeline_wait(dependency, REMAIN: tl.constexpr):
+    return tl.inline_asm_elementwise(
+        "ppu.cp.async.wait_group $2; bar.sync 0; ppu.mov.u32 $0,0;",
+        "=r,r,n,~{memory}",
+        [dependency, REMAIN],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@libentry()
+@triton.jit
+def grouped_pipeline_int8_kernel(
+    A,
+    As,
+    B,
+    Bs,
+    C,
+    Tiles,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    STAGES: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+):
+    tl.static_assert(BM % 16 == 0 and BN % 16 == 0 and BK % 128 == 0)
+    tl.static_assert(N % 4 == 0 and K % 128 == 0 and (STAGES == 2 or STAGES == 3))
+    tl.static_assert(triton.cdiv(K, BK) % STAGES == 0)
+    STAGE_BYTES: tl.constexpr = (BM + BN) * BK
+    CHUNKS: tl.constexpr = triton.cdiv(K, BK)
+    NT: tl.constexpr = triton.cdiv(N, BN)
+    thread = tl.arange(0, 32 * (BN // 16))
+    lane = thread % 32
+    warp = thread // 32
+    smem = tle.gpu.alloc(
+        [triton.next_power_of_2(STAGES * STAGE_BYTES)],
+        tl.int8,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    shared = tle.gpu.local_ptr(smem, (0,)).to(tl.int64).to(tl.int32)
+    total = tl.load(Tiles) * NT
+    for task in range(tl.program_id(0), total, PROGRAMS):
+        tl.debug_barrier()
+        mt, nt = task // NT, task % NT
+        expert = tl.load(Tiles + 1 + 3 * mt).to(tl.int64)
+        first = tl.load(Tiles + 2 + 3 * mt).to(tl.int64)
+        end = tl.load(Tiles + 3 + 3 * mt).to(tl.int64)
+        bptr = B + expert * N * K
+        nfirst = nt * BN
+        token = tl.full((), 0, tl.int32)
+        for pre in tl.static_range(min(STAGES - 1, CHUNKS)):
+            token = grouped_pipeline_stage(
+                shared + pre * STAGE_BYTES,
+                A,
+                bptr,
+                first,
+                end,
+                nfirst,
+                pre * BK,
+                N,
+                K,
+                BM,
+                BN,
+                BK,
+                token,
+            )
+        zero = tl.full((32 * (BN // 16),), 0, tl.int32)
+        acc = (zero,) * (8 * (BM // 16))
+        # Constant shared slots avoid dynamic ring pointers in the PPU backend.
+        for batch in range(CHUNKS // STAGES):
+            for slot in tl.static_range(STAGES):
+                chunk = batch * STAGES + slot
+                if slot == STAGES - 1:
+                    if batch + 1 < CHUNKS // STAGES:
+                        ready = grouped_pipeline_wait(token, STAGES - 2)
+                    else:
+                        ready = grouped_pipeline_wait(token, 0)
+                else:
+                    ready = grouped_pipeline_wait(token, STAGES - 2)
+                current = shared + slot * STAGE_BYTES
+                if slot == 0 or batch + 1 < CHUNKS // STAGES:
+                    token = grouped_pipeline_stage(
+                        shared + ((slot + STAGES - 1) % STAGES) * STAGE_BYTES,
+                        A,
+                        bptr,
+                        first,
+                        end,
+                        nfirst,
+                        (chunk + STAGES - 1) * BK,
+                        N,
+                        K,
+                        BM,
+                        BN,
+                        BK,
+                        ready,
+                    )
+                else:
+                    token = ready
+                for sub in tl.static_range(BK // 32):
+                    cube = sub // 4
+                    channel = (sub % 4) * 32
+                    b = grouped_aiu_fragment(
+                        current + BM * BK + cube * BN * 128,
+                        warp * 16,
+                        channel,
+                        ready,
+                        BN,
+                    )
+                    updated = ()
+                    for mi in tl.static_range(BM // 16):
+                        a = grouped_aiu_fragment(
+                            current + cube * BM * 128, mi * 16, channel, ready, BM
+                        )
+                        updated += grouped_mma(a, b, acc[mi * 8 : mi * 8 + 8])
+                    acc = updated
+        nbase = nfirst + warp * 16
+        sb = grouped_b_scales(Bs, expert, nbase + lane % 4, N)
+        for mi in tl.static_range(BM // 16):
+            row0 = first + mi * 16 + lane // 4
+            row1 = row0 + 8
+            sa = (tl.load(As + row0, row0 < end, 0), tl.load(As + row1, row1 < end, 0))
+            grouped_mma_epilogue(
+                C, sb, row0, row1, end, nbase, lane, sa, acc[mi * 8 : mi * 8 + 8], N
+            )
 
 
 @triton.jit
@@ -1382,6 +1605,54 @@ def grouped_gemm_w8a8(
 
     if (
         K >= LARGE_REDUCTION_MIN
+        and K % 768 == 0
+        and (
+            GROUPED_VECTOR_MIN_ROWS < M <= PIPELINE_MAX_ROWS_PER_EXPERT * E
+            or M >= PIPELINE_DENSE_ROWS_PER_EXPERT * E
+        )
+        and 4 <= N <= 256
+        and N % 4 == 0
+        and A.data_ptr() % 128 == 0
+        and B.data_ptr() % 128 == 0
+        and C.data_ptr() % 8 == 0
+    ):
+        is_dense = M >= PIPELINE_DENSE_ROWS_PER_EXPERT * E
+        block_m = PIPELINE_DENSE_BLOCK_M if is_dense else PIPELINE_BLOCK_M
+        block_n = 128 if is_dense else 64
+        block_k = 128 if is_dense else 256
+        stages = 2 if is_dense else 3
+        tile_capacity = triton.cdiv(M, block_m) + E
+        tiles = torch.empty(1 + 3 * tile_capacity, dtype=torch.int32, device=A.device)
+        with torch_device_fn.device(A.device):
+            grouped_pipeline_metadata[(E,)](
+                m_rows,
+                tiles,
+                E,
+                triton.next_power_of_2(E),
+                block_m,
+                num_warps=4,
+            )
+            grouped_pipeline_int8_kernel[(PIPELINE_PROGRAMS,)](
+                A,
+                As,
+                B,
+                Bs,
+                C,
+                tiles,
+                N,
+                K,
+                BM=block_m,
+                BN=block_n,
+                BK=block_k,
+                STAGES=stages,
+                PROGRAMS=PIPELINE_PROGRAMS,
+                num_warps=4,
+                num_stages=1,
+            )
+        return
+
+    if (
+        K >= LARGE_REDUCTION_MIN
         and K % 512 == 0
         and N >= 32
         and GROUPED_VECTOR_MIN_ROWS <= M
@@ -1413,10 +1684,12 @@ def grouped_gemm_w8a8(
             )
         return
 
-    is_row_prefetch = M <= min(E, ROW_PREFETCH_LIMIT)
+    is_row_prefetch = M <= min(E, ROW_PREFETCH_LIMIT) or (
+        M >= STREAMING_GEMV_ROW_LIMIT and E // 2 < M <= E
+    )
     if (
         K == PREFETCH_REDUCTION_LIMIT
-        and (is_row_prefetch or 2 * E <= M <= 16 * E)
+        and (is_row_prefetch or E <= M <= 16 * E)
         and N % 4 == 0
         and A.data_ptr() % 128 == 0
         and B.data_ptr() % 128 == 0
