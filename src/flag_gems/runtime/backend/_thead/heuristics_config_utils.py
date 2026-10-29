@@ -272,6 +272,80 @@ def mm_heur_even_k(args):
     return args["K"] % (args["BLOCK_K"] * args["SPLIT_K"]) == 0
 
 
+def mm_w8a8_int8_heur_tiles(args):
+    """Return BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, GROUP_M.
+
+    INT8 AIU v1 uses channels of 32/64/128 bytes. Wide decode projections
+    load two 128-byte K segments per tile to amortize async load overhead.
+    Never pad BLOCK_N far past N: a 64-wide MMA on N=1 is ~64x wasted work.
+    """
+    m, n, k = args["M"], args["N"], args["K"]
+    if m <= 8 and n >= 512 and 4096 < k <= 8192:
+        return 16, 64, 128 if m <= 2 else 256, 4, 3, 8
+    if 192 < m <= 256 and n >= 2048 and k == 2048:
+        if m % 128 == 0:
+            return 128, 128, 128, 8, 3, 8
+        return 32, 128, 128, 4, 3, 8
+    if 256 < m <= 512 and n >= 1024 and k >= 2048:
+        return 64, 128, 128, 8, 3, 8
+    if 1024 <= m <= 12288 and n >= 1024 and k >= 4096:
+        return 128, 128, 128, 8, 3, 8
+    if 8 < m <= 256 and n <= 512 and 4096 < k <= 8192:
+        # More K work per load amortizes the long, narrow reduction.
+        return 32, 32, 256, 4, 3, 8
+    if m > 16 and n >= 2048 and k == 128:
+        # Complete the short reduction in one iteration.
+        if m <= 32:
+            return 16, 128, 128, 4, 1, 8
+        return 32, 128, 128, 4, 1, 1 if m < 1024 else 8
+    if 1 < m <= 8 and n >= 32768 and 2048 <= k <= 4096:
+        return 16, 128, 256, 4, 3, 8
+    if 32 < m <= 128 and n <= 512 and k >= 2048:
+        return 16, 16, 128, 1, 2, 8
+    if 128 < m <= 256 and n <= 512 and k >= 2048:
+        return 32, 32, 128, 4, 2, 8
+    if m >= 1024 and n <= 1024 and k >= 2048:
+        return 64, 128, 128, 4, 3, 8
+    if 32 < m <= 256 and n >= 1024 and 256 <= k <= 512:
+        return 32, 128, 128, 4, 3, 8
+    if 16 < m <= 64 and 512 <= n < 2048 and k >= 1024:
+        return 32, 64, 128, 4, 3, 8
+    if 32 < m <= 512 and n >= 2048 and k >= 2048:
+        return 64, 128, 128, 4 if n >= 16384 else 8, 3, 8
+    if k >= 256:
+        block_k = 128
+    elif k >= 64:
+        block_k = 64
+    else:
+        block_k = 32
+    if k >= 2048:
+        stages = 3 if m >= 1024 else 4
+    elif k >= 512:
+        stages = 3
+    else:
+        stages = 2
+    group_m = 8
+    # Keep BLOCK_N close to N so skinny GEMM does not compute unused columns.
+    if n <= 16:
+        block_n = 16
+    elif n <= 32:
+        block_n = 32
+    elif n < 512:
+        block_n = 64
+    else:
+        block_n = 128
+    if m <= 16:
+        # Tiny wide GEMM is launch-bound; one warp + BLOCK_K=128 beats gems BF16.
+        if n <= 256 and k <= 256 and k >= 128:
+            return 16, min(block_n, 64), 128, 1, 2, group_m
+        warps = 1 if block_n <= 32 else 4
+        return 16, block_n, block_k, warps, stages, group_m
+    if m <= 32:
+        warps = 2 if block_n <= 16 else 4
+        return 32, block_n, block_k, warps, stages, group_m
+    return 64, block_n, block_k, 4, stages, group_m
+
+
 def rand_heur_block(args):
     """Select block size for random number generation on PPU"""
     if args["N"] <= 512:
@@ -353,6 +427,9 @@ HEURISTICS_CONFIGS = {
     },
     "mm": {
         "EVEN_K": mm_heur_even_k,
+    },
+    "mm_w8a8_int8": {
+        "TILES": mm_w8a8_int8_heur_tiles,
     },
     "rand": {
         "BLOCK": rand_heur_block,
