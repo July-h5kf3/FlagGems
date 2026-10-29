@@ -56,6 +56,12 @@ SHAPES = [
     (1025, 6144, 128),
     (3840, 128, 6144),
     (16384, 6144, 128),
+    (1025, 1536, 6151),
+    (4033, 1536, 6144),
+    (12885, 128, 6144),
+    (11264, 128, 6144),
+    (11265, 128, 6144),
+    (449, 1024, 2048),
 ]
 
 
@@ -210,6 +216,8 @@ def _assert_reference(a, b, sa, sb, out, bias=None):
         (1, 6145, 768),
         (134, 255, 6151),
         (1025, 256, 6144),
+        (8193, 128, 6144),
+        (11265, 128, 6144),
     ],
 )
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -244,7 +252,15 @@ def test_scaled_empty_bias(shape):
 
 @pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
 @pytest.mark.parametrize(
-    "shape", [(3, 17, 128), (1, 32, 128), (32, 1, 128), (17, 35, 67), (1025, 65, 2048)]
+    "shape",
+    [
+        (3, 17, 128),
+        (1, 32, 128),
+        (32, 1, 128),
+        (17, 35, 67),
+        (1025, 65, 2048),
+        (449, 1024, 2048),
+    ],
 )
 @pytest.mark.parametrize("scalar", [False, True])
 def test_scaled_graph_bias_updates(shape, scalar):
@@ -361,6 +377,47 @@ def test_scaled_unaligned_weight():
     sb = torch.rand(n, device=a.device)
     y = flag_gems.mm_w8a8_int8(a, b, sa, sb, torch.float32)
     _assert_reference(a, b, sa, sb, y)
+
+
+@pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
+@pytest.mark.parametrize("shape", [(65, 128, 2048), (1025, 128, 6144), (1, 6145, 768)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_scaled_alignment_updates(shape, dtype):
+    m, n, k = shape
+    torch.manual_seed(43)
+    a_storage = torch.randint(
+        -128, 128, (m * k + 16,), device=flag_gems.device, dtype=torch.int8
+    )
+    b_storage = torch.randint(
+        -128, 128, (n * k + 16,), device=flag_gems.device, dtype=torch.int8
+    )
+    out_storage = torch.empty(m * n + 16, device=flag_gems.device, dtype=dtype)
+    sa = torch.rand(m, device=flag_gems.device) * 0.01
+    sb = torch.rand(n, device=flag_gems.device) * 0.01
+    for offset in (0, 1, 0):
+        a = a_storage[offset : offset + m * k].view(m, k)
+        b = b_storage[offset : offset + n * k].view(n, k).t()
+        out = out_storage[offset : offset + m * n].view(m, n)
+        flag_gems.mm_w8a8_int8_out(a, b, sa, sb, out=out)
+        _assert_reference(a, b, sa, sb, out)
+
+
+@pytest.mark.skipif(flag_gems.vendor_name != "thead", reason="thead only")
+def test_long_reduction_cancellation():
+    m, n, k = 11265, 128, 6144
+    a = torch.full((m, k), 127, device=flag_gems.device, dtype=torch.int8)
+    weight = torch.full((n, k), 127, device=a.device, dtype=torch.int8)
+    # Each half sum exceeds 2**24; float partial sums lose the final unit.
+    weight[:, k // 2 :] = -127
+    weight[:, k // 2] = -126
+    out = flag_gems.mm_w8a8_int8(
+        a,
+        weight.t(),
+        torch.ones(m, device=a.device),
+        torch.ones(n, device=a.device),
+        out_dtype=torch.float32,
+    )
+    gems_assert_equal(out, torch.full_like(out, 127))
 
 
 def inputs(m, n, k, scalar=False, layout=False):
