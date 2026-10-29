@@ -17,6 +17,7 @@ import logging
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as al
 
 from flag_gems.runtime import torch_device_fn
 
@@ -65,6 +66,7 @@ def grouped_gemm_int8_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ALIGNED: tl.constexpr,
 ):
     tiles_n: tl.constexpr = tl.cdiv(N, BLOCK_N)
     if ROW_MODE:
@@ -91,19 +93,35 @@ def grouped_gemm_int8_kernel(
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.int32)
         for chunk in range(tl.cdiv(K, BLOCK_K)):
             offsets_k = chunk * BLOCK_K + reduction
-            activation = tl.load(
-                A + rows[:, None] * K + offsets_k[None, :],
-                (rows[:, None] < row_end) & (offsets_k[None, :] < K),
-                0,
-            )
-            weight = tl.load(
-                B
-                + weight_base
-                + columns[:, None].to(tl.int64) * K
-                + offsets_k[None, :],
-                (columns[:, None] < N) & (offsets_k[None, :] < K),
-                0,
-            )
+            if ALIGNED:
+                # Discarded output rows do not require zero-filled dot inputs.
+                activation = tl.load(
+                    A + rows[:, None] * K + offsets_k[None, :],
+                    rows[:, None] < row_end,
+                    care_padding=False,
+                )
+                weight = tl.load(
+                    B
+                    + weight_base
+                    + columns[:, None].to(tl.int64) * K
+                    + offsets_k[None, :]
+                )
+                al.compile_hint(activation, "dot_pad_only_k")
+                al.compile_hint(weight, "dot_pad_only_k")
+            else:
+                activation = tl.load(
+                    A + rows[:, None] * K + offsets_k[None, :],
+                    (rows[:, None] < row_end) & (offsets_k[None, :] < K),
+                    0,
+                )
+                weight = tl.load(
+                    B
+                    + weight_base
+                    + columns[:, None].to(tl.int64) * K
+                    + offsets_k[None, :],
+                    (columns[:, None] < N) & (offsets_k[None, :] < K),
+                    0,
+                )
             accumulator = tl.dot(
                 activation, tl.trans(weight), accumulator, out_dtype=tl.int32
             )
@@ -175,10 +193,16 @@ def grouped_gemm_w8a8(
         return
 
     row_mode = M <= E
-    block_m = 16 if M <= 16 * E else 64
-    block_n = (512 if K <= 128 else 128) if M <= 16 * E else 256
-    block_k = 128 if K <= 128 else (512 if E < M <= 16 * E else 256)
+    if K >= 1024 and N % 256 == 0:
+        block_m, block_n = (16, 256) if M <= 16 * E else (128, 128)
+        block_k = 512
+    else:
+        block_m = 16 if M <= 16 * E else 64
+        block_n = (512 if K <= 128 else 128) if M <= 16 * E else 256
+        block_k = 128 if K <= 128 else (512 if E < M <= 16 * E else 256)
     tiles_n = triton.cdiv(N, block_n)
+    aligned = N % block_n == 0 and K % block_k == 0
+    pipeline_options = {"unit_flag": True, "sync_solver": False} if aligned else {}
     with torch_device_fn.device(A.device):
         if row_mode:
             plan = None
@@ -203,4 +227,7 @@ def grouped_gemm_w8a8(
             block_m,
             block_n,
             block_k,
+            aligned,
+            multibuffer=True,
+            **pipeline_options,
         )
