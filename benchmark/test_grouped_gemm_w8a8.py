@@ -16,7 +16,10 @@ import pytest
 import torch
 
 import flag_gems
-from tests.test_grouped_gemm_w8a8 import deepgemm_grouped_gemm, make_grouped_gemm_case
+from tests.test_grouped_gemm_w8a8 import (
+    get_grouped_gemm_reference,
+    make_grouped_gemm_case,
+)
 
 from .base import Benchmark
 
@@ -40,13 +43,12 @@ class GroupedGemmInt8Benchmark(Benchmark):
 @pytest.mark.grouped_gemm_w8a8
 @pytest.mark.skipif(
     "grouped_gemm_w8a8" not in vars(flag_gems),
-    reason="requires a registered PPU grouped INT8 GEMM implementation",
+    reason="requires a registered grouped INT8 GEMM implementation",
 )
 def test_grouped_gemm_w8a8():
-    pytest.importorskip("deep_gemm")
     bench = GroupedGemmInt8Benchmark(
         op_name="grouped_gemm_w8a8",
-        torch_op=deepgemm_grouped_gemm,
+        torch_op=get_grouped_gemm_reference(),
         gems_op=flag_gems.grouped_gemm_w8a8,
         dtypes=[torch.bfloat16],
     )
